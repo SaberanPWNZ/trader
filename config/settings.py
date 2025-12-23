@@ -86,7 +86,7 @@ class DevConfig:
 @dataclass
 class SelfLearningConfig:
     enabled: bool = False
-    training_interval_hours: int = 24
+    training_interval_hours: int = field(default_factory=lambda: int(os.getenv("TRAINING_INTERVAL_HOURS", "4")))
     min_accuracy_improvement: float = 0.05
     min_samples_for_training: int = 500
     max_models_to_keep: int = 5
