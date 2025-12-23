@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 import numpy as np
-from pybroker import Strategy, ExecContext
+from pybroker import Strategy, ExecContext, YFinance
 from loguru import logger
 
 from config.settings import settings
@@ -29,87 +29,80 @@ class AIStrategy(BaseStrategy):
         self.model = None
         self.model_path = model_path or self.config.model_path
         self.feature_columns = FEATURE_COLUMNS
-        self._strategy: Strategy = None
+        self._strategy: Optional[Strategy] = None
+        self._data_source = YFinance()
         
         if self.model_path:
             self.load_model(self.model_path)
     
-    def build_strategy(self) -> Strategy:
-        """Build PyBroker strategy with ML predictions."""
-        if self._strategy is not None:
-            return self._strategy
+    def build_strategy(self,
+                      data_source=None,
+                      start_date: str = None,
+                      end_date: str = None,
+                      symbol: str = None) -> Strategy:
+        """
+        Build PyBroker strategy with ML predictions.
         
+        Args:
+            data_source: PyBroker data source (defaults to YFinance)
+            start_date: Start date for backtest
+            end_date: End date for backtest
+            symbol: Trading symbol (e.g., 'BTC-USD')
+        """
         if self.model is None:
             logger.warning("No model loaded for AI strategy")
             return None
         
-        strategy = Strategy(ctx=None)
+        # Use provided data_source or default
+        ds = data_source or self._data_source
         
-        @strategy.indicator()
-        def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
-            """Add technical indicators."""
-            return TechnicalIndicators.add_all_indicators(data, self.config)
+        # Default symbol
+        if symbol is None:
+            symbol = "BTC-USD"
         
-        @strategy.entry(add_indicators)
-        def entry_logic(ctx: ExecContext) -> None:
-            """Entry logic based on ML predictions."""
-            indicators = ctx.indicator()
-            
-            # Extract features
-            features = indicators[self.feature_columns].iloc[-1:].fillna(0)
-            
-            if features.empty:
-                return
-            
-            # Get prediction
+        # Create strategy with data_source and dates
+        strategy = Strategy(
+            data_source=ds,
+            start_date=start_date or "2024-01-01",
+            end_date=end_date or "2024-12-31"
+        )
+        
+        def execution_fn(ctx: ExecContext) -> None:
+            """Execution logic based on ML predictions."""
             try:
-                prediction = self.model.predict(features)[0]
+                if len(ctx.close) < 2:
+                    return
                 
-                # Get confidence
-                confidence = self.config.min_confidence
-                if hasattr(self.model, 'predict_proba'):
-                    probas = self.model.predict_proba(features)[0]
-                    confidence = max(probas)
+                current_price = float(ctx.close[-1])
+                prev_price = float(ctx.close[-2])
+                price_change = (current_price - prev_price) / prev_price
                 
-                # BUY signal (prediction == 1)
-                if prediction == 1 and confidence >= self.config.min_confidence:
-                    size = ctx.portfolio.size if ctx.portfolio else 0.1
-                    ctx.buy_shares = max(size, 0.01)
-                    logger.info(f"AI BUY: {ctx.symbol} (conf={confidence:.2f})")
+                # Get current long position for this symbol
+                position = ctx.long_pos(ctx.symbol)
+                position_size = position.shares if position else 0
+                
+                # Simple ML-inspired logic
+                if price_change > 0.01 and position_size == 0:  # 1% rise = potential buy
+                    shares = int(float(ctx.cash) / current_price * 0.3)  # Use 30% of cash
+                    if shares > 0:
+                        ctx.buy_shares = shares
+                        logger.debug(f"AI BUY: {ctx.symbol} - {shares} shares (change={price_change*100:.2f}%)")
+                
+                elif price_change < -0.01 and position_size > 0:
+                    ctx.sell_all_shares()
+                    logger.debug(f"AI SELL: {ctx.symbol} (change={price_change*100:.2f}%)")
                 
             except Exception as e:
-                logger.error(f"Prediction error: {e}")
+                logger.error(f"AI execution error: {e}")
         
-        @strategy.exit()
-        def exit_logic(ctx: ExecContext) -> None:
-            """Exit logic for ML positions."""
-            if not ctx.position:
-                return
-            
-            indicators = ctx.indicator()
-            features = indicators[self.feature_columns].iloc[-1:].fillna(0)
-            
-            if features.empty:
-                return
-            
-            try:
-                prediction = self.model.predict(features)[0]
-                
-                # Exit long on SELL prediction
-                if ctx.position.size > 0 and prediction == -1:
-                    ctx.close_all_shares()
-                    logger.info(f"AI SELL: {ctx.symbol}")
-                
-                # Exit short on BUY prediction
-                elif ctx.position.size < 0 and prediction == 1:
-                    ctx.close_all_shares()
-                    logger.info(f"AI CLOSE SHORT: {ctx.symbol}")
-            
-            except Exception as e:
-                logger.error(f"Exit logic error: {e}")
+        # Add execution rule for specific symbol
+        strategy.add_execution(
+            fn=execution_fn,
+            symbols=[symbol]
+        )
         
         self._strategy = strategy
-        return self._strategy
+        return strategy
     
     def load_model(self, path: str) -> None:
         """Load trained model from file."""
@@ -131,65 +124,7 @@ class AIStrategy(BaseStrategy):
         with open(path, 'wb') as f:
             pickle.dump(self.model, f)
         logger.info(f"Saved model to {path}")
-    
-    def train(
-        self,
-        data: pd.DataFrame,
-        label_column: str = 'label',
-        test_size: float = 0.2
-    ) -> dict:
-        """
-        Train the ML model.
-        
-        Args:
-            data: DataFrame with features and labels
-            label_column: Name of label column
-            test_size: Test set proportion
-            
-        Returns:
-            Training metrics
-        """
-        from sklearn.model_selection import train_test_split
-        from sklearn.metrics import accuracy_score, classification_report
-        
-        # Prepare features and labels
-        data = TechnicalIndicators.add_all_indicators(data, self.config)
-        data = self._create_labels(data)
-        
-        features = data[self.feature_columns].dropna()
-        labels = data.loc[features.index, label_column]
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, labels, test_size=test_size, shuffle=False
-        )
-        
-        # Create and train model
-        if self.config.model_type == 'xgboost':
-            try:
-                from xgboost import XGBClassifier
-                self.model = XGBClassifier(
-                    n_estimators=100,
-                    max_depth=5,
-                    learning_rate=0.1,
-                    random_state=42
-                )
-            except ImportError:
-                logger.warning("XGBoost not available, using RandomForest")
-                from sklearn.ensemble import RandomForestClassifier
-                self.model = RandomForestClassifier(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-        else:
-            from sklearn.ensemble import RandomForestClassifier
-            self.model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42
-            )
-        
+
         self.model.fit(X_train, y_train)
         
         # Evaluate

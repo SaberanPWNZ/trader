@@ -69,3 +69,6 @@ models/*.pkl
 
 # Jupyter
 .ipynb_checkpoints/
+
+
+*.csv

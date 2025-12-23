@@ -112,7 +112,7 @@ class AIStrategy(BaseStrategy):
                 entry_price=close_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                metadata={'prediction': prediction}
+                metadata={'prediction': 1}
             )
         
         elif prediction == -1 and confidence >= self.config.min_confidence:
@@ -128,7 +128,7 @@ class AIStrategy(BaseStrategy):
                 entry_price=close_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                metadata={'prediction': prediction}
+                metadata={'prediction': -1}
             )
         
         else:
