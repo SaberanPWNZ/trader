@@ -1,9 +1,6 @@
 # Crypto AI Trading Bot - Requirements
 # Python 3.11+
 
-# PyBroker Framework
-pybroker>=1.17.0
-
 # Exchange & Data
 ccxt>=4.0.0
 pandas>=2.0.0
@@ -11,8 +8,7 @@ numpy>=1.24.0
 yfinance>=0.2.32
 
 # Technical Analysis
-ta-lib>=0.4.28  # Optional - requires system library
-pandas-ta>=0.3.14b0
+ta>=0.10.0
 
 # Machine Learning
 scikit-learn>=1.3.0

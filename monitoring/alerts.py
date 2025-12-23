@@ -188,7 +188,6 @@ All trading has been halted. Manual intervention required.
         await self.send_message(message)
     
     async def system_status(self, status: str, details: str = "") -> None:
-        """Send system status notification."""
         emoji = "✅" if status == "online" else "🔴"
         
         message = f"""
@@ -200,6 +199,93 @@ All trading has been halted. Manual intervention required.
 """
         await self.send_message(message)
 
+    async def training_started(self, symbol: str) -> None:
+        message = f"""
+🔄 <b>Training Started</b>
 
-# Global telegram instance
+<b>Symbol:</b> {symbol}
+<b>Model:</b> {settings.strategy.model_type}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+    async def training_complete(
+        self,
+        symbol: str,
+        model_type: str,
+        train_accuracy: float,
+        test_accuracy: float,
+        samples: int,
+        duration_seconds: float,
+        improvement: float = 0,
+        deployed: bool = False
+    ) -> None:
+        emoji = "🤖" if test_accuracy >= 0.6 else "⚠️"
+        improvement_text = f"+{improvement:.1%}" if improvement > 0 else f"{improvement:.1%}"
+        deployed_text = "✅ Auto-deployed" if deployed else "⏸️ Pending review"
+
+        message = f"""
+{emoji} <b>Training Complete</b>
+
+<b>Symbol:</b> {symbol}
+<b>Model:</b> {model_type}
+<b>Train Accuracy:</b> {train_accuracy:.1%}
+<b>Test Accuracy:</b> {test_accuracy:.1%}
+<b>Improvement:</b> {improvement_text}
+<b>Samples:</b> {samples:,}
+<b>Duration:</b> {duration_seconds:.1f}s
+<b>Status:</b> {deployed_text}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+    async def training_failed(self, symbol: str, error: str) -> None:
+        message = f"""
+❌ <b>Training Failed</b>
+
+<b>Symbol:</b> {symbol}
+<b>Error:</b> {error}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+    async def model_deployed(self, symbol: str, model_id: str, accuracy: float) -> None:
+        message = f"""
+🚀 <b>Model Deployed</b>
+
+<b>Symbol:</b> {symbol}
+<b>Model ID:</b> <code>{model_id}</code>
+<b>Accuracy:</b> {accuracy:.1%}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+    async def performance_report(
+        self,
+        symbol: str,
+        total_predictions: int,
+        accuracy: float,
+        total_pnl: float,
+        period_days: int = 7
+    ) -> None:
+        emoji = "📈" if total_pnl >= 0 else "📉"
+        pnl_sign = "+" if total_pnl >= 0 else ""
+
+        message = f"""
+📊 <b>Performance Report ({period_days}d)</b>
+
+<b>Symbol:</b> {symbol}
+<b>Predictions:</b> {total_predictions}
+<b>Accuracy:</b> {accuracy:.1%}
+<b>PnL:</b> {emoji} {pnl_sign}${total_pnl:,.2f}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+
 telegram = TelegramAlert()

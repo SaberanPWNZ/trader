@@ -72,16 +72,28 @@ class StrategyConfig:
 
 @dataclass
 class DevConfig:
-    """Development mode configuration."""
-    enabled: bool = False  # Enable dev mode
-    use_mock_data: bool = True  # Use mock data instead of real APIs
-    mock_symbol: str = "BTC-USD"  # Symbol for mock data
-    mock_base_price: float = 45000.0  # Base price for mock data
-    mock_volatility: float = 0.02  # Daily volatility (2%)
-    mock_days: int = 90  # Number of days for mock data
-    local_data_dir: str = "data/local"  # Directory for local data files
-    debug_level: int = 1  # Debug verbosity (0=off, 1=info, 2=verbose)
-    skip_api_validation: bool = True  # Skip API key validation in dev mode
+    enabled: bool = False
+    use_mock_data: bool = True
+    mock_symbol: str = "BTC-USD"
+    mock_base_price: float = 45000.0
+    mock_volatility: float = 0.02
+    mock_days: int = 90
+    local_data_dir: str = "data/local"
+    debug_level: int = 1
+    skip_api_validation: bool = True
+
+
+@dataclass
+class SelfLearningConfig:
+    enabled: bool = False
+    training_interval_hours: int = 24
+    min_accuracy_improvement: float = 0.05
+    min_samples_for_training: int = 500
+    max_models_to_keep: int = 5
+    db_path: str = field(default_factory=lambda: os.getenv("LEARNING_DB_PATH", "data/learning.db"))
+    performance_lookback_days: int = 60
+    holdout_days: int = 5
+    auto_deploy_enabled: bool = False
 
 
 @dataclass
@@ -129,10 +141,11 @@ class BacktestConfig:
 
 @dataclass
 class MonitoringConfig:
-    """Monitoring and alerts configuration."""
     telegram_enabled: bool = False
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+    telegram_commands_enabled: bool = False
+    telegram_polling_interval: int = 2
     log_level: str = "INFO"
     log_to_file: bool = True
     log_dir: str = "logs"
@@ -147,7 +160,6 @@ class DatabaseConfig:
 
 @dataclass
 class Settings:
-    """Main application settings."""
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -157,6 +169,7 @@ class Settings:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     pybroker: PyBrokerConfig = field(default_factory=PyBrokerConfig)
     dev: DevConfig = field(default_factory=DevConfig)
+    self_learning: SelfLearningConfig = field(default_factory=SelfLearningConfig)
     
     # Paths
     base_dir: Path = field(default_factory=lambda: Path(__file__).parent.parent)
