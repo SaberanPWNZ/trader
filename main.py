@@ -18,238 +18,33 @@ from monitoring.alerts import telegram
 
 
 async def run_backtest(args):
-    """Run backtesting mode using PyBroker."""
-    from strategies.rule_based_pb import RuleBasedStrategy
-    from strategies.ai_strategy_pb import AIStrategy
-    from backtesting.pybroker_engine import BacktestEngine
-    
-    logger.info("Starting backtest mode with PyBroker")
-    
-    # Get YFinance symbol from crypto pair
-    yf_symbol = settings.get_symbol_for_pybroker(args.symbol)
-    
-    # Initialize strategy
-    if args.strategy == "ai":
-        strategy = AIStrategy(model_path=args.model)
-    else:
-        strategy = RuleBasedStrategy()
-    
-    try:
-        # Run backtest using PyBroker engine
-        logger.info(f"Running backtest for {args.symbol} ({yf_symbol}) from {args.start_date} to {args.end_date}")
-        
-        engine = BacktestEngine(
-            initial_balance=args.initial_balance or settings.backtest.initial_balance,
-            commission=settings.pybroker.commission,
-            slippage=settings.pybroker.slippage,
-        )
-        
-        result = engine.run(
-            symbol=yf_symbol,
-            strategy=strategy,
-            start_date=args.start_date or settings.backtest.start_date,
-            end_date=args.end_date or settings.backtest.end_date
-        )
-        
-        # Print results
-        engine.print_report(result)
-        
-        # Optional: Walk-forward validation
-        if args.walk_forward:
-            logger.info("Running walk-forward validation...")
-            wf_results = engine.walk_forward_validation(
-                symbol=yf_symbol,
-                strategy=strategy,
-                start_date=args.start_date or settings.backtest.start_date,
-                end_date=args.end_date or settings.backtest.end_date,
-                train_size=settings.backtest.walk_forward_periods,
-                test_size=settings.backtest.walk_forward_test_size,
-            )
-            print(f"\n{'='*60}")
-            print("WALK-FORWARD VALIDATION RESULTS")
-            print(f"{'='*60}")
-            for i, result in enumerate(wf_results):
-                print(f"\nFold {i+1}:")
-                engine.print_report(result)
-        
-    except Exception as e:
-        logger.error(f"Backtest failed: {e}")
-        sys.exit(1)
+    logger.warning("⚠️ Backtest mode not available - PyBroker not installed")
+    logger.info("Available modes: force-train, scheduler, bot")
+    sys.exit(1)
 
 
 
 
 async def run_paper_trading(args):
-    """Run paper trading mode using PyBroker."""
-    from strategies.rule_based_pb import RuleBasedStrategy
-    from strategies.ai_strategy_pb import AIStrategy
-    from backtesting.pybroker_engine import BacktestEngine
-    
-    logger.info("Starting paper trading mode with PyBroker")
-    
-    # Get YFinance symbol
-    yf_symbol = settings.get_symbol_for_pybroker(args.symbol)
-    
-    # Initialize strategy
-    if args.strategy == "ai":
-        strategy = AIStrategy(model_path=args.model)
-    else:
-        strategy = RuleBasedStrategy()
-    
-    try:
-        # Run paper trading (similar to backtest but on live data)
-        logger.info(f"Paper trading for {args.symbol} ({yf_symbol})")
-        
-        engine = BacktestEngine(
-            initial_balance=args.initial_balance or settings.backtest.initial_balance
-        )
-        
-        # Use recent data (last 3 months)
-        from datetime import datetime, timedelta
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-        
-        result = engine.run(
-            symbol=yf_symbol,
-            strategy=strategy,
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        logger.info("Paper trading completed")
-        engine.print_report(result)
-        
-        # Send notification
-        await telegram.system_status("online", "Paper trading completed")
-        
-    except Exception as e:
-        logger.error(f"Paper trading failed: {e}")
-        await telegram.system_status("error", f"Paper trading error: {e}")
-        sys.exit(1)
+    logger.warning("⚠️ Paper trading mode not available - PyBroker not installed")
+    logger.info("Available modes: force-train, scheduler, bot")
+    sys.exit(1)
 
 
 
 
 async def run_live_trading(args):
-    """Run live trading mode with PyBroker integration."""
-    import ccxt.async_support as ccxt
-    from strategies.rule_based_pb import RuleBasedStrategy
-    from strategies.ai_strategy_pb import AIStrategy
-    from execution.pybroker_executor import ExecutionManager
-    from risk.kill_switch import KillSwitch
-    
-    logger.warning("⚠️ LIVE TRADING MODE - Real money at risk!")
-    
-    if not args.confirm:
-        print("\n" + "="*60)
-        print("WARNING: Live trading will use real funds!")
-        print("Use --confirm flag to acknowledge this risk")
-        print("="*60 + "\n")
-        return
-    
-    # Initialize exchange
-    exchange_config = {
-        'apiKey': settings.exchange.api_key,
-        'secret': settings.exchange.api_secret,
-        'timeout': settings.exchange.timeout,
-        'enableRateLimit': True,
-    }
-    
-    if settings.exchange.testnet:
-        exchange_config['options'] = {'sandboxMode': True}
-    
-    exchange = getattr(ccxt, settings.exchange.name)(exchange_config)
-    
-    if settings.exchange.testnet:
-        exchange.set_sandbox_mode(True)
-    
-    # Initialize components
-    if args.strategy == "ai":
-        strategy = AIStrategy(model_path=args.model)
-    else:
-        strategy = RuleBasedStrategy()
-    
-    kill_switch = KillSwitch()
-    execution_mgr = ExecutionManager()
-    
-    try:
-        await exchange.load_markets()
-        logger.info(f"Connected to {settings.exchange.name}")
-        
-        balance = await exchange.fetch_balance()
-        initial_balance = balance.get('total', {}).get('USDT', 10000)
-        
-        await telegram.system_status(
-            "online",
-            f"Live trading started\nBalance: ${initial_balance:,.2f}\nStrategy: {args.strategy}"
-        )
-        
-        # Main trading loop
-        logger.info("Entering live trading loop")
-        while not kill_switch.is_active:
-            for symbol in settings.trading.symbols:
-                try:
-                    # Execute trading logic with execution manager
-                    # The execution manager handles risk checks and PyBroker integration
-                    status = execution_mgr.get_status()
-                    logger.info(f"Execution status for {symbol}: {status}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing {symbol}: {e}")
-            
-            await asyncio.sleep(60)
-    
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        kill_switch.activate(str(e))
-        await telegram.system_status("error", f"Live trading error: {e}")
-    finally:
-        await exchange.close()
-        await telegram.system_status("offline", "Live trading stopped")
+    logger.warning("⚠️ Live trading mode not available - PyBroker not installed")
+    logger.info("Available modes: force-train, scheduler, bot")
+    sys.exit(1)
 
 
 
 
 async def train_model(args):
-    """Train AI model on historical data."""
-    from strategies.ai_strategy_pb import AIStrategy
-    
-    logger.info("Starting AI model training")
-    
-    # Get YFinance symbol
-    yf_symbol = settings.get_symbol_for_pybroker(args.symbol)
-    
-    try:
-        logger.info(f"Training model for {args.symbol} ({yf_symbol})")
-        
-        # Create and train strategy
-        strategy = AIStrategy()
-        metrics = strategy.train(
-            symbol=yf_symbol,
-            start_date=args.start_date,
-            end_date=args.end_date
-        )
-        
-        # Save model
-        model_path = args.output or f"models/{args.symbol.replace('/', '_')}_{datetime.now():%Y%m%d_%H%M%S}.pkl"
-        strategy.save_model(model_path)
-        
-        print("\n" + "="*60)
-        print("MODEL TRAINING COMPLETE")
-        print("="*60)
-        if 'accuracy' in metrics:
-            print(f"Model Accuracy: {metrics['accuracy']:.3f}")
-        print(f"Samples processed: {metrics.get('samples', 'N/A')}")
-        print(f"Model saved to: {model_path}")
-        print("="*60)
-        
-        logger.info(f"Model training completed and saved to {model_path}")
-        
-    except Exception as e:
-        logger.error(f"Model training failed: {e}")
-        sys.exit(1)
+    logger.warning("⚠️ Use: python main.py force-train <symbol>")
+    logger.info("Available modes: force-train, scheduler, bot")
+    sys.exit(1)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -298,54 +93,9 @@ async def dev_generate_data(args):
 
 
 async def dev_backtest(args):
-    """Run backtest with mock data (dev mode)."""
-    from strategies.rule_based_pb import RuleBasedStrategy
-    from strategies.ai_strategy_pb import AIStrategy
-    from backtesting.pybroker_engine import BacktestEngine
-    from data.local_data import DataLoader
-    
-    logger.info("🔧 Development mode: Running backtest with mock data")
-    
-    # Enable dev mode
-    settings.enable_dev_mode()
-    
-    # Get symbol
-    symbol = args.symbol or settings.dev.mock_symbol
-    yf_symbol = settings.get_symbol_for_pybroker(symbol)
-    start_date = args.start_date or settings.backtest.start_date
-    end_date = args.end_date or settings.backtest.end_date
-    
-    # Initialize strategy
-    if args.strategy == "ai":
-        strategy = AIStrategy(model_path=args.model)
-    else:
-        strategy = RuleBasedStrategy()
-    
-    try:
-        # Load mock data
-        loader = DataLoader()
-        data = loader.load_data(yf_symbol, start_date, end_date)
-        
-        # Run backtest
-        logger.info(f"Running backtest on {len(data)} candles of mock data")
-        
-        engine = BacktestEngine(
-            initial_balance=args.initial_balance or settings.backtest.initial_balance
-        )
-        
-        result = engine.run(
-            symbol=yf_symbol,
-            strategy=strategy,
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        # Print results
-        engine.print_report(result)
-        
-    except Exception as e:
-        logger.error(f"Backtest failed: {e}")
-        sys.exit(1)
+    logger.warning("⚠️ Backtest mode not available - PyBroker not installed")
+    logger.info("Available modes: force-train, scheduler, bot")
+    sys.exit(1)
 
 
 async def dev_train(args):

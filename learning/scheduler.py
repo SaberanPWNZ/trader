@@ -38,8 +38,22 @@ class LearningScheduler:
         await self.db.initialize()
         self._running = True
         self._task = asyncio.create_task(self._scheduler_loop())
+        
+        now = datetime.utcnow()
+        next_run = self._get_next_run_time(now)
+        wait_seconds = (next_run - now).total_seconds()
+        wait_hours = wait_seconds / 3600
+        
         logger.info("Learning scheduler started")
-        await telegram.system_status("online", "Self-learning scheduler started")
+        
+        startup_msg = (
+            f"🤖 Self-learning scheduler started\n"
+            f"⏱️ Interval: every {self.config.training_interval_hours} hour(s)\n"
+            f"📅 Next training: {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"⏳ In {wait_hours:.1f} hours\n"
+            f"📍 Symbols: {', '.join(self.symbols)}"
+        )
+        await telegram.system_status("online", startup_msg)
 
     async def stop(self) -> None:
         self._running = False
@@ -74,10 +88,18 @@ class LearningScheduler:
                 await asyncio.sleep(60)
 
     def _get_next_run_time(self, now: datetime) -> datetime:
-        target_hour = 0
-        next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-        if now.hour >= target_hour:
-            next_run += timedelta(days=1)
+        interval_hours = self.config.training_interval_hours
+        
+        if interval_hours >= 24:
+            target_hour = 0
+            next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+            if now.hour >= target_hour:
+                next_run += timedelta(days=1)
+        else:
+            minutes_to_next = (interval_hours * 60) - (now.minute + now.hour * 60) % (interval_hours * 60)
+            next_run = now + timedelta(minutes=minutes_to_next)
+            next_run = next_run.replace(second=0, microsecond=0)
+        
         return next_run
 
     async def run_training_cycle(self) -> dict:

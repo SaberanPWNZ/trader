@@ -5,11 +5,13 @@ services:
     build: .
     container_name: crypto-trading-bot
     restart: unless-stopped
+    command: ["python", "main.py", "scheduler"]
     environment:
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TRAINING_INTERVAL_HOURS=4
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -26,6 +28,7 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TRAINING_INTERVAL_HOURS=4
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -41,6 +44,7 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TRAINING_INTERVAL_HOURS=4
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
