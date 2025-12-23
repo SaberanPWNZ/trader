@@ -11,7 +11,7 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - TRAINING_INTERVAL_HOURS=4
+      - TRAINING_INTERVAL_HOURS=${TRAINING_INTERVAL_HOURS}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -28,7 +28,7 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - TRAINING_INTERVAL_HOURS=4
+      - TRAINING_INTERVAL_HOURS=${TRAINING_INTERVAL_HOURS}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -44,7 +44,7 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - TRAINING_INTERVAL_HOURS=4
+      - TRAINING_INTERVAL_HOURS=${TRAINING_INTERVAL_HOURS}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
