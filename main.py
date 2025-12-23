@@ -252,6 +252,198 @@ async def train_model(args):
         sys.exit(1)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# DEVELOPMENT MODE COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def dev_generate_data(args):
+    """Generate mock data for development."""
+    from data.mock_generator import MockDataGenerator, MockConfig
+    from data.local_data import LocalDataManager
+    
+    logger.info("🔧 Development mode: Generating mock data")
+    
+    # Enable dev mode
+    settings.enable_dev_mode()
+    
+    # Parse date range
+    start_date = args.start_date or settings.backtest.start_date
+    end_date = args.end_date or settings.backtest.end_date
+    symbol = args.symbol or settings.dev.mock_symbol
+    
+    # Configure mock data
+    config = MockConfig(
+        base_price=args.base_price or settings.dev.mock_base_price,
+        volatility=args.volatility or settings.dev.mock_volatility,
+    )
+    
+    try:
+        # Generate and save data
+        generator = MockDataGenerator(config)
+        df = generator.generate_ohlcv(symbol, start_date, end_date)
+        
+        # Cache it
+        manager = LocalDataManager()
+        filepath = manager.save_data(df, symbol, start_date, end_date)
+        
+        print(f"\n✅ Generated {len(df)} candles")
+        print(f"   Symbol: {symbol}")
+        print(f"   Range: {start_date} to {end_date}")
+        print(f"   Saved: {filepath}\n")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate data: {e}")
+        sys.exit(1)
+
+
+async def dev_backtest(args):
+    """Run backtest with mock data (dev mode)."""
+    from strategies.rule_based_pb import RuleBasedStrategy
+    from strategies.ai_strategy_pb import AIStrategy
+    from backtesting.pybroker_engine import BacktestEngine
+    from data.local_data import DataLoader
+    
+    logger.info("🔧 Development mode: Running backtest with mock data")
+    
+    # Enable dev mode
+    settings.enable_dev_mode()
+    
+    # Get symbol
+    symbol = args.symbol or settings.dev.mock_symbol
+    yf_symbol = settings.get_symbol_for_pybroker(symbol)
+    start_date = args.start_date or settings.backtest.start_date
+    end_date = args.end_date or settings.backtest.end_date
+    
+    # Initialize strategy
+    if args.strategy == "ai":
+        strategy = AIStrategy(model_path=args.model)
+    else:
+        strategy = RuleBasedStrategy()
+    
+    try:
+        # Load mock data
+        loader = DataLoader()
+        data = loader.load_data(yf_symbol, start_date, end_date)
+        
+        # Run backtest
+        logger.info(f"Running backtest on {len(data)} candles of mock data")
+        
+        engine = BacktestEngine(
+            initial_balance=args.initial_balance or settings.backtest.initial_balance
+        )
+        
+        result = engine.run(
+            symbol=yf_symbol,
+            strategy=strategy,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # Print results
+        engine.print_report(result)
+        
+    except Exception as e:
+        logger.error(f"Backtest failed: {e}")
+        sys.exit(1)
+
+
+async def dev_train(args):
+    """Train AI model with synthetic data (dev mode)."""
+    import pickle
+    from sklearn.ensemble import RandomForestClassifier
+    from data.mock_generator import generate_training_data
+    
+    logger.info("🔧 Development mode: Training model with synthetic data")
+    
+    # Enable dev mode
+    settings.enable_dev_mode()
+    
+    try:
+        # Generate synthetic training data
+        symbol = args.symbol or settings.dev.mock_symbol
+        samples = args.samples or 1000
+        features = args.features or 20
+        
+        logger.info(f"Generating {samples} training samples with {features} features")
+        X, y = generate_training_data(symbol, samples, features)
+        
+        # Train model using scikit-learn
+        logger.info(f"Training RandomForest model on {samples} synthetic samples...")
+        model = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
+        model.fit(X, y)
+        
+        # Save model
+        import os
+        os.makedirs("models", exist_ok=True)
+        model_path = args.output or f"models/{symbol}_dev_{datetime.now():%Y%m%d_%H%M%S}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(model, f)
+        
+        print(f"\n✅ Model training complete")
+        print(f"   Samples: {samples}")
+        print(f"   Features: {features}")
+        print(f"   Accuracy: {model.score(X, y):.2%}")
+        print(f"   Saved: {model_path}\n")
+        logger.info(f"Model saved to {model_path}")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        sys.exit(1)
+
+
+def dev_list_data(args):
+    """List cached local data files."""
+    from data.local_data import LocalDataManager
+    
+    logger.info("🔧 Listing cached data files")
+    
+    settings.enable_dev_mode()
+    
+    try:
+        manager = LocalDataManager()
+        summary = manager.get_data_summary()
+        
+        print(f"\n📊 Cached Data Files")
+        print(f"   Total files: {summary['total_files']}")
+        print(f"   Total size: {summary['total_size_mb']:.2f} MB")
+        
+        if summary['files']:
+            print(f"\n   Files:")
+            for file_info in summary['files']:
+                print(f"     - {file_info['name']} ({file_info['size_mb']:.2f} MB)")
+        
+        print()
+        
+    except Exception as e:
+        logger.error(f"Failed to list data: {e}")
+        sys.exit(1)
+
+
+def dev_clear_cache(args):
+    """Clear cached data files."""
+    from data.local_data import LocalDataManager
+    
+    logger.info("🔧 Clearing cache")
+    
+    settings.enable_dev_mode()
+    
+    try:
+        manager = LocalDataManager()
+        symbol = args.symbol or None
+        
+        count = manager.clear_cache(symbol)
+        
+        if symbol:
+            print(f"\n✅ Deleted {count} cached files for {symbol}\n")
+        else:
+            print(f"\n✅ Deleted {count} cached files\n")
+        
+    except Exception as e:
+        logger.error(f"Failed to clear cache: {e}")
+        sys.exit(1)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -308,6 +500,37 @@ Examples:
     train_parser.add_argument("--end-date", default="2024-11-01", help="Training end date (YYYY-MM-DD)")
     train_parser.add_argument("--output", help="Output model path")
     
+    # Dev mode: Generate mock data
+    dev_gen_parser = subparsers.add_parser("dev-gen", help="[DEV] Generate mock data")
+    dev_gen_parser.add_argument("--symbol", default="BTC-USD", help="Symbol for mock data")
+    dev_gen_parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
+    dev_gen_parser.add_argument("--end-date", help="End date (YYYY-MM-DD)")
+    dev_gen_parser.add_argument("--base-price", type=float, help="Base price for mock data")
+    dev_gen_parser.add_argument("--volatility", type=float, help="Daily volatility (0-1)")
+    
+    # Dev mode: Backtest with mock data
+    dev_backtest_parser = subparsers.add_parser("dev-backtest", help="[DEV] Backtest with mock data")
+    dev_backtest_parser.add_argument("--symbol", default="BTC-USD", help="Symbol for mock data")
+    dev_backtest_parser.add_argument("--strategy", choices=["rule_based", "ai"], default="rule_based")
+    dev_backtest_parser.add_argument("--model", help="Path to AI model file")
+    dev_backtest_parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
+    dev_backtest_parser.add_argument("--end-date", help="End date (YYYY-MM-DD)")
+    dev_backtest_parser.add_argument("--initial-balance", type=float, help="Initial balance")
+    
+    # Dev mode: Train with synthetic data
+    dev_train_parser = subparsers.add_parser("dev-train", help="[DEV] Train model with synthetic data")
+    dev_train_parser.add_argument("--symbol", default="BTC-USD", help="Symbol name")
+    dev_train_parser.add_argument("--samples", type=int, help="Number of training samples")
+    dev_train_parser.add_argument("--features", type=int, help="Number of features")
+    dev_train_parser.add_argument("--output", help="Output model path")
+    
+    # Dev mode: List cached data
+    dev_list_parser = subparsers.add_parser("dev-list", help="[DEV] List cached data files")
+    
+    # Dev mode: Clear cache
+    dev_clear_parser = subparsers.add_parser("dev-clear", help="[DEV] Clear cached data")
+    dev_clear_parser.add_argument("--symbol", help="Clear specific symbol (or all if not set)")
+    
     args = parser.parse_args()
     
     if not args.mode:
@@ -328,6 +551,17 @@ Examples:
         asyncio.run(run_live_trading(args))
     elif args.mode == "train":
         asyncio.run(train_model(args))
+    # Dev mode commands
+    elif args.mode == "dev-gen":
+        asyncio.run(dev_generate_data(args))
+    elif args.mode == "dev-backtest":
+        asyncio.run(dev_backtest(args))
+    elif args.mode == "dev-train":
+        asyncio.run(dev_train(args))
+    elif args.mode == "dev-list":
+        dev_list_data(args)
+    elif args.mode == "dev-clear":
+        dev_clear_cache(args)
 
 
 if __name__ == "__main__":

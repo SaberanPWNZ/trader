@@ -61,10 +61,27 @@ class StrategyConfig:
     macd_signal: int = 9
     # ATR
     atr_period: int = 14
+    # Risk Management
+    stop_loss_atr_multiplier: float = 2.0  # ATR multiplier for stop loss
+    take_profit_atr_multiplier: float = 3.0  # ATR multiplier for take profit
     # AI Model
     model_type: str = "xgboost"  # randomforest, xgboost
     model_path: Optional[str] = None
     min_confidence: float = 0.6
+
+
+@dataclass
+class DevConfig:
+    """Development mode configuration."""
+    enabled: bool = False  # Enable dev mode
+    use_mock_data: bool = True  # Use mock data instead of real APIs
+    mock_symbol: str = "BTC-USD"  # Symbol for mock data
+    mock_base_price: float = 45000.0  # Base price for mock data
+    mock_volatility: float = 0.02  # Daily volatility (2%)
+    mock_days: int = 90  # Number of days for mock data
+    local_data_dir: str = "data/local"  # Directory for local data files
+    debug_level: int = 1  # Debug verbosity (0=off, 1=info, 2=verbose)
+    skip_api_validation: bool = True  # Skip API key validation in dev mode
 
 
 @dataclass
@@ -139,6 +156,7 @@ class Settings:
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     pybroker: PyBrokerConfig = field(default_factory=PyBrokerConfig)
+    dev: DevConfig = field(default_factory=DevConfig)
     
     # Paths
     base_dir: Path = field(default_factory=lambda: Path(__file__).parent.parent)
@@ -150,10 +168,29 @@ class Settings:
         self.data_dir.mkdir(exist_ok=True)
         self.models_dir.mkdir(exist_ok=True)
         Path(self.monitoring.log_dir).mkdir(exist_ok=True)
+        
+        # Create dev data directory if dev mode enabled
+        if self.dev.enabled:
+            Path(self.dev.local_data_dir).mkdir(parents=True, exist_ok=True)
     
     def get_symbol_for_pybroker(self, crypto_pair: str) -> str:
         """Convert ccxt symbol to YFinance symbol for PyBroker."""
         return self.pybroker.symbol_mapping.get(crypto_pair, crypto_pair)
+    
+    def enable_dev_mode(self) -> None:
+        """Enable development mode."""
+        self.dev.enabled = True
+        self.dev.use_mock_data = True
+        Path(self.dev.local_data_dir).mkdir(parents=True, exist_ok=True)
+        from loguru import logger
+        logger.info("✅ Development mode ENABLED")
+    
+    def disable_dev_mode(self) -> None:
+        """Disable development mode."""
+        self.dev.enabled = False
+        self.dev.use_mock_data = False
+        from loguru import logger
+        logger.info("🔓 Development mode DISABLED")
 
 
 # Global settings instance

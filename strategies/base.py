@@ -32,9 +32,19 @@ class BaseStrategy(ABC):
         self._signal_history: list = []
     
     @abstractmethod
-    def build_strategy(self) -> Strategy:
+    def build_strategy(self, 
+                      data_source=None,
+                      start_date: str = None,
+                      end_date: str = None,
+                      symbol: str = None) -> Strategy:
         """
         Build PyBroker strategy with entry/exit rules.
+        
+        Args:
+            data_source: PyBroker data source (e.g., YFinance)
+            start_date: Start date for backtest (YYYY-MM-DD)
+            end_date: End date for backtest (YYYY-MM-DD)
+            symbol: Trading symbol (e.g., 'BTC-USD')
         
         Returns:
             PyBroker Strategy instance
