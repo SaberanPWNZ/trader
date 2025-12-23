@@ -87,13 +87,16 @@ class LearningTelegramBot:
         message = update.get("message", {})
         text = message.get("text", "")
         chat_id = message.get("chat", {}).get("id")
+        chat_type = message.get("chat", {}).get("type")  # 'private', 'group', 'supergroup'
 
         if not text or not chat_id:
             return
 
+        # Only accept commands from the configured chat or private messages
         if str(chat_id) != str(self.chat_id):
-            logger.warning(f"Unauthorized chat: {chat_id}")
-            return
+            if chat_type != "private":
+                logger.debug(f"Ignoring message from unauthorized chat: {chat_id} (type: {chat_type})")
+                return
 
         parts = text.strip().split()
         command = parts[0].lower()
