@@ -16,38 +16,25 @@ from .indicators import TechnicalIndicators
 
 
 class AIStrategy(BaseStrategy):
-    """
-    AI/ML-based trading strategy.
-    
-    Uses Random Forest or XGBoost models to predict
-    trading signals based on technical indicators.
-    """
-    
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: Optional[str] = None, model_type: str = None):
         super().__init__(name="ai_strategy")
         self.config = settings.strategy
         self.model = None
         self.model_path = model_path or self.config.model_path
+        self.model_type = model_type or self.config.model_type
         self.feature_columns = FEATURE_COLUMNS
         
         if self.model_path:
             self.load_model(self.model_path)
+
+    def build_strategy(self, data_source=None, start_date: str = None, end_date: str = None, symbol: str = None):
+        return None
     
     def calculate_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Add technical indicators and prepare features."""
         df = TechnicalIndicators.add_all_indicators(data, self.config)
         return df
     
     def prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Prepare feature matrix for model prediction.
-        
-        Args:
-            data: DataFrame with indicators
-            
-        Returns:
-            Feature matrix
-        """
         if not all(col in data.columns for col in self.feature_columns):
             data = self.calculate_features(data)
         
@@ -55,15 +42,6 @@ class AIStrategy(BaseStrategy):
         return features
     
     def generate_signal(self, data: pd.DataFrame) -> Signal:
-        """
-        Generate trading signal using ML model.
-        
-        Args:
-            data: DataFrame with OHLCV data
-            
-        Returns:
-            Trading signal
-        """
         if self.model is None:
             logger.warning("No model loaded, returning HOLD signal")
             return self.create_signal(
@@ -142,7 +120,6 @@ class AIStrategy(BaseStrategy):
             )
     
     def load_model(self, path: str) -> None:
-        """Load trained model from file."""
         try:
             with open(path, 'rb') as f:
                 self.model = pickle.load(f)
@@ -152,10 +129,10 @@ class AIStrategy(BaseStrategy):
             self.model = None
     
     def save_model(self, path: str) -> None:
-        """Save trained model to file."""
         if self.model is None:
             raise ValueError("No model to save")
         
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump(self.model, f)
         logger.info(f"Saved model to {path}")
@@ -166,34 +143,20 @@ class AIStrategy(BaseStrategy):
         label_column: str = 'label',
         test_size: float = 0.2
     ) -> dict:
-        """
-        Train the ML model.
-        
-        Args:
-            data: DataFrame with features and labels
-            label_column: Name of label column
-            test_size: Test set proportion
-            
-        Returns:
-            Training metrics
-        """
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, classification_report
         
-        # Prepare features and labels
         data = self.calculate_features(data)
-        data = self._create_labels(data)
+        data = self.create_labels(data)
         
         features = data[self.feature_columns].dropna()
         labels = data.loc[features.index, label_column]
         
-        # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             features, labels, test_size=test_size, shuffle=False
         )
         
-        # Create and train model
-        if self.config.model_type == 'xgboost':
+        if self.model_type == 'xgboost':
             try:
                 from xgboost import XGBClassifier
                 self.model = XGBClassifier(
@@ -220,7 +183,6 @@ class AIStrategy(BaseStrategy):
         
         self.model.fit(X_train, y_train)
         
-        # Evaluate
         train_pred = self.model.predict(X_train)
         test_pred = self.model.predict(X_test)
         
@@ -234,40 +196,22 @@ class AIStrategy(BaseStrategy):
         
         return metrics
     
-    def _create_labels(
+    def create_labels(
         self,
         data: pd.DataFrame,
         forward_periods: int = 10,
-        threshold: float = 0.002  # 0.2% minimum expected move
+        threshold: float = 0.002
     ) -> pd.DataFrame:
-        """
-        Create labels for supervised learning.
-        
-        Labels:
-        - BUY (1): Expected price increase > threshold
-        - SELL (-1): Expected price decrease > threshold
-        - HOLD (0): No clear edge
-        
-        Args:
-            data: DataFrame with OHLCV data
-            forward_periods: Lookahead periods for return calculation
-            threshold: Minimum return threshold
-            
-        Returns:
-            DataFrame with label column
-        """
         data = data.copy()
         
-        # Calculate forward returns
         data['forward_return'] = data['close'].shift(-forward_periods) / data['close'] - 1
         
-        # Create labels
         conditions = [
             data['forward_return'] > threshold,
             data['forward_return'] < -threshold
         ]
-        choices = [1, -1]  # BUY, SELL
+        choices = [2, 0]
         
-        data['label'] = np.select(conditions, choices, default=0)  # HOLD
+        data['label'] = np.select(conditions, choices, default=1)
         
         return data

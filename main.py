@@ -349,18 +349,15 @@ async def dev_backtest(args):
 
 
 async def dev_train(args):
-    """Train AI model with synthetic data (dev mode)."""
     import pickle
     from sklearn.ensemble import RandomForestClassifier
     from data.mock_generator import generate_training_data
     
     logger.info("🔧 Development mode: Training model with synthetic data")
     
-    # Enable dev mode
     settings.enable_dev_mode()
     
     try:
-        # Generate synthetic training data
         symbol = args.symbol or settings.dev.mock_symbol
         samples = args.samples or 1000
         features = args.features or 20
@@ -368,12 +365,10 @@ async def dev_train(args):
         logger.info(f"Generating {samples} training samples with {features} features")
         X, y = generate_training_data(symbol, samples, features)
         
-        # Train model using scikit-learn
         logger.info(f"Training RandomForest model on {samples} synthetic samples...")
         model = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
         model.fit(X, y)
         
-        # Save model
         import os
         os.makedirs("models", exist_ok=True)
         model_path = args.output or f"models/{symbol}_dev_{datetime.now():%Y%m%d_%H%M%S}.pkl"
@@ -389,6 +384,86 @@ async def dev_train(args):
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        sys.exit(1)
+
+
+async def run_scheduler(args):
+    from learning.scheduler import LearningScheduler
+    from learning.database import LearningDatabase
+    
+    logger.info("🤖 Starting self-learning scheduler")
+    
+    settings.self_learning.enabled = True
+    if args.interval:
+        settings.self_learning.training_interval_hours = args.interval
+    if args.auto_deploy:
+        settings.self_learning.auto_deploy_enabled = True
+    
+    symbols = args.symbols or settings.trading.symbols
+    
+    db = LearningDatabase()
+    scheduler = LearningScheduler(db=db, symbols=symbols)
+    
+    try:
+        await scheduler.start()
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("Shutting down scheduler...")
+    finally:
+        await scheduler.stop()
+
+
+async def run_telegram_bot(args):
+    from learning.telegram_bot import LearningTelegramBot
+    from learning.scheduler import LearningScheduler
+    from learning.database import LearningDatabase
+    
+    logger.info("🤖 Starting Telegram bot")
+    
+    settings.monitoring.telegram_commands_enabled = True
+    
+    db = LearningDatabase()
+    scheduler = LearningScheduler(db=db)
+    
+    async def on_train(symbol: str) -> dict:
+        return await scheduler.force_train(symbol)
+    
+    bot = LearningTelegramBot(db=db, on_train_command=on_train)
+    
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        logger.info("Shutting down bot...")
+    finally:
+        await bot.stop()
+
+
+async def run_force_train(args):
+    from learning.scheduler import LearningScheduler
+    from learning.database import LearningDatabase
+    
+    symbol = args.symbol
+    if "/" not in symbol:
+        symbol = f"{symbol}/USDT"
+    
+    logger.info(f"🤖 Force training model for {symbol}")
+    
+    db = LearningDatabase()
+    scheduler = LearningScheduler(db=db)
+    
+    result = await scheduler.force_train(symbol)
+    
+    if result["status"] == "success":
+        print(f"\n✅ Training complete")
+        print(f"   Model ID: {result['model_id']}")
+        print(f"   Train Accuracy: {result['train_accuracy']:.1%}")
+        print(f"   Test Accuracy: {result['test_accuracy']:.1%}")
+        print(f"   Samples: {result['samples']:,}")
+        print(f"   Improvement: {result['improvement']:.1%}")
+        print(f"   Should deploy: {result['should_deploy']}\n")
+    else:
+        print(f"\n❌ Training failed: {result.get('error', 'Unknown')}\n")
         sys.exit(1)
 
 
@@ -531,6 +606,16 @@ Examples:
     dev_clear_parser = subparsers.add_parser("dev-clear", help="[DEV] Clear cached data")
     dev_clear_parser.add_argument("--symbol", help="Clear specific symbol (or all if not set)")
     
+    scheduler_parser = subparsers.add_parser("scheduler", help="Run self-learning scheduler")
+    scheduler_parser.add_argument("--interval", type=int, help="Training interval in hours")
+    scheduler_parser.add_argument("--symbols", nargs="+", help="Symbols to train")
+    scheduler_parser.add_argument("--auto-deploy", action="store_true", help="Auto-deploy improved models")
+    
+    bot_parser = subparsers.add_parser("bot", help="Run Telegram bot for learning control")
+    
+    force_train_parser = subparsers.add_parser("force-train", help="Force training for a symbol")
+    force_train_parser.add_argument("symbol", help="Symbol to train (e.g., BTC/USDT)")
+    
     args = parser.parse_args()
     
     if not args.mode:
@@ -562,6 +647,12 @@ Examples:
         dev_list_data(args)
     elif args.mode == "dev-clear":
         dev_clear_cache(args)
+    elif args.mode == "scheduler":
+        asyncio.run(run_scheduler(args))
+    elif args.mode == "bot":
+        asyncio.run(run_telegram_bot(args))
+    elif args.mode == "force-train":
+        asyncio.run(run_force_train(args))
 
 
 if __name__ == "__main__":
