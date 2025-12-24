@@ -129,6 +129,13 @@ class LearningDatabase:
             """, (model_id,))
             await db.commit()
 
+    async def update_model_sharpe(self, model_id: str, sharpe_ratio: Optional[float]) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE models SET sharpe_ratio = ? WHERE id = ?
+            """, (sharpe_ratio, model_id))
+            await db.commit()
+
     async def get_models(self, symbol: Optional[str] = None, limit: int = 10) -> List[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -247,6 +254,23 @@ class LearningDatabase:
                     "total_pnl": total_pnl or 0,
                     "avg_confidence": avg_confidence or 0
                 }
+
+    async def get_predictions_with_outcomes(
+        self,
+        symbol: str,
+        days: int = 30
+    ) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM predictions
+                WHERE symbol = ?
+                    AND actual_outcome IS NOT NULL
+                    AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp DESC
+            """, (symbol, f'-{days} days')) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
 
     async def get_performance_summary(self, days: int = 30) -> dict:
         async with aiosqlite.connect(self.db_path) as db:

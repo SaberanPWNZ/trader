@@ -94,6 +94,11 @@ class SelfLearningConfig:
     performance_lookback_days: int = 60
     holdout_days: int = 5
     auto_deploy_enabled: bool = False
+    backtest_before_deploy: bool = True
+    min_sharpe_ratio: float = 1.0
+    max_drawdown_percent: float = 15.0
+    min_win_rate: float = 0.50
+    min_profit_factor: float = 1.2
 
 
 @dataclass
