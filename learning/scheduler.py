@@ -132,9 +132,15 @@ class LearningScheduler:
                         samples=result["samples"],
                         duration_seconds=result["duration_seconds"],
                         improvement=result.get("improvement", 0),
-                        deployed=result.get("deployed", False)
+                        deployed=result.get("deployed", False),
+                        backtest_metrics=result.get("backtest_metrics")
                     )
                     await self.model_manager.cleanup_old_models(symbol)
+                elif result.get("status") == "skipped":
+                    await telegram.training_skipped(
+                        symbol=symbol,
+                        reason=result.get("reason", "Training interval not reached")
+                    )
                 else:
                     await telegram.training_failed(
                         symbol=symbol,

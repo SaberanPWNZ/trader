@@ -222,7 +222,8 @@ All trading has been halted. Manual intervention required.
         samples: int,
         duration_seconds: float,
         improvement: float = 0,
-        deployed: bool = False
+        deployed: bool = False,
+        backtest_metrics: dict = None
     ) -> None:
         emoji = "🤖" if test_accuracy >= 0.6 else "⚠️"
         improvement_text = f"+{improvement:.1%}" if improvement > 0 else f"{improvement:.1%}"
@@ -239,9 +240,24 @@ All trading has been halted. Manual intervention required.
 <b>Samples:</b> {samples:,}
 <b>Duration:</b> {duration_seconds:.1f}s
 <b>Status:</b> {deployed_text}
-
-<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
 """
+        
+        if backtest_metrics and isinstance(backtest_metrics, dict):
+            if backtest_metrics.get('backtest_skipped'):
+                message += "\n<i>Backtest: Skipped</i>\n"
+            elif backtest_metrics.get('error'):
+                message += f"\n<i>Backtest: Error - {backtest_metrics['error']}</i>\n"
+            else:
+                passed = "✅" if backtest_metrics.get('passes_validation') else "❌"
+                message += f"""
+<b>Backtest Results:</b> {passed}
+<b>├ Sharpe Ratio:</b> {backtest_metrics.get('sharpe_ratio', 0):.2f}
+<b>├ Max Drawdown:</b> {backtest_metrics.get('max_drawdown_percent', 0):.1f}%
+<b>├ Win Rate:</b> {backtest_metrics.get('win_rate', 0):.1%}
+<b>└ Profit Factor:</b> {backtest_metrics.get('profit_factor', 0):.2f}
+"""
+
+        message += f"\n<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
         await self.send_message(message)
 
     async def training_failed(self, symbol: str, error: str) -> None:
@@ -250,6 +266,17 @@ All trading has been halted. Manual intervention required.
 
 <b>Symbol:</b> {symbol}
 <b>Error:</b> {error}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
+
+    async def training_skipped(self, symbol: str, reason: str) -> None:
+        message = f"""
+⏭️ <b>Training Skipped</b>
+
+<b>Symbol:</b> {symbol}
+<b>Reason:</b> {reason}
 
 <i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
 """
