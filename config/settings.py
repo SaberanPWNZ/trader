@@ -141,10 +141,10 @@ class BacktestConfig:
 
 @dataclass
 class MonitoringConfig:
-    telegram_enabled: bool = False
+    telegram_enabled: bool = field(default_factory=lambda: os.getenv("TELEGRAM_ENABLED", "false").lower() == "true")
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
-    telegram_commands_enabled: bool = False
+    telegram_commands_enabled: bool = field(default_factory=lambda: os.getenv("TELEGRAM_COMMANDS_ENABLED", "false").lower() == "true")
     telegram_polling_interval: int = 2
     log_level: str = "INFO"
     log_to_file: bool = True

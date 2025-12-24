@@ -51,7 +51,7 @@ class TelegramAlert:
             True if sent successfully
         """
         if not self.enabled:
-            logger.debug(f"Telegram disabled, would send: {text[:50]}...")
+            logger.warning(f"Telegram disabled - cannot send message")
             return False
         
         if not self.token or not self.chat_id:
@@ -61,6 +61,7 @@ class TelegramAlert:
         try:
             session = await self._get_session()
             
+            logger.info(f"Sending Telegram message to chat_id={self.chat_id}")
             async with session.post(
                 f"{self.base_url}/sendMessage",
                 json={
@@ -70,9 +71,11 @@ class TelegramAlert:
                 }
             ) as response:
                 if response.status == 200:
+                    logger.info("Telegram message sent successfully")
                     return True
                 else:
-                    logger.error(f"Telegram API error: {response.status}")
+                    error_text = await response.text()
+                    logger.error(f"Telegram API error: {response.status} - {error_text}")
                     return False
                     
         except Exception as e:

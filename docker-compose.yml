@@ -5,10 +5,12 @@ services:
     build: .
     container_name: crypto-trading-bot
     restart: unless-stopped
-    command: ["python", "main.py", "scheduler"]
+    command: ["sleep", "infinity"]
     environment:
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
+      - TELEGRAM_COMMANDS_ENABLED=${TELEGRAM_COMMANDS_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TRAINING_INTERVAL_HOURS=${TRAINING_INTERVAL_HOURS:-4}
@@ -26,6 +28,8 @@ services:
     environment:
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
+      - TELEGRAM_COMMANDS_ENABLED=${TELEGRAM_COMMANDS_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TRAINING_INTERVAL_HOURS=${TRAINING_INTERVAL_HOURS:-4}
@@ -42,6 +46,8 @@ services:
     container_name: crypto-telegram-bot
     restart: unless-stopped
     environment:
+      - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-true}
+      - TELEGRAM_COMMANDS_ENABLED=${TELEGRAM_COMMANDS_ENABLED:-true}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TRAINING_INTERVAL_HOURS=4
