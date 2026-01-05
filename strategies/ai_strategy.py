@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import pandas as pd
 import numpy as np
 from loguru import logger
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import accuracy_score, classification_report
 
 from config.settings import settings
 from config.constants import SignalType, FEATURE_COLUMNS
@@ -50,7 +52,6 @@ class AIStrategy(BaseStrategy):
                 confidence=0.0
             )
         
-        # Prepare data
         data = self.calculate_features(data)
         features = self.prepare_features(data)
         
@@ -66,23 +67,29 @@ class AIStrategy(BaseStrategy):
         close_price = current['close']
         atr = current['atr']
         
-        # Get prediction
         X = features.iloc[[-1]]
         prediction = self.model.predict(X)[0]
         
-        # Get prediction probabilities if available
-        confidence = self.config.min_confidence
+        confidence = 0.5
         if hasattr(self.model, 'predict_proba'):
             probas = self.model.predict_proba(X)[0]
             confidence = max(probas)
         
-        # Map prediction to signal
-        if prediction == 1 and confidence >= self.config.min_confidence:
+        confidence_threshold = settings.self_learning.confidence_threshold
+        
+        if confidence < confidence_threshold:
+            logger.debug(f"AI HOLD signal for {symbol}: low confidence={confidence:.2f}")
+            return self.create_signal(
+                symbol=symbol,
+                signal_type=SignalType.HOLD,
+                confidence=confidence,
+                metadata={'prediction': int(prediction), 'reason': 'low_confidence'}
+            )
+        
+        if prediction == 1:
             stop_loss = close_price - (atr * self.config.stop_loss_atr_multiplier)
             take_profit = close_price + (atr * self.config.take_profit_atr_multiplier)
-            
             logger.info(f"AI BUY signal for {symbol}: confidence={confidence:.2f}")
-            
             return self.create_signal(
                 symbol=symbol,
                 signal_type=SignalType.BUY,
@@ -92,13 +99,10 @@ class AIStrategy(BaseStrategy):
                 take_profit=take_profit,
                 metadata={'prediction': 1}
             )
-        
-        elif prediction == -1 and confidence >= self.config.min_confidence:
+        else:
             stop_loss = close_price + (atr * self.config.stop_loss_atr_multiplier)
             take_profit = close_price - (atr * self.config.take_profit_atr_multiplier)
-            
             logger.info(f"AI SELL signal for {symbol}: confidence={confidence:.2f}")
-            
             return self.create_signal(
                 symbol=symbol,
                 signal_type=SignalType.SELL,
@@ -106,17 +110,7 @@ class AIStrategy(BaseStrategy):
                 entry_price=close_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                metadata={'prediction': -1}
-            )
-        
-        else:
-            logger.debug(f"AI HOLD signal for {symbol}: confidence={confidence:.2f}")
-            
-            return self.create_signal(
-                symbol=symbol,
-                signal_type=SignalType.HOLD,
-                confidence=confidence,
-                metadata={'prediction': prediction}
+                metadata={'prediction': 0}
             )
     
     def load_model(self, path: str) -> None:
@@ -143,56 +137,108 @@ class AIStrategy(BaseStrategy):
         label_column: str = 'label',
         test_size: float = 0.2
     ) -> dict:
-        from sklearn.model_selection import train_test_split
-        from sklearn.metrics import accuracy_score, classification_report
+        learning_config = settings.self_learning
         
         data = self.calculate_features(data)
-        data = self.create_labels(data)
+        data = self.create_labels(data, threshold=learning_config.label_threshold)
         
-        features = data[self.feature_columns].dropna()
-        labels = data.loc[features.index, label_column]
+        valid_data = data.dropna(subset=self.feature_columns + [label_column])
+        features = valid_data[self.feature_columns]
+        labels = valid_data[label_column]
         
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, labels, test_size=test_size, shuffle=False
-        )
+        if len(features) < learning_config.min_samples_for_training:
+            logger.warning(f"Insufficient data: {len(features)} samples, need {learning_config.min_samples_for_training}")
+            return {'error': 'insufficient_data', 'samples': len(features)}
+        
+        split_idx = int(len(features) * (1 - test_size))
+        X_train, X_test = features.iloc[:split_idx], features.iloc[split_idx:]
+        y_train, y_test = labels.iloc[:split_idx], labels.iloc[split_idx:]
+        
+        pos_count = (y_train == 1).sum()
+        neg_count = (y_train == 0).sum()
+        scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+        
+        logger.info(f"Training data: {len(y_train)} samples, pos={pos_count}, neg={neg_count}, scale={scale_pos_weight:.2f}")
+        
+        cv_splits = learning_config.cv_splits
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
         
         if self.model_type == 'xgboost':
             try:
                 from xgboost import XGBClassifier
-                self.model = XGBClassifier(
-                    n_estimators=100,
-                    max_depth=5,
-                    learning_rate=0.1,
-                    random_state=42
+                base_model = XGBClassifier(
+                    random_state=42,
+                    scale_pos_weight=scale_pos_weight,
+                    eval_metric='logloss'
                 )
+                if learning_config.hyperparameter_tuning:
+                    param_grid = {
+                        'n_estimators': [50, 100, 200],
+                        'max_depth': [3, 5, 7],
+                        'learning_rate': [0.01, 0.05, 0.1]
+                    }
+                    grid_search = GridSearchCV(
+                        base_model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1
+                    )
+                    grid_search.fit(X_train, y_train)
+                    self.model = grid_search.best_estimator_
+                    best_params = grid_search.best_params_
+                    cv_score = grid_search.best_score_
+                    logger.info(f"Best params: {best_params}, CV score: {cv_score:.3f}")
+                else:
+                    base_model.set_params(n_estimators=100, max_depth=5, learning_rate=0.05)
+                    base_model.fit(X_train, y_train)
+                    self.model = base_model
+                    best_params = {}
+                    cv_score = 0.0
             except ImportError:
                 logger.warning("XGBoost not available, using RandomForest")
-                from sklearn.ensemble import RandomForestClassifier
-                self.model = RandomForestClassifier(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-        else:
-            from sklearn.ensemble import RandomForestClassifier
-            self.model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42
-            )
+                self.model_type = 'randomforest'
         
-        self.model.fit(X_train, y_train)
+        if self.model_type != 'xgboost':
+            from sklearn.ensemble import RandomForestClassifier
+            base_model = RandomForestClassifier(
+                random_state=42,
+                class_weight='balanced'
+            )
+            if learning_config.hyperparameter_tuning:
+                param_grid = {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [5, 10, 15],
+                    'min_samples_split': [2, 5, 10]
+                }
+                grid_search = GridSearchCV(
+                    base_model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1
+                )
+                grid_search.fit(X_train, y_train)
+                self.model = grid_search.best_estimator_
+                best_params = grid_search.best_params_
+                cv_score = grid_search.best_score_
+                logger.info(f"Best params: {best_params}, CV score: {cv_score:.3f}")
+            else:
+                base_model.set_params(n_estimators=100, max_depth=10)
+                base_model.fit(X_train, y_train)
+                self.model = base_model
+                best_params = {}
+                cv_score = 0.0
         
         train_pred = self.model.predict(X_train)
         test_pred = self.model.predict(X_test)
         
+        train_accuracy = accuracy_score(y_train, train_pred)
+        test_accuracy = accuracy_score(y_test, test_pred)
+        
         metrics = {
-            'train_accuracy': accuracy_score(y_train, train_pred),
-            'test_accuracy': accuracy_score(y_test, test_pred),
+            'train_accuracy': train_accuracy,
+            'test_accuracy': test_accuracy,
+            'cv_score': cv_score,
+            'best_params': best_params,
+            'samples_used': len(features),
+            'class_balance': {'positive': int(pos_count), 'negative': int(neg_count)},
             'classification_report': classification_report(y_test, test_pred)
         }
         
-        logger.info(f"Model trained: train_acc={metrics['train_accuracy']:.3f}, test_acc={metrics['test_accuracy']:.3f}")
+        logger.info(f"Model trained: train_acc={train_accuracy:.3f}, test_acc={test_accuracy:.3f}, cv={cv_score:.3f}")
         
         return metrics
     
@@ -200,18 +246,22 @@ class AIStrategy(BaseStrategy):
         self,
         data: pd.DataFrame,
         forward_periods: int = 10,
-        threshold: float = 0.002
+        threshold: float = 0.005
     ) -> pd.DataFrame:
         data = data.copy()
         
         data['forward_return'] = data['close'].shift(-forward_periods) / data['close'] - 1
         
-        conditions = [
-            data['forward_return'] > threshold,
-            data['forward_return'] < -threshold
-        ]
-        choices = [2, 0]
+        data['label'] = np.where(data['forward_return'] > threshold, 1, 
+                                 np.where(data['forward_return'] < -threshold, 0, np.nan))
         
-        data['label'] = np.select(conditions, choices, default=1)
+        initial_count = len(data)
+        data = data.dropna(subset=['label'])
+        filtered_count = initial_count - len(data)
+        
+        if filtered_count > 0:
+            logger.debug(f"Filtered {filtered_count} neutral samples ({filtered_count/initial_count*100:.1f}%)")
+        
+        data['label'] = data['label'].astype(int)
         
         return data
