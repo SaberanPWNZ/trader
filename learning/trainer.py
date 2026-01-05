@@ -36,6 +36,13 @@ class AutoTrainer:
             raise ValueError(f"Insufficient samples: {len(prepared_data)} < {self.config.min_samples_for_training}")
 
         metrics = strategy.train(prepared_data)
+        
+        if 'error' in metrics:
+            raise ValueError(f"Training failed: {metrics['error']}, samples={metrics.get('samples', 0)}")
+        
+        if strategy.model is None:
+            raise ValueError("Training completed but no model was created")
+        
         duration = time.time() - start_time
 
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -295,6 +302,9 @@ class AutoTrainer:
         
         final_strategy = AIStrategy(model_type=model_type)
         final_metrics = final_strategy.train(prepared_data)
+        
+        if 'error' in final_metrics or final_strategy.model is None:
+            raise ValueError(f"Final training failed after walk-forward validation")
         
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         model_filename = f"{symbol.replace('/', '_')}_{model_type}_wf_{timestamp}.pkl"
