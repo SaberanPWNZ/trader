@@ -26,17 +26,190 @@ async def run_backtest(args):
 
 
 async def run_paper_trading(args):
-    logger.warning("⚠️ Paper trading mode not available - PyBroker not installed")
-    logger.info("Available modes: force-train, scheduler, bot")
-    sys.exit(1)
+    from paper.simulator import PaperTradingSimulator
+    from strategies.ai_strategy import AIStrategy
+    from strategies.rule_based import RuleBasedStrategy
+    from learning.database import LearningDatabase
+    from monitoring.alerts import telegram
+    
+    logger.info("📄 Starting Paper Trading mode")
+    
+    symbol = args.symbol
+    if "/" not in symbol:
+        symbol = f"{symbol}/USDT"
+    symbols = [symbol]
+    
+    if args.strategy == "ai":
+        model_path = args.model
+        if not model_path:
+            db = LearningDatabase()
+            await db.initialize()
+            deployed = await db.get_deployed_model(symbol)
+            if deployed:
+                model_path = deployed['model_path']
+                logger.info(f"Using deployed model: {model_path}")
+            else:
+                logger.error(f"No deployed model for {symbol}. Run training first.")
+                sys.exit(1)
+        strategy = AIStrategy(model_path=model_path)
+    else:
+        strategy = RuleBasedStrategy()
+    
+    db = LearningDatabase()
+    await db.initialize()
+    
+    initial_balance = args.initial_balance or settings.backtest.initial_balance
+    
+    simulator = PaperTradingSimulator(
+        strategy=strategy,
+        initial_balance=initial_balance,
+        db=db,
+        symbols=symbols
+    )
+    
+    await telegram.send_message(
+        f"📄 Paper trading started\n"
+        f"Symbol: {symbol}\n"
+        f"Strategy: {args.strategy}\n"
+        f"Balance: ${initial_balance:,.2f}"
+    )
+    
+    try:
+        await simulator.start()
+        
+        while True:
+            await asyncio.sleep(60)
+            status = simulator.get_status()
+            logger.info(
+                f"Paper: Balance=${status['balance']:,.2f} "
+                f"PnL=${status['total_pnl']:,.2f} "
+                f"Trades={status['total_trades']} "
+                f"WinRate={status['win_rate']:.1%}"
+            )
+    except KeyboardInterrupt:
+        logger.info("Stopping paper trading...")
+    finally:
+        await simulator.stop()
+        await telegram.send_message(
+            f"📄 Paper trading stopped\n"
+            f"Final PnL: ${simulator.stats.total_pnl:,.2f}\n"
+            f"Total Trades: {simulator.stats.total_trades}"
+        )
 
 
 
 
 async def run_live_trading(args):
-    logger.warning("⚠️ Live trading mode not available - PyBroker not installed")
-    logger.info("Available modes: force-train, scheduler, bot")
-    sys.exit(1)
+    from exchange.client import ExchangeClient
+    from exchange.factory import create_exchange
+    from execution.executor import TradeExecutor
+    from strategies.ai_strategy import AIStrategy
+    from strategies.rule_based import RuleBasedStrategy
+    from learning.database import LearningDatabase
+    from risk.manager import RiskManager
+    from monitoring.alerts import telegram
+    import yfinance as yf
+    
+    if not args.confirm:
+        logger.error("❌ Live trading requires --confirm flag")
+        logger.warning("⚠️ THIS WILL TRADE WITH REAL MONEY!")
+        logger.info("   Add --confirm to proceed")
+        sys.exit(1)
+    
+    if not settings.exchange.api_key or not settings.exchange.api_secret:
+        logger.error("❌ Exchange API keys not configured")
+        logger.info("   Set BINANCE_API_KEY and BINANCE_API_SECRET in .env")
+        sys.exit(1)
+    
+    logger.warning("🚨 STARTING LIVE TRADING - REAL MONEY AT RISK 🚨")
+    
+    symbols = settings.trading.symbols
+    
+    if args.strategy == "ai":
+        db = LearningDatabase()
+        await db.initialize()
+        
+        model_path = args.model
+        if not model_path:
+            deployed = await db.get_deployed_model(symbols[0])
+            if deployed:
+                model_path = deployed['model_path']
+        
+        if not model_path:
+            logger.error(f"No deployed model for {symbols[0]}")
+            sys.exit(1)
+        
+        strategy = AIStrategy(model_path=model_path)
+    else:
+        strategy = RuleBasedStrategy()
+    
+    exchange = create_exchange(testnet=settings.exchange.testnet)
+    await exchange.connect()
+    
+    validation = await exchange.validate_connection()
+    if not validation['success']:
+        logger.error(f"Exchange connection failed: {validation['error']}")
+        sys.exit(1)
+    
+    logger.info(f"✅ Connected to {exchange.exchange_id}")
+    logger.info(f"   Testnet: {exchange.testnet}")
+    logger.info(f"   Balance: {validation['balance']} USDT")
+    
+    balance = await exchange.get_available_balance('USDT')
+    risk_manager = RiskManager(portfolio_value=balance)
+    executor = TradeExecutor(exchange, risk_manager)
+    
+    db = LearningDatabase()
+    await db.initialize()
+    executor.set_learning_db(db)
+    
+    await telegram.send_message(
+        f"🚨 LIVE TRADING STARTED\n"
+        f"Exchange: {exchange.exchange_id}\n"
+        f"Testnet: {exchange.testnet}\n"
+        f"Balance: ${balance:,.2f}\n"
+        f"Strategy: {args.strategy}"
+    )
+    
+    try:
+        while True:
+            for symbol in symbols:
+                try:
+                    yf_symbol = settings.get_symbol_for_pybroker(symbol)
+                    ticker = yf.Ticker(yf_symbol)
+                    data = ticker.history(period="7d", interval="1h")
+                    
+                    if data.empty:
+                        continue
+                    
+                    data = data.reset_index()
+                    data.columns = [c.lower() for c in data.columns]
+                    data['symbol'] = symbol
+                    
+                    signal = strategy.generate_signal(data)
+                    
+                    if signal.signal_type != 0:
+                        result = await executor.execute_signal(signal)
+                        if result and result.success:
+                            await telegram.send_message(
+                                f"📈 Trade executed\n"
+                                f"Symbol: {symbol}\n"
+                                f"Side: {result.side}\n"
+                                f"Amount: {result.amount}\n"
+                                f"Price: ${result.average_price:,.2f}"
+                            )
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {symbol}: {e}")
+            
+            await asyncio.sleep(300)
+            
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        await executor.close_all_positions("Shutdown")
+        await exchange.disconnect()
+        await telegram.send_message("🛑 LIVE TRADING STOPPED")
 
 
 
