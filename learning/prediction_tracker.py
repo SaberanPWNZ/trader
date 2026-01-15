@@ -89,9 +89,11 @@ class PredictionTracker:
         return total_pnl
 
     def _signal_to_int(self, signal_type) -> int:
+        if isinstance(signal_type, int):
+            return signal_type
         signal_map = {
-            'buy': 2,
-            'sell': 0,
-            'hold': 1
+            'buy': 1,
+            'sell': -1,
+            'hold': 0
         }
-        return signal_map.get(signal_type.lower(), 1)
+        return signal_map.get(str(signal_type).lower(), 0)

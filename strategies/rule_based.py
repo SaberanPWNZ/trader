@@ -13,18 +13,14 @@ from .indicators import TechnicalIndicators
 
 
 class RuleBasedStrategy(BaseStrategy):
-    """
-    Rule-based trading strategy using technical indicators.
-    
-    Uses EMA crossovers, RSI, and MACD for signal generation.
-    """
-    
     def __init__(self):
         super().__init__(name="rule_based")
         self.config = settings.strategy
     
+    def build_strategy(self, data_source=None, start_date: str = None, end_date: str = None, symbol: str = None):
+        return None
+    
     def calculate_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Add technical indicators to data."""
         return TechnicalIndicators.add_all_indicators(data, self.config)
     
     def generate_signal(self, data: pd.DataFrame) -> Signal:

@@ -11,9 +11,10 @@ from loguru import logger
 from config.settings import settings
 from config.constants import OrderSide, OrderType, SignalType
 from data.models import Signal, Position
-from data.collector import DataCollector
 from strategies.base import BaseStrategy
 from risk.manager import RiskManager
+from learning.database import LearningDatabase
+from learning.prediction_tracker import PredictionTracker
 
 
 @dataclass
@@ -60,124 +61,115 @@ class PaperTradingStats:
 
 
 class PaperTradingSimulator:
-    """
-    Paper trading simulator for strategy testing in live market conditions.
-    
-    Features:
-    - Simulated account balance
-    - Virtual order execution
-    - Fee accounting
-    - Performance tracking
-    - Comparison with live results
-    """
-    
     def __init__(
         self,
         strategy: BaseStrategy,
         initial_balance: float = None,
-        fee_rate: float = None
+        fee_rate: float = None,
+        db: Optional[LearningDatabase] = None,
+        exchange_client = None,
+        symbols: Optional[List[str]] = None
     ):
-        """
-        Initialize paper trading simulator.
-        
-        Args:
-            strategy: Trading strategy to simulate
-            initial_balance: Starting balance
-            fee_rate: Trading fee rate
-        """
         self.strategy = strategy
         self.initial_balance = initial_balance or settings.backtest.initial_balance
         self.fee_rate = fee_rate or settings.backtest.trading_fee
+        self.symbols = symbols or settings.trading.symbols
         
-        # Account state
         self._balance = self.initial_balance
         self._positions: Dict[str, PaperPosition] = {}
         self._orders: List[PaperOrder] = []
         self._trade_history: List[Dict[str, Any]] = []
         
-        # Statistics
         self.stats = PaperTradingStats(peak_balance=self.initial_balance)
         
-        # Components
-        self.data_collector: Optional[DataCollector] = None
+        self.exchange = exchange_client
         self.risk_manager = RiskManager(self.initial_balance)
+        self.db = db
+        self.prediction_tracker: Optional[PredictionTracker] = None
+        if db:
+            self.prediction_tracker = PredictionTracker(db)
         
-        # Control
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._model_ids: Dict[str, str] = {}
     
     async def start(self) -> None:
-        """Start paper trading simulation."""
         logger.info("Starting paper trading simulator")
         
-        # Initialize data collector
-        self.data_collector = DataCollector()
-        await self.data_collector.connect()
+        if self.db:
+            await self.db.initialize()
+            for symbol in self.symbols:
+                deployed = await self.db.get_deployed_model(symbol)
+                if deployed:
+                    self._model_ids[symbol] = deployed['id']
+                    logger.info(f"Using deployed model {deployed['id']} for {symbol}")
         
         self._running = True
         
-        # Start trading loop for each symbol
-        for symbol in settings.trading.symbols:
+        for symbol in self.symbols:
             task = asyncio.create_task(self._trading_loop(symbol))
             self._tasks.append(task)
         
-        logger.info(f"Paper trading started for {settings.trading.symbols}")
+        logger.info(f"Paper trading started for {self.symbols}")
     
     async def stop(self) -> None:
-        """Stop paper trading simulation."""
         logger.info("Stopping paper trading simulator")
         
         self._running = False
         
-        # Cancel all tasks
         for task in self._tasks:
             task.cancel()
         
-        # Close all positions
         for symbol in list(self._positions.keys()):
             await self._close_position(symbol, "Simulation stopped")
-        
-        # Disconnect
-        if self.data_collector:
-            await self.data_collector.disconnect()
         
         logger.info("Paper trading stopped")
         self._print_summary()
     
+    async def _fetch_market_data(self, symbol: str, limit: int = 200):
+        import yfinance as yf
+        import pandas as pd
+        
+        yf_symbol = settings.get_symbol_for_pybroker(symbol)
+        ticker = yf.Ticker(yf_symbol)
+        data = ticker.history(period="7d", interval="1h")
+        
+        if data.empty:
+            return pd.DataFrame()
+        
+        data = data.reset_index()
+        data.columns = [c.lower() for c in data.columns]
+        if 'datetime' in data.columns:
+            data = data.rename(columns={'datetime': 'timestamp'})
+        elif 'date' in data.columns:
+            data = data.rename(columns={'date': 'timestamp'})
+        
+        data['symbol'] = symbol
+        return data.tail(limit)
+    
     async def _trading_loop(self, symbol: str) -> None:
-        """Main trading loop for a symbol."""
         logger.info(f"Starting trading loop for {symbol}")
         
         while self._running:
             try:
-                # Fetch current data
-                data = await self.data_collector.fetch_ohlcv(
-                    symbol,
-                    settings.trading.default_timeframe,
-                    limit=200
-                )
+                data = await self._fetch_market_data(symbol, limit=200)
                 
                 if data.empty:
+                    logger.warning(f"No data for {symbol}, waiting...")
                     await asyncio.sleep(60)
                     continue
                 
-                # Update position prices
                 current_price = data['close'].iloc[-1]
                 if symbol in self._positions:
                     self._update_position_price(symbol, current_price)
-                    
-                    # Check stop-loss / take-profit
                     await self._check_exit_conditions(symbol, current_price)
                 
-                # Generate and process signal
                 signal = self.strategy.generate_signal(data)
                 await self._process_signal(signal, current_price)
                 
-                # Update statistics
                 self._update_stats()
                 
-                # Wait for next iteration
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(300)
                 
             except asyncio.CancelledError:
                 break
@@ -186,39 +178,31 @@ class PaperTradingSimulator:
                 await asyncio.sleep(60)
     
     async def _process_signal(self, signal: Signal, current_price: float) -> None:
-        """Process trading signal."""
         symbol = signal.symbol
         
-        # Skip HOLD signals
         if signal.signal_type == SignalType.HOLD.value:
             return
         
-        # Check risk management
         can_trade, reason = self.risk_manager.can_trade(symbol)
         if not can_trade:
             logger.debug(f"Cannot trade {symbol}: {reason}")
             return
         
-        # Handle existing position
         if symbol in self._positions:
             position = self._positions[symbol]
             
-            # Close on opposite signal
             if ((signal.signal_type == SignalType.BUY.value and position.side == 'short') or
                 (signal.signal_type == SignalType.SELL.value and position.side == 'long')):
                 await self._close_position(symbol, "Signal reversal")
             else:
-                return  # Already have position in same direction
+                return
         
-        # Open new position
         await self._open_position(signal, current_price)
     
     async def _open_position(self, signal: Signal, current_price: float) -> None:
-        """Open a new paper position."""
         symbol = signal.symbol
         entry_price = current_price
         
-        # Calculate position size
         if signal.stop_loss:
             position_size = self.risk_manager.calculate_position_size(
                 entry_price, signal.stop_loss, symbol
@@ -229,10 +213,8 @@ class PaperTradingSimulator:
         if position_size <= 0:
             return
         
-        # Calculate fee
         fee = position_size * entry_price * self.fee_rate
         
-        # Create position
         position = PaperPosition(
             id=str(uuid.uuid4()),
             symbol=symbol,
@@ -248,7 +230,16 @@ class PaperTradingSimulator:
         self._balance -= fee
         self.stats.total_fees += fee
         
-        # Create order record
+        if self.prediction_tracker and symbol in self._model_ids:
+            try:
+                await self.prediction_tracker.log_prediction(
+                    symbol=symbol,
+                    signal=signal,
+                    model_id=self._model_ids[symbol]
+                )
+            except Exception as e:
+                logger.error(f"Failed to log prediction: {e}")
+        
         order = PaperOrder(
             id=str(uuid.uuid4()),
             symbol=symbol,
@@ -265,28 +256,24 @@ class PaperTradingSimulator:
         
         logger.info(
             f"📈 Paper {position.side.upper()} opened: {symbol} "
-            f"size={position_size:.6f} @ {entry_price:.2f}"
+            f"size={position_size:.6f} @ {entry_price:.2f} conf={signal.confidence:.1%}"
         )
     
     async def _close_position(self, symbol: str, reason: str) -> None:
-        """Close a paper position."""
         if symbol not in self._positions:
             return
         
         position = self._positions[symbol]
         exit_price = position.current_price
         
-        # Calculate PnL
         if position.side == 'long':
             pnl = (exit_price - position.entry_price) * position.amount
         else:
             pnl = (position.entry_price - exit_price) * position.amount
         
-        # Calculate exit fee
         exit_fee = position.amount * exit_price * self.fee_rate
         pnl -= exit_fee
         
-        # Update balance and stats
         self._balance += pnl
         self.stats.total_pnl += pnl
         self.stats.total_fees += exit_fee
@@ -297,7 +284,18 @@ class PaperTradingSimulator:
         else:
             self.stats.losing_trades += 1
         
-        # Record trade
+        if self.prediction_tracker:
+            try:
+                actual_outcome = 1 if pnl > 0 else -1 if pnl < 0 else 0
+                await self.prediction_tracker.update_prediction_outcome(
+                    symbol=symbol,
+                    actual_outcome=actual_outcome,
+                    exit_price=exit_price,
+                    pnl=pnl
+                )
+            except Exception as e:
+                logger.error(f"Failed to update prediction outcome: {e}")
+        
         self._trade_history.append({
             'symbol': symbol,
             'side': position.side,
@@ -310,7 +308,6 @@ class PaperTradingSimulator:
             'reason': reason
         })
         
-        # Create closing order
         order = PaperOrder(
             id=str(uuid.uuid4()),
             symbol=symbol,
@@ -325,7 +322,6 @@ class PaperTradingSimulator:
         )
         self._orders.append(order)
         
-        # Remove position
         del self._positions[symbol]
         
         pnl_emoji = "✅" if pnl > 0 else "❌"
@@ -335,13 +331,11 @@ class PaperTradingSimulator:
         )
     
     async def _check_exit_conditions(self, symbol: str, current_price: float) -> None:
-        """Check stop-loss and take-profit conditions."""
         if symbol not in self._positions:
             return
         
         position = self._positions[symbol]
         
-        # Check stop-loss
         if position.stop_loss:
             if position.side == 'long' and current_price <= position.stop_loss:
                 await self._close_position(symbol, "Stop-loss triggered")
