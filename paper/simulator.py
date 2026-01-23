@@ -150,6 +150,10 @@ class PaperTradingSimulator:
     async def _trading_loop(self, symbol: str) -> None:
         logger.info(f"Starting trading loop for {symbol}")
         
+        from strategies.ai_strategy import AIStrategy
+        if isinstance(self.strategy, AIStrategy) and self.db:
+            await self.strategy.load_model_for_symbol(symbol)
+        
         while self._running:
             try:
                 data = await self._fetch_market_data(symbol, limit=200)

@@ -18,13 +18,15 @@ from .indicators import TechnicalIndicators
 
 
 class AIStrategy(BaseStrategy):
-    def __init__(self, model_path: Optional[str] = None, model_type: str = None):
+    def __init__(self, model_path: Optional[str] = None, model_type: str = None, db = None):
         super().__init__(name="ai_strategy")
         self.config = settings.strategy
         self.model = None
         self.model_path = model_path or self.config.model_path
         self.model_type = model_type or self.config.model_type
         self.feature_columns = FEATURE_COLUMNS
+        self.db = db
+        self._loaded_models = {}
         
         if self.model_path:
             self.load_model(self.model_path)
@@ -43,11 +45,44 @@ class AIStrategy(BaseStrategy):
         features = data[self.feature_columns].dropna()
         return features
     
+    async def load_model_for_symbol(self, symbol: str) -> bool:
+        """Load deployed model for symbol from database."""
+        if symbol in self._loaded_models:
+            self.model = self._loaded_models[symbol]
+            return True
+        
+        if self.db is None:
+            return False
+        
+        try:
+            deployed = await self.db.get_deployed_model(symbol)
+            if not deployed:
+                logger.debug(f"No deployed model for {symbol}")
+                return False
+            
+            model_path = deployed['model_path']
+            if not Path(model_path).exists():
+                logger.warning(f"Model file not found: {model_path}")
+                return False
+            
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+            
+            self._loaded_models[symbol] = model
+            self.model = model
+            logger.info(f"Loaded model for {symbol} from {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load model for {symbol}: {e}")
+            return False
+    
     def generate_signal(self, data: pd.DataFrame) -> Signal:
+        symbol = data.get('symbol', ['UNKNOWN']).iloc[-1] if 'symbol' in data.columns else 'UNKNOWN'
+        
         if self.model is None:
-            logger.warning("No model loaded, returning HOLD signal")
+            logger.warning(f"No model loaded for {symbol}, returning HOLD signal")
             return self.create_signal(
-                symbol=data.get('symbol', ['UNKNOWN']).iloc[-1] if 'symbol' in data.columns else 'UNKNOWN',
+                symbol=symbol,
                 signal_type=SignalType.HOLD,
                 confidence=0.0
             )
