@@ -15,6 +15,7 @@ from strategies.base import BaseStrategy
 from risk.manager import RiskManager
 from learning.database import LearningDatabase
 from learning.prediction_tracker import PredictionTracker
+from monitoring.alerts import TelegramAlert
 
 
 @dataclass
@@ -89,9 +90,11 @@ class PaperTradingSimulator:
         if db:
             self.prediction_tracker = PredictionTracker(db)
         
+        self.telegram = TelegramAlert()
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._model_ids: Dict[str, str] = {}
+        self._last_summary_time = datetime.utcnow()
     
     async def start(self) -> None:
         logger.info("Starting paper trading simulator")
@@ -125,6 +128,8 @@ class PaperTradingSimulator:
         
         logger.info("Paper trading stopped")
         self._print_summary()
+        
+        await self._send_summary()
     
     async def _fetch_market_data(self, symbol: str, limit: int = 200):
         import yfinance as yf
@@ -172,6 +177,8 @@ class PaperTradingSimulator:
                 await self._process_signal(signal, current_price)
                 
                 self._update_stats()
+                
+                await self._check_send_summary()
                 
                 await asyncio.sleep(300)
                 
@@ -262,6 +269,17 @@ class PaperTradingSimulator:
             f"📈 Paper {position.side.upper()} opened: {symbol} "
             f"size={position_size:.6f} @ {entry_price:.2f} conf={signal.confidence:.1%}"
         )
+        
+        await self.telegram.send_message(
+            f"📈 <b>Paper Position Opened</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {position.side.upper()}\n"
+            f"Size: {position_size:.6f}\n"
+            f"Entry: ${entry_price:,.2f}\n"
+            f"Confidence: {signal.confidence:.1%}\n"
+            f"Stop Loss: ${position.stop_loss:,.2f}\n"
+            f"Take Profit: ${position.take_profit:,.2f}"
+        )
     
     async def _close_position(self, symbol: str, reason: str) -> None:
         if symbol not in self._positions:
@@ -333,6 +351,18 @@ class PaperTradingSimulator:
             f"{pnl_emoji} Paper position closed: {symbol} "
             f"PnL={pnl:.2f} ({reason})"
         )
+        
+        duration = (datetime.utcnow() - position.opened_at).total_seconds() / 3600
+        await self.telegram.send_message(
+            f"{pnl_emoji} <b>Paper Position Closed</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {position.side.upper()}\n"
+            f"Entry: ${position.entry_price:,.2f}\n"
+            f"Exit: ${exit_price:,.2f}\n"
+            f"PnL: ${pnl:,.2f}\n"
+            f"Duration: {duration:.1f}h\n"
+            f"Reason: {reason}"
+        )
     
     async def _check_exit_conditions(self, symbol: str, current_price: float) -> None:
         if symbol not in self._positions:
@@ -384,6 +414,51 @@ class PaperTradingSimulator:
         drawdown = (self.stats.peak_balance - equity) / self.stats.peak_balance
         if drawdown > self.stats.max_drawdown:
             self.stats.max_drawdown = drawdown
+    
+    async def _check_send_summary(self) -> None:
+        """Send periodic summary to Telegram (every 6 hours)."""
+        now = datetime.utcnow()
+        hours_since_last = (now - self._last_summary_time).total_seconds() / 3600
+        
+        if hours_since_last >= 6:
+            await self._send_summary()
+            self._last_summary_time = now
+    
+    async def _send_summary(self) -> None:
+        """Send trading summary to Telegram."""
+        equity = self._balance
+        for position in self._positions.values():
+            equity += position.unrealized_pnl
+        
+        win_rate = (self.stats.winning_trades / self.stats.total_trades * 100 
+                   if self.stats.total_trades > 0 else 0)
+        
+        pnl_pct = (self.stats.total_pnl / self.initial_balance) * 100
+        
+        open_positions = ""
+        if self._positions:
+            open_positions = "\\n\\n<b>Open Positions:</b>\\n"
+            for symbol, pos in self._positions.items():
+                pnl_emoji = "📈" if pos.unrealized_pnl > 0 else "📉"
+                open_positions += (
+                    f"{pnl_emoji} {symbol} {pos.side.upper()}\\n"
+                    f"  Entry: ${pos.entry_price:,.2f}\\n"
+                    f"  Current: ${pos.current_price:,.2f}\\n"
+                    f"  Unrealized PnL: ${pos.unrealized_pnl:,.2f}\\n"
+                )
+        
+        await self.telegram.send_message(
+            f"📊 <b>Paper Trading Report</b>\\n\\n"
+            f"💰 Balance: ${self._balance:,.2f}\\n"
+            f"📈 Equity: ${equity:,.2f}\\n"
+            f"💵 Total PnL: ${self.stats.total_pnl:,.2f} ({pnl_pct:+.2f}%)\\n\\n"
+            f"📊 Trades: {self.stats.total_trades}\\n"
+            f"✅ Wins: {self.stats.winning_trades}\\n"
+            f"❌ Losses: {self.stats.losing_trades}\\n"
+            f"🎯 Win Rate: {win_rate:.1f}%\\n"
+            f"📉 Max DD: {self.stats.max_drawdown*100:.2f}%"
+            f"{open_positions}"
+        )
     
     def _print_summary(self) -> None:
         """Print paper trading summary."""
