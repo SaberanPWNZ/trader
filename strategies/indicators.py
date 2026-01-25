@@ -215,7 +215,7 @@ class TechnicalIndicators:
             config.macd_slow,
             config.macd_signal
         )
-        df['macd'] = macd_line
+        df['macd_line'] = macd_line
         df['macd_signal'] = signal_line
         df['macd_histogram'] = histogram
         

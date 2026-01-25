@@ -37,8 +37,8 @@ class RiskConfig:
     max_daily_loss: float = 0.05  # 5%
     max_drawdown: float = 0.10  # 10%
     max_position_size: float = 0.30  # 30% of portfolio
-    stop_loss_atr_multiplier: float = 2.0
-    take_profit_atr_multiplier: float = 3.0
+    stop_loss_atr_multiplier: float = 1.5  # More aggressive
+    take_profit_atr_multiplier: float = 2.0  # More aggressive
     max_consecutive_losses: int = 3
     cooldown_minutes: int = 60
     kill_switch_enabled: bool = True
