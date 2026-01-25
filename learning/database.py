@@ -65,6 +65,20 @@ class LearningDatabase:
                 )
             """)
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS balance_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP NOT NULL,
+                    balance REAL NOT NULL,
+                    equity REAL NOT NULL,
+                    total_pnl REAL NOT NULL,
+                    total_trades INTEGER NOT NULL,
+                    winning_trades INTEGER NOT NULL,
+                    losing_trades INTEGER NOT NULL,
+                    open_positions INTEGER NOT NULL,
+                    notes TEXT
+                )
+            """)
+            await db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_models_symbol ON models(symbol)
             """)
             await db.execute("""
@@ -271,6 +285,80 @@ class LearningDatabase:
             """, (symbol, f'-{days} days')) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def save_balance_snapshot(
+        self,
+        balance: float,
+        equity: float,
+        total_pnl: float,
+        total_trades: int,
+        winning_trades: int,
+        losing_trades: int,
+        open_positions: int,
+        notes: Optional[str] = None
+    ) -> None:
+        """Save balance snapshot for tracking performance over time."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO balance_history 
+                (timestamp, balance, equity, total_pnl, total_trades, 
+                 winning_trades, losing_trades, open_positions, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (datetime.utcnow(), balance, equity, total_pnl, total_trades,
+                  winning_trades, losing_trades, open_positions, notes))
+            await db.commit()
+
+    async def get_balance_history(self, hours: int = 168) -> List[dict]:
+        """Get balance history for specified hours (default 7 days)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM balance_history
+                WHERE timestamp >= datetime('now', ?)
+                ORDER BY timestamp ASC
+            """, (f'-{hours} hours',)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_weekly_summary(self) -> dict:
+        """Get weekly trading summary."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Get first and last snapshots
+            cursor = await db.execute("""
+                SELECT * FROM balance_history
+                WHERE timestamp >= datetime('now', '-7 days')
+                ORDER BY timestamp ASC
+                LIMIT 1
+            """)
+            start_snapshot = await cursor.fetchone()
+            
+            cursor = await db.execute("""
+                SELECT * FROM balance_history
+                WHERE timestamp >= datetime('now', '-7 days')
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """)
+            end_snapshot = await cursor.fetchone()
+            
+            if not start_snapshot or not end_snapshot:
+                return None
+            
+            start = dict(start_snapshot)
+            end = dict(end_snapshot)
+            
+            return {
+                'start_balance': start['balance'],
+                'end_balance': end['balance'],
+                'start_equity': start['equity'],
+                'end_equity': end['equity'],
+                'total_pnl': end['total_pnl'] - start['total_pnl'],
+                'total_trades': end['total_trades'] - start['total_trades'],
+                'winning_trades': end['winning_trades'] - start['winning_trades'],
+                'losing_trades': end['losing_trades'] - start['losing_trades'],
+                'pnl_percentage': ((end['equity'] - start['equity']) / start['equity'] * 100) if start['equity'] > 0 else 0
+            }
 
     async def get_performance_summary(self, days: int = 30) -> dict:
         async with aiosqlite.connect(self.db_path) as db:

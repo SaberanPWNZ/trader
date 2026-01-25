@@ -24,25 +24,6 @@ class RuleBasedStrategy(BaseStrategy):
         return TechnicalIndicators.add_all_indicators(data, self.config)
     
     def generate_signal(self, data: pd.DataFrame) -> Signal:
-        """
-        Generate trading signal based on rules.
-        
-        Buy conditions:
-        - Price above EMA fast > EMA medium > EMA slow (uptrend)
-        - RSI not overbought (< 70)
-        - MACD histogram positive and increasing
-        
-        Sell conditions:
-        - Price below EMA fast < EMA medium < EMA slow (downtrend)
-        - RSI not oversold (> 30)
-        - MACD histogram negative and decreasing
-        
-        Args:
-            data: DataFrame with OHLCV and indicators
-            
-        Returns:
-            Trading signal
-        """
         if len(data) < 2:
             return self.create_signal(
                 symbol=data['symbol'].iloc[-1] if 'symbol' in data.columns else "UNKNOWN",
@@ -50,7 +31,6 @@ class RuleBasedStrategy(BaseStrategy):
                 confidence=0.0
             )
         
-        # Add indicators if not present
         if 'ema_fast' not in data.columns:
             data = self.calculate_features(data)
         
@@ -61,59 +41,64 @@ class RuleBasedStrategy(BaseStrategy):
         close_price = current['close']
         atr = current['atr']
         
-        # Calculate signal strength
         buy_score = 0
         sell_score = 0
         
-        # Trend analysis (weight: 3)
-        if current['trend'] == 1:  # Uptrend
-            buy_score += 3
-        elif current['trend'] == -1:  # Downtrend
-            sell_score += 3
+        if current['trend'] == 1:
+            buy_score += 4
+        elif current['trend'] == -1:
+            sell_score += 4
         
-        # RSI analysis (weight: 2)
         rsi = current['rsi']
-        if rsi < self.config.rsi_oversold:
-            buy_score += 2  # Oversold - potential bounce
-        elif rsi > self.config.rsi_overbought:
-            sell_score += 2  # Overbought - potential reversal
-        elif rsi < 50:
+        if rsi < 30:
+            buy_score += 3
+        elif rsi > 70:
+            sell_score += 3
+        elif 30 <= rsi < 45:
             buy_score += 1
-        else:
+        elif 55 < rsi <= 70:
             sell_score += 1
         
-        # MACD analysis (weight: 2)
         macd_hist = current['macd_histogram']
         macd_hist_prev = previous['macd_histogram']
+        macd_line = current['macd_line']
+        macd_signal = current['macd_signal']
         
-        if macd_hist > 0 and macd_hist > macd_hist_prev:
-            buy_score += 2  # Bullish momentum increasing
-        elif macd_hist < 0 and macd_hist < macd_hist_prev:
-            sell_score += 2  # Bearish momentum increasing
+        if macd_hist > 0 and macd_hist > macd_hist_prev and macd_line > macd_signal:
+            buy_score += 3
+        elif macd_hist < 0 and macd_hist < macd_hist_prev and macd_line < macd_signal:
+            sell_score += 3
         
-        # EMA crossover (weight: 2)
         if (previous['ema_fast'] <= previous['ema_medium'] and 
-            current['ema_fast'] > current['ema_medium']):
-            buy_score += 2  # Bullish crossover
+            current['ema_fast'] > current['ema_medium'] and
+            current['ema_medium'] > current['ema_slow']):
+            buy_score += 3
         elif (previous['ema_fast'] >= previous['ema_medium'] and 
-              current['ema_fast'] < current['ema_medium']):
-            sell_score += 2  # Bearish crossover
+              current['ema_fast'] < current['ema_medium'] and
+              current['ema_medium'] < current['ema_slow']):
+            sell_score += 3
         
-        # Price relative to Bollinger Bands (weight: 1)
-        if current['close'] < current['bb_lower']:
-            buy_score += 1  # Price below lower band
-        elif current['close'] > current['bb_upper']:
-            sell_score += 1  # Price above upper band
+        if current['close'] < current['bb_lower'] and rsi < 40:
+            buy_score += 2
+        elif current['close'] > current['bb_upper'] and rsi > 60:
+            sell_score += 2
         
-        # Calculate signal
-        max_score = 10  # Maximum possible score
+        volume_increase = current['volume'] > data['volume'].rolling(20).mean().iloc[-1] * 1.5
+        if volume_increase:
+            if buy_score > sell_score:
+                buy_score += 1
+            elif sell_score > buy_score:
+                sell_score += 1
         
-        if buy_score > sell_score and buy_score >= 5:
-            confidence = buy_score / max_score
+        max_score = 16
+        threshold = 7
+        
+        if buy_score > sell_score and buy_score >= threshold:
+            confidence = min(buy_score / max_score, 0.99)
             stop_loss = close_price - (atr * self.config.stop_loss_atr_multiplier)
             take_profit = close_price + (atr * self.config.take_profit_atr_multiplier)
             
-            logger.info(f"BUY signal for {symbol}: confidence={confidence:.2f}")
+            logger.info(f"BUY signal for {symbol}: confidence={confidence:.2f} (score={buy_score}/{max_score}, rsi={rsi:.1f}, macd={macd_hist:.4f})")
             
             return self.create_signal(
                 symbol=symbol,
@@ -131,12 +116,12 @@ class RuleBasedStrategy(BaseStrategy):
                 }
             )
         
-        elif sell_score > buy_score and sell_score >= 5:
-            confidence = sell_score / max_score
+        elif sell_score > buy_score and sell_score >= threshold:
+            confidence = min(sell_score / max_score, 0.99)
             stop_loss = close_price + (atr * self.config.stop_loss_atr_multiplier)
             take_profit = close_price - (atr * self.config.take_profit_atr_multiplier)
             
-            logger.info(f"SELL signal for {symbol}: confidence={confidence:.2f}")
+            logger.info(f"SELL signal for {symbol}: confidence={confidence:.2f} (score={sell_score}/{max_score}, rsi={rsi:.1f}, macd={macd_hist:.4f})")
             
             return self.create_signal(
                 symbol=symbol,

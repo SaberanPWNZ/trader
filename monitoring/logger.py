@@ -23,7 +23,7 @@ def setup_logging() -> None:
     # Console handler
     logger.add(
         sys.stdout,
-        level=settings.monitoring.log_level,
+        level="DEBUG",
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
                "<level>{level: <8}</level> | "
                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "

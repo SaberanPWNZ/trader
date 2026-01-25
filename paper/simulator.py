@@ -95,6 +95,7 @@ class PaperTradingSimulator:
         self._tasks: List[asyncio.Task] = []
         self._model_ids: Dict[str, str] = {}
         self._last_summary_time = datetime.utcnow()
+        self._last_balance_save_time = datetime.utcnow()
     
     async def start(self) -> None:
         logger.info("Starting paper trading simulator")
@@ -174,11 +175,15 @@ class PaperTradingSimulator:
                     await self._check_exit_conditions(symbol, current_price)
                 
                 signal = self.strategy.generate_signal(data)
+                
+                logger.debug(f"{symbol}: {signal.signal_type} signal (conf={signal.confidence:.2f})")
+                
                 await self._process_signal(signal, current_price)
                 
                 self._update_stats()
                 
                 await self._check_send_summary()
+                await self._check_save_balance()
                 
                 await asyncio.sleep(300)
                 
@@ -423,6 +428,36 @@ class PaperTradingSimulator:
         if hours_since_last >= 6:
             await self._send_summary()
             self._last_summary_time = now
+    
+    async def _check_save_balance(self) -> None:
+        """Save balance snapshot every hour."""
+        now = datetime.utcnow()
+        hours_since_last = (now - self._last_balance_save_time).total_seconds() / 3600
+        
+        if hours_since_last >= 1:
+            await self._save_balance_snapshot()
+            self._last_balance_save_time = now
+    
+    async def _save_balance_snapshot(self) -> None:
+        """Save current balance snapshot to database."""
+        if not self.db:
+            return
+        
+        equity = self._balance
+        for position in self._positions.values():
+            equity += position.unrealized_pnl
+        
+        await self.db.save_balance_snapshot(
+            balance=self._balance,
+            equity=equity,
+            total_pnl=self.stats.total_pnl,
+            total_trades=self.stats.total_trades,
+            winning_trades=self.stats.winning_trades,
+            losing_trades=self.stats.losing_trades,
+            open_positions=len(self._positions),
+            notes=f"Symbols: {', '.join(self.symbols)}"
+        )
+        logger.debug(f"Balance snapshot saved: ${equity:,.2f}")
     
     async def _send_summary(self) -> None:
         """Send trading summary to Telegram."""

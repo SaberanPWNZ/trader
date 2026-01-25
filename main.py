@@ -37,26 +37,29 @@ async def run_paper_trading(args):
     symbol = args.symbol
     if "/" not in symbol:
         symbol = f"{symbol}/USDT"
-    symbols = [symbol]
     
-    if args.strategy == "ai":
-        model_path = args.model
-        if not model_path:
-            db = LearningDatabase()
-            await db.initialize()
-            deployed = await db.get_deployed_model(symbol)
-            if deployed:
-                model_path = deployed['model_path']
-                logger.info(f"Using deployed model: {model_path}")
-            else:
-                logger.error(f"No deployed model for {symbol}. Run training first.")
-                sys.exit(1)
-        strategy = AIStrategy(model_path=model_path)
+    # Support multiple symbols for more trading opportunities
+    if symbol == "BTC/USDT":
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        logger.info("Trading multiple symbols: BTC/USDT, ETH/USDT")
     else:
-        strategy = RuleBasedStrategy()
+        symbols = [symbol]
     
     db = LearningDatabase()
     await db.initialize()
+    
+    if args.strategy == "ai":
+        for sym in symbols:
+            deployed = await db.get_deployed_model(sym)
+            if deployed:
+                logger.info(f"Found model for {sym}: {deployed['model_path']}")
+            else:
+                logger.warning(f"No deployed model for {sym}")
+        
+        strategy = AIStrategy(db=db)
+    else:
+        logger.info(f"🎯 Using Rule-Based Strategy (RSI+MACD+EMA)")
+        strategy = RuleBasedStrategy()
     
     initial_balance = args.initial_balance or settings.backtest.initial_balance
     
@@ -69,7 +72,7 @@ async def run_paper_trading(args):
     
     await telegram.send_message(
         f"📄 Paper trading started\n"
-        f"Symbol: {symbol}\n"
+        f"Symbols: {', '.join(symbols)}\n"
         f"Strategy: {args.strategy}\n"
         f"Balance: ${initial_balance:,.2f}"
     )
