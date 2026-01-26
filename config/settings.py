@@ -24,7 +24,7 @@ class ExchangeConfig:
 @dataclass
 class TradingConfig:
     """Trading parameters configuration."""
-    symbols: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    symbols: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"])
     timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
     default_timeframe: str = "1h"
     mode: str = "paper"  # paper, live, backtest
@@ -34,13 +34,13 @@ class TradingConfig:
 class RiskConfig:
     """Risk management configuration."""
     max_risk_per_trade: float = 0.02  # 2%
-    max_daily_loss: float = 0.05  # 5%
-    max_drawdown: float = 0.10  # 10%
-    max_position_size: float = 0.30  # 30% of portfolio
-    stop_loss_atr_multiplier: float = 1.5  # More aggressive
-    take_profit_atr_multiplier: float = 2.0  # More aggressive
-    max_consecutive_losses: int = 3
-    cooldown_minutes: int = 60
+    max_daily_loss: float = 0.10  # 10%
+    max_drawdown: float = 0.20  # 20% - portfolio kill switch
+    max_position_size: float = 0.05  # 5% of portfolio per trade
+    stop_loss_atr_multiplier: float = 1.5
+    take_profit_atr_multiplier: float = 3.0
+    max_consecutive_losses: int = 5
+    cooldown_minutes: int = 30
     kill_switch_enabled: bool = True
 
 
@@ -138,14 +138,14 @@ class BacktestConfig:
     """Backtesting configuration."""
     start_date: str = "2024-01-01"
     end_date: str = "2024-12-01"
-    initial_balance: float = 10000.0
+    initial_balance: float = 100.0  # Start with $100 for paper trading
     trading_fee: float = 0.001  # 0.1%
     slippage: float = 0.0005  # 0.05%
     
     # PyBroker-specific backtest settings
-    pybroker_engine: bool = True  # Use PyBroker for backtesting
-    walk_forward_periods: int = 252  # trading days for walk-forward validation
-    walk_forward_test_size: int = 63  # test set size
+    pybroker_engine: bool = True
+    walk_forward_periods: int = 252
+    walk_forward_test_size: int = 63
 
 
 @dataclass
