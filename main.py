@@ -25,6 +25,28 @@ async def run_backtest(args):
 
 
 
+async def run_grid_trading(args):
+    from paper.grid_simulator import GridPaperSimulator
+    from monitoring.alerts import telegram
+    
+    logger.info("🔲 Starting Grid Trading mode")
+    
+    grid_symbols = ["BTC/USDT", "ETH/USDT"]
+    initial_balance = args.initial_balance if hasattr(args, 'initial_balance') and args.initial_balance else 300.0
+    
+    simulator = GridPaperSimulator(
+        symbols=grid_symbols,
+        initial_balance=initial_balance
+    )
+    
+    try:
+        await simulator.start()
+    except KeyboardInterrupt:
+        logger.info("Stopping grid trading...")
+    finally:
+        await simulator.stop()
+
+
 async def run_paper_trading(args):
     from paper.simulator import PaperTradingSimulator
     from strategies.ai_strategy import AIStrategy
@@ -480,6 +502,10 @@ Examples:
     paper_parser.add_argument("--model", help="Path to AI model file")
     paper_parser.add_argument("--initial-balance", type=float, help="Initial portfolio balance")
     
+    # Grid trading parser
+    grid_parser = subparsers.add_parser("grid", help="Run grid trading bot")
+    grid_parser.add_argument("--initial-balance", type=float, default=300.0, help="Initial balance for grid trading")
+    
     # Live trading parser
     live_parser = subparsers.add_parser("live", help="Run live trading (PyBroker integration)")
     live_parser.add_argument("--strategy", choices=["rule_based", "ai"], default="rule_based")
@@ -550,6 +576,8 @@ Examples:
         asyncio.run(run_backtest(args))
     elif args.mode == "paper":
         asyncio.run(run_paper_trading(args))
+    elif args.mode == "grid":
+        asyncio.run(run_grid_trading(args))
     elif args.mode == "live":
         asyncio.run(run_live_trading(args))
     elif args.mode == "train":
