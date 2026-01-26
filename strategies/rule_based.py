@@ -93,12 +93,14 @@ class RuleBasedStrategy(BaseStrategy):
         max_score = 16
         threshold = 7
         
-        if buy_score > sell_score and buy_score >= threshold:
+        global_trend = current.get('global_trend', 0)
+        
+        if global_trend == 1 and buy_score > sell_score and buy_score >= threshold and current['trend'] == 1 and rsi < 70:
             confidence = min(buy_score / max_score, 0.99)
             stop_loss = close_price - (atr * self.config.stop_loss_atr_multiplier)
             take_profit = close_price + (atr * self.config.take_profit_atr_multiplier)
             
-            logger.info(f"BUY signal for {symbol}: confidence={confidence:.2f} (score={buy_score}/{max_score}, rsi={rsi:.1f}, macd={macd_hist:.4f})")
+            logger.info(f"BUY signal for {symbol}: confidence={confidence:.2f} (score={buy_score}/{max_score}, rsi={rsi:.1f}, global_trend=BULL)")
             
             return self.create_signal(
                 symbol=symbol,
@@ -112,35 +114,13 @@ class RuleBasedStrategy(BaseStrategy):
                     'sell_score': sell_score,
                     'rsi': rsi,
                     'macd_histogram': macd_hist,
-                    'trend': current['trend']
-                }
-            )
-        
-        elif sell_score > buy_score and sell_score >= threshold:
-            confidence = min(sell_score / max_score, 0.99)
-            stop_loss = close_price + (atr * self.config.stop_loss_atr_multiplier)
-            take_profit = close_price - (atr * self.config.take_profit_atr_multiplier)
-            
-            logger.info(f"SELL signal for {symbol}: confidence={confidence:.2f} (score={sell_score}/{max_score}, rsi={rsi:.1f}, macd={macd_hist:.4f})")
-            
-            return self.create_signal(
-                symbol=symbol,
-                signal_type=SignalType.SELL,
-                confidence=confidence,
-                entry_price=close_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                metadata={
-                    'buy_score': buy_score,
-                    'sell_score': sell_score,
-                    'rsi': rsi,
-                    'macd_histogram': macd_hist,
-                    'trend': current['trend']
+                    'trend': current['trend'],
+                    'global_trend': global_trend
                 }
             )
         
         else:
-            logger.debug(f"HOLD signal for {symbol}: buy={buy_score}, sell={sell_score}")
+            logger.debug(f"HOLD signal for {symbol}: buy={buy_score}, sell={sell_score}, global_trend={global_trend}")
             
             return self.create_signal(
                 symbol=symbol,
@@ -151,6 +131,7 @@ class RuleBasedStrategy(BaseStrategy):
                     'sell_score': sell_score,
                     'rsi': rsi,
                     'macd_histogram': macd_hist,
-                    'trend': current['trend']
+                    'trend': current['trend'],
+                    'global_trend': global_trend
                 }
             )

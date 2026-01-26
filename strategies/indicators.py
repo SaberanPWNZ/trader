@@ -241,6 +241,13 @@ class TechnicalIndicators:
         # Trend detection
         df['trend'] = TechnicalIndicators.detect_trend(df)
         
+        # Global trend (SMA 200)
+        df['sma_200'] = df['close'].rolling(window=200).mean()
+        buffer = 0.05
+        df['global_trend'] = np.where(
+            df['close'] > df['sma_200'] * (1 + buffer), 1,
+            np.where(df['close'] < df['sma_200'] * (1 - buffer), -1, 0)
+        )
         return df
     
     @staticmethod

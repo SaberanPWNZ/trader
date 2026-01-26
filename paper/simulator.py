@@ -136,22 +136,27 @@ class PaperTradingSimulator:
         import yfinance as yf
         import pandas as pd
         
-        yf_symbol = settings.get_symbol_for_pybroker(symbol)
-        ticker = yf.Ticker(yf_symbol)
-        data = ticker.history(period="7d", interval="1h")
-        
-        if data.empty:
+        try:
+            yf_symbol = settings.get_symbol_for_pybroker(symbol)
+            ticker = yf.Ticker(yf_symbol)
+            data = ticker.history(period="7d", interval="1h")
+            
+            if data is None or data.empty:
+                logger.warning(f"Yahoo Finance returned empty data for {symbol}")
+                return pd.DataFrame()
+            
+            data = data.reset_index()
+            data.columns = [c.lower() for c in data.columns]
+            if 'datetime' in data.columns:
+                data = data.rename(columns={'datetime': 'timestamp'})
+            elif 'date' in data.columns:
+                data = data.rename(columns={'date': 'timestamp'})
+            
+            data['symbol'] = symbol
+            return data.tail(limit)
+        except Exception as e:
+            logger.error(f"Error fetching data for {symbol}: {e}")
             return pd.DataFrame()
-        
-        data = data.reset_index()
-        data.columns = [c.lower() for c in data.columns]
-        if 'datetime' in data.columns:
-            data = data.rename(columns={'datetime': 'timestamp'})
-        elif 'date' in data.columns:
-            data = data.rename(columns={'date': 'timestamp'})
-        
-        data['symbol'] = symbol
-        return data.tail(limit)
     
     async def _trading_loop(self, symbol: str) -> None:
         logger.info(f"Starting trading loop for {symbol}")
@@ -421,11 +426,11 @@ class PaperTradingSimulator:
             self.stats.max_drawdown = drawdown
     
     async def _check_send_summary(self) -> None:
-        """Send periodic summary to Telegram (every 6 hours)."""
+        """Send periodic summary to Telegram (every 24 hours)."""
         now = datetime.utcnow()
         hours_since_last = (now - self._last_summary_time).total_seconds() / 3600
         
-        if hours_since_last >= 6:
+        if hours_since_last >= 24:
             await self._send_summary()
             self._last_summary_time = now
     
@@ -470,28 +475,39 @@ class PaperTradingSimulator:
         
         pnl_pct = (self.stats.total_pnl / self.initial_balance) * 100
         
+        if self.stats.total_trades > 0:
+            avg_win = sum(t['pnl'] for t in self._trade_history if t['pnl'] > 0) / max(self.stats.winning_trades, 1)
+            avg_loss = sum(t['pnl'] for t in self._trade_history if t['pnl'] < 0) / max(self.stats.losing_trades, 1)
+            profit_factor = abs(sum(t['pnl'] for t in self._trade_history if t['pnl'] > 0) / 
+                               min(sum(t['pnl'] for t in self._trade_history if t['pnl'] < 0), -0.01))
+        else:
+            avg_win = avg_loss = profit_factor = 0
+        
         open_positions = ""
         if self._positions:
-            open_positions = "\\n\\n<b>Open Positions:</b>\\n"
+            open_positions = "\n\n<b>Open Positions:</b>\n"
             for symbol, pos in self._positions.items():
                 pnl_emoji = "📈" if pos.unrealized_pnl > 0 else "📉"
                 open_positions += (
-                    f"{pnl_emoji} {symbol} {pos.side.upper()}\\n"
-                    f"  Entry: ${pos.entry_price:,.2f}\\n"
-                    f"  Current: ${pos.current_price:,.2f}\\n"
-                    f"  Unrealized PnL: ${pos.unrealized_pnl:,.2f}\\n"
+                    f"{pnl_emoji} {symbol} {pos.side.upper()}\n"
+                    f"  Entry: ${pos.entry_price:,.2f}\n"
+                    f"  Current: ${pos.current_price:,.2f}\n"
+                    f"  Unrealized PnL: ${pos.unrealized_pnl:,.2f}\n"
                 )
         
         await self.telegram.send_message(
-            f"📊 <b>Paper Trading Report</b>\\n\\n"
-            f"💰 Balance: ${self._balance:,.2f}\\n"
-            f"📈 Equity: ${equity:,.2f}\\n"
-            f"💵 Total PnL: ${self.stats.total_pnl:,.2f} ({pnl_pct:+.2f}%)\\n\\n"
-            f"📊 Trades: {self.stats.total_trades}\\n"
-            f"✅ Wins: {self.stats.winning_trades}\\n"
-            f"❌ Losses: {self.stats.losing_trades}\\n"
-            f"🎯 Win Rate: {win_rate:.1f}%\\n"
-            f"📉 Max DD: {self.stats.max_drawdown*100:.2f}%"
+            f"📊 <b>Daily Paper Trading Report</b>\n\n"
+            f"💰 Balance: ${self._balance:,.2f}\n"
+            f"📈 Equity: ${equity:,.2f}\n"
+            f"💵 Total PnL: ${self.stats.total_pnl:,.2f} ({pnl_pct:+.1f}%)\n\n"
+            f"📊 <b>Statistics:</b>\n"
+            f"Trades: {self.stats.total_trades}\n"
+            f"✅ Wins: {self.stats.winning_trades} | ❌ Losses: {self.stats.losing_trades}\n"
+            f"🎯 Win Rate: {win_rate:.1f}%\n"
+            f"📈 Avg Win: ${avg_win:,.2f}\n"
+            f"📉 Avg Loss: ${avg_loss:,.2f}\n"
+            f"⚖️ Profit Factor: {profit_factor:.2f}\n"
+            f"📉 Max Drawdown: {self.stats.max_drawdown*100:.1f}%"
             f"{open_positions}"
         )
     

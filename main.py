@@ -34,16 +34,8 @@ async def run_paper_trading(args):
     
     logger.info("📄 Starting Paper Trading mode")
     
-    symbol = args.symbol
-    if "/" not in symbol:
-        symbol = f"{symbol}/USDT"
-    
-    # Support multiple symbols for more trading opportunities
-    if symbol == "BTC/USDT":
-        symbols = ["BTC/USDT", "ETH/USDT"]
-        logger.info("Trading multiple symbols: BTC/USDT, ETH/USDT")
-    else:
-        symbols = [symbol]
+    symbols = settings.trading.symbols
+    logger.info(f"Trading symbols: {', '.join(symbols)}")
     
     db = LearningDatabase()
     await db.initialize()
