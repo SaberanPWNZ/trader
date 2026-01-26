@@ -87,7 +87,7 @@ class DevConfig:
 class SelfLearningConfig:
     enabled: bool = False
     training_interval_hours: int = field(default_factory=lambda: int(os.getenv("TRAINING_INTERVAL_HOURS", "4")))
-    min_accuracy_improvement: float = 0.05
+    min_accuracy_improvement: float = 0.02
     min_samples_for_training: int = 1000
     max_models_to_keep: int = 5
     db_path: str = field(default_factory=lambda: os.getenv("LEARNING_DB_PATH", "data/learning.db"))
@@ -95,13 +95,14 @@ class SelfLearningConfig:
     holdout_days: int = 5
     auto_deploy_enabled: bool = False
     backtest_before_deploy: bool = True
-    min_sharpe_ratio: float = 1.0
-    max_drawdown_percent: float = 15.0
-    min_win_rate: float = 0.50
-    min_profit_factor: float = 1.2
+    min_sharpe_ratio: float = 0.5
+    max_drawdown_percent: float = 20.0
+    min_win_rate: float = 0.45
+    min_profit_factor: float = 1.0
+    max_overfit_gap: float = 0.25
     cv_splits: int = 5
     hyperparameter_tuning: bool = True
-    confidence_threshold: float = 0.6
+    confidence_threshold: float = 0.55
     label_threshold: float = 0.005
 
 

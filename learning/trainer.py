@@ -168,6 +168,31 @@ class AutoTrainer:
                 symbol, metrics["test_accuracy"]
             )
 
+            overfit_gap = metrics["train_accuracy"] - metrics["test_accuracy"]
+            if overfit_gap > self.config.max_overfit_gap:
+                logger.warning(f"Model rejected due to overfitting: gap={overfit_gap:.1%} > max={self.config.max_overfit_gap:.1%}")
+                await self.db.save_training_run(
+                    symbol=symbol,
+                    model_version_id=model_id,
+                    train_start_date="",
+                    train_end_date="",
+                    samples=metrics["samples"],
+                    train_accuracy=metrics["train_accuracy"],
+                    test_accuracy=metrics["test_accuracy"],
+                    previous_accuracy=old_accuracy,
+                    improvement=improvement,
+                    duration_seconds=metrics["duration_seconds"],
+                    status=f"rejected: overfitting {overfit_gap:.1%}"
+                )
+                return {
+                    "status": "rejected",
+                    "reason": f"Overfitting detected: gap={overfit_gap:.1%} > max={self.config.max_overfit_gap:.1%}",
+                    "model_id": model_id,
+                    "train_accuracy": metrics["train_accuracy"],
+                    "test_accuracy": metrics["test_accuracy"],
+                    "overfit_gap": overfit_gap
+                }
+
             strategy = AIStrategy(model_type=model_type)
             strategy.load_model(metrics["model_path"])
             
