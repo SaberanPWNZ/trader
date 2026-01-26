@@ -65,9 +65,9 @@ class MockDataGenerator:
         
         # Create date range based on timeframe
         if timeframe == "1h":
-            freq = "H"
+            freq = "h"
         elif timeframe == "4h":
-            freq = "4H"
+            freq = "4h"
         elif timeframe == "1d":
             freq = "D"
         else:

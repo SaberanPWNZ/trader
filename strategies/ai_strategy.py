@@ -102,7 +102,7 @@ class AIStrategy(BaseStrategy):
         close_price = current['close']
         atr = current['atr']
         
-        X = features.iloc[[-1]]
+        X = features.iloc[[-1]].values
         prediction = self.model.predict(X)[0]
         
         confidence = 0.5
@@ -204,13 +204,18 @@ class AIStrategy(BaseStrategy):
                 base_model = XGBClassifier(
                     random_state=42,
                     scale_pos_weight=scale_pos_weight,
-                    eval_metric='logloss'
+                    eval_metric='logloss',
+                    reg_alpha=0.1,
+                    reg_lambda=1.0,
+                    subsample=0.8,
+                    colsample_bytree=0.8
                 )
                 if learning_config.hyperparameter_tuning:
                     param_grid = {
-                        'n_estimators': [50, 100, 200],
-                        'max_depth': [3, 5, 7],
-                        'learning_rate': [0.01, 0.05, 0.1]
+                        'n_estimators': [50, 100],
+                        'max_depth': [3, 4, 5],
+                        'learning_rate': [0.01, 0.03, 0.05],
+                        'min_child_weight': [3, 5, 7]
                     }
                     grid_search = GridSearchCV(
                         base_model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1
