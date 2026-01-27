@@ -158,7 +158,7 @@ class GridPaperSimulator:
                 data = await self._fetch_market_data(symbol)
                 
                 if data.empty:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(30)
                     continue
                 
                 data = TechnicalIndicators.add_all_indicators(data)
@@ -177,7 +177,7 @@ class GridPaperSimulator:
                 if strategy.should_rebalance(current_price):
                     logger.warning(f"{symbol} price ${current_price:.2f} out of grid range, waiting...")
                 
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
                 break
@@ -200,7 +200,6 @@ class GridPaperSimulator:
         self.total_trades += 1
         
         if fill['side'] == 'buy':
-            self.balance -= fill['value']
             self.positions[symbol].append(GridPosition(
                 symbol=symbol,
                 side='long',
@@ -211,7 +210,6 @@ class GridPaperSimulator:
             emoji = "🟢"
             action = "BUY"
         else:
-            self.balance += fill['value']
             profit = 0.0
             if self.positions[symbol]:
                 pos = self.positions[symbol].pop(0)
@@ -222,9 +220,15 @@ class GridPaperSimulator:
             emoji = "🔴"
             action = "SELL"
         
-        strategy = self.strategies[symbol]
-        unrealized = strategy.calculate_unrealized_pnl(current_price)
-        total_value = self.balance + unrealized
+        total_unrealized = 0.0
+        for sym, strategy in self.strategies.items():
+            if strategy.initialized:
+                data = await self._fetch_market_data(sym)
+                if not data.empty:
+                    price = data['close'].iloc[-1]
+                    total_unrealized += strategy.calculate_unrealized_pnl(price)
+        
+        total_value = self.initial_balance + self.realized_pnl + total_unrealized
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         
         trade_record = TradeRecord(
@@ -235,8 +239,8 @@ class GridPaperSimulator:
             amount=fill['amount'],
             value=fill['value'],
             realized_pnl=self.realized_pnl,
-            unrealized_pnl=unrealized,
-            balance=self.balance,
+            unrealized_pnl=total_unrealized,
+            balance=self.initial_balance,
             total_value=total_value,
             roi_percent=roi
         )
@@ -247,8 +251,8 @@ class GridPaperSimulator:
             f"Price: ${fill['price']:.2f}\n"
             f"Value: ${fill['value']:.2f}\n"
             f"Realized: ${self.realized_pnl:.2f}\n"
-            f"Unrealized: ${unrealized:.2f}\n"
-            f"Balance: ${self.balance:.2f}"
+            f"Unrealized: ${total_unrealized:.2f}\n"
+            f"Total: ${total_value:.2f}"
         )
         await telegram.send_message(msg)
         logger.info(f"Grid {action} {symbol} at ${fill['price']:.2f}, PnL: ${self.realized_pnl:.2f}")
@@ -351,14 +355,14 @@ class GridPaperSimulator:
                     )
         
         total_pnl = self.realized_pnl + total_unrealized
-        total_value = self.balance + total_unrealized
+        total_value = self.initial_balance + total_pnl
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
         win_rate = (self.winning_trades / max(1, self.total_trades // 2)) * 100
         
         snapshot_data = {
-            'balance': self.balance,
+            'balance': self.initial_balance,
             'realized_pnl': self.realized_pnl,
             'unrealized_pnl': total_unrealized,
             'total_value': total_value,
@@ -370,18 +374,11 @@ class GridPaperSimulator:
         }
         self._save_snapshot(snapshot_data, "status")
         
-        total_pnl = self.realized_pnl + total_unrealized
-        total_value = self.balance + total_unrealized
-        roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
-        runtime = datetime.utcnow() - self._start_time
-        hours = runtime.total_seconds() / 3600
-        win_rate = (self.winning_trades / max(1, self.total_trades // 2)) * 100
-        
         msg = (
             f"📊 Grid Status Report\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"⏱ Runtime: {hours:.1f}h\n"
-            f"💰 Balance: ${self.balance:.2f}\n"
+            f"💰 Initial: ${self.initial_balance:.2f}\n"
             f"📈 Realized PnL: ${self.realized_pnl:.2f}\n"
             f"📊 Unrealized PnL: ${total_unrealized:.2f}\n"
             f"💵 Total Value: ${total_value:.2f}\n"
@@ -402,7 +399,8 @@ class GridPaperSimulator:
                     current_price = data['close'].iloc[-1]
                     total_unrealized += strategy.calculate_unrealized_pnl(current_price)
         
-        total_value = self.balance + total_unrealized
+        total_pnl = self.realized_pnl + total_unrealized
+        total_value = self.initial_balance + total_pnl
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         
@@ -419,9 +417,16 @@ class GridPaperSimulator:
         await telegram.send_message(msg)
     
     def get_stats(self) -> Dict:
+        total_unrealized = sum(
+            strategy.calculate_unrealized_pnl(0) 
+            for strategy in self.strategies.values() 
+            if strategy.initialized
+        )
         return {
-            "balance": self.balance,
+            "initial_balance": self.initial_balance,
             "realized_pnl": self.realized_pnl,
+            "unrealized_pnl": total_unrealized,
+            "total_value": self.initial_balance + self.realized_pnl + total_unrealized,
             "total_trades": self.total_trades,
             "positions": sum(len(p) for p in self.positions.values()),
             "winning_trades": self.winning_trades

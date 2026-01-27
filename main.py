@@ -47,6 +47,47 @@ async def run_grid_trading(args):
         await simulator.stop()
 
 
+def show_grid_status():
+    import pandas as pd
+    from pathlib import Path
+    
+    trades_file = Path("data/grid_trades.csv")
+    
+    if not trades_file.exists():
+        print("❌ No grid trading data found!")
+        print("Start grid trading with: python main.py grid --initial-balance 100")
+        return
+    
+    trades = pd.read_csv(trades_file)
+    if len(trades) == 0:
+        print("📊 Grid trading started but no trades yet")
+        return
+    
+    trades['timestamp'] = pd.to_datetime(trades['timestamp'])
+    latest = trades.iloc[-1]
+    initial_balance = 100.0
+    
+    real_value = initial_balance + latest['realized_pnl'] + latest['unrealized_pnl']
+    real_roi = ((real_value - initial_balance) / initial_balance) * 100
+    runtime_hours = (trades['timestamp'].max() - trades['timestamp'].min()).total_seconds() / 3600
+    
+    print("\n╔════════════════════════════════════════╗")
+    print("║     GRID TRADING STATUS                ║")
+    print("╠════════════════════════════════════════╣")
+    print(f"║ 💰 Initial:    ${initial_balance:.2f}                   ║")
+    print(f"║ 💵 Current:    ${real_value:.2f}                  ║")
+    print(f"║ 📈 Realized:   ${latest['realized_pnl']:.2f}                   ║")
+    print(f"║ 📊 Unrealized: ${latest['unrealized_pnl']:.2f}                  ║")
+    print(f"║ 📉 ROI:        {real_roi:+.2f}%                   ║")
+    print("╠════════════════════════════════════════╣")
+    print(f"║ 🔄 Trades:     {len(trades):<24} ║")
+    print(f"║ ⏱  Runtime:    {runtime_hours:.1f}h{' '*(23-len(f'{runtime_hours:.1f}h'))} ║")
+    print("╚════════════════════════════════════════╝\n")
+    
+    print("💡 Full analysis: python analyze_grid.py")
+    print("📊 Live monitor: ./monitor_grid.sh\n")
+
+
 async def run_paper_trading(args):
     from paper.simulator import PaperTradingSimulator
     from strategies.ai_strategy import AIStrategy
@@ -560,6 +601,8 @@ Examples:
     force_train_parser = subparsers.add_parser("force-train", help="Force training for a symbol")
     force_train_parser.add_argument("symbol", help="Symbol to train (e.g., BTC/USDT)")
     
+    status_parser = subparsers.add_parser("status", help="Show grid trading status")
+    
     args = parser.parse_args()
     
     if not args.mode:
@@ -582,6 +625,8 @@ Examples:
         asyncio.run(run_live_trading(args))
     elif args.mode == "train":
         asyncio.run(train_model(args))
+    elif args.mode == "status":
+        show_grid_status()
     # Dev mode commands
     elif args.mode == "dev-gen":
         asyncio.run(dev_generate_data(args))
