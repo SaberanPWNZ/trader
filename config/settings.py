@@ -164,8 +164,40 @@ class MonitoringConfig:
 @dataclass
 class DatabaseConfig:
     """Database configuration."""
-    url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///data/trading.db"))
+    url: str = field(default_factory=lambda: os.getenv(
+        "DATABASE_URL", 
+        "postgresql+asyncpg://trader:password@localhost:5240/trading_bot"
+    ))
+    pool_size: int = 10
+    max_overflow: int = 20
     echo: bool = False
+    legacy_sqlite_path: str = field(default_factory=lambda: os.getenv("SQLITE_DB_PATH", "data/learning.db"))
+
+
+@dataclass
+class GridConfig:
+    """Grid trading rebalancing configuration."""
+    rebalance_interval_hours: float = field(default_factory=lambda: {
+        "BTC/USDT": 12.0,
+        "ETH/USDT": 12.0,
+        "SOL/USDT": 8.0,
+        "DOGE/USDT": 6.0,
+        "XRP/USDT": 8.0
+    })
+    auto_rebalance_enabled: bool = True
+    wait_for_profit: bool = True
+    min_profit_threshold: float = 0.0
+    min_profit_threshold_percent: float = 0.0
+    rebalance_cooldown_minutes: int = 30
+    min_price_movement_percent: float = 1.0
+    emergency_rebalance_on_breakout: bool = True
+    breakout_buffer_multiplier: float = 2.0
+    force_rebalance_after_hours: float = 24.0
+    
+    def get_interval_hours(self, symbol: str) -> float:
+        if isinstance(self.rebalance_interval_hours, dict):
+            return self.rebalance_interval_hours.get(symbol, 12.0)
+        return self.rebalance_interval_hours
 
 
 @dataclass
@@ -177,6 +209,7 @@ class Settings:
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    grid: GridConfig = field(default_factory=GridConfig)
     pybroker: PyBrokerConfig = field(default_factory=PyBrokerConfig)
     dev: DevConfig = field(default_factory=DevConfig)
     self_learning: SelfLearningConfig = field(default_factory=SelfLearningConfig)

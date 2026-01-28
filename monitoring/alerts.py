@@ -316,6 +316,34 @@ All trading has been halted. Manual intervention required.
 <i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
 """
         await self.send_message(message)
+    
+    async def grid_rebalance_alert(
+        self,
+        symbol: str,
+        reason: str,
+        old_range: str,
+        new_range: str,
+        open_positions: int,
+        unrealized_pnl: float
+    ) -> None:
+        emoji = "🔄"
+        pnl_emoji = "📈" if unrealized_pnl >= 0 else "📉"
+        
+        message = f"""
+{emoji} <b>Grid Rebalancing</b>
+
+<b>Symbol:</b> {symbol}
+<b>Reason:</b> {reason}
+
+<b>Old Range:</b> {old_range}
+<b>New Range:</b> {new_range}
+
+<b>Open Positions:</b> {open_positions}
+<b>Unrealized PnL:</b> {pnl_emoji} ${unrealized_pnl:.2f}
+
+<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
+"""
+        await self.send_message(message)
 
 
 telegram = TelegramAlert()
