@@ -2,9 +2,10 @@ import asyncio
 import csv
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from loguru import logger
+import pandas as pd
 
 from strategies.grid import GridStrategy
 from strategies.indicators import TechnicalIndicators
@@ -52,6 +53,7 @@ class GridPaperSimulator:
         self._last_24h_report = None
         self._trades_file = "data/grid_trades.csv"
         self._snapshots_file = "data/grid_snapshots.csv"
+        self._rebalances_file = "data/grid_rebalances.csv"
         self._init_data_files()
         
         for symbol in symbols:
@@ -76,6 +78,14 @@ class GridPaperSimulator:
                     'total_value', 'roi_percent', 'total_trades', 'win_rate',
                     'btc_price', 'eth_price', 'report_type'
                 ])
+        
+        if not os.path.exists(self._rebalances_file):
+            with open(self._rebalances_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'symbol', 'reason', 'old_range', 'new_range',
+                    'open_positions', 'unrealized_pnl', 'positions_profitable', 'forced'
+                ])
     
     def _save_trade(self, record: TradeRecord):
         with open(self._trades_file, 'a', newline='') as f:
@@ -97,6 +107,21 @@ class GridPaperSimulator:
                 data.get('btc_price', 0),
                 data.get('eth_price', 0),
                 report_type
+            ])
+    
+    def _save_rebalance_event(self, event_data: Dict):
+        with open(self._rebalances_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                event_data['timestamp'],
+                event_data['symbol'],
+                event_data['reason'],
+                event_data['old_range'],
+                event_data['new_range'],
+                event_data['open_positions'],
+                event_data['unrealized_pnl'],
+                event_data['positions_profitable'],
+                event_data['forced']
             ])
     
     async def start(self):
@@ -166,7 +191,8 @@ class GridPaperSimulator:
                 atr = data['atr'].iloc[-1] if 'atr' in data.columns else current_price * 0.02
                 
                 if not strategy.initialized:
-                    strategy.initialize_grid(current_price, atr, investment_per_symbol)
+                    strategy.initialize_grid(current_price, atr, investment_per_symbol, data)
+                    strategy.last_rebalance_time = datetime.utcnow()
                     await self._send_grid_init_message(symbol, strategy)
                 
                 fills = strategy.check_grid_fills(current_price)
@@ -174,8 +200,10 @@ class GridPaperSimulator:
                 for fill in fills:
                     await self._process_fill(symbol, fill, current_price)
                 
-                if strategy.should_rebalance(current_price):
-                    logger.warning(f"{symbol} price ${current_price:.2f} out of grid range, waiting...")
+                should_rebalance, reason = strategy.should_rebalance_hybrid(current_price)
+                
+                if should_rebalance:
+                    await self._execute_rebalance(symbol, strategy, current_price, atr, reason, data)
                 
                 await asyncio.sleep(60)
                 
@@ -184,6 +212,46 @@ class GridPaperSimulator:
             except Exception as e:
                 logger.error(f"Error in grid loop for {symbol}: {e}")
                 await asyncio.sleep(60)
+    
+    async def _execute_rebalance(
+        self,
+        symbol: str,
+        strategy: GridStrategy,
+        current_price: float,
+        atr: float,
+        reason: str,
+        data: Optional[pd.DataFrame] = None
+    ):
+        old_config = strategy.config
+        unrealized_pnl = strategy.calculate_unrealized_pnl(current_price)
+        open_positions = len(self.positions[symbol])
+        
+        can_rebalance, profit_msg = strategy.can_rebalance_positions_profitable(current_price)
+        
+        strategy.rebalance(current_price, atr, reason, data)
+        
+        self._save_rebalance_event({
+            'timestamp': datetime.utcnow().isoformat(),
+            'symbol': symbol,
+            'reason': reason,
+            'old_range': f"${old_config.lower_price:.2f}-${old_config.upper_price:.2f}",
+            'new_range': f"${strategy.config.lower_price:.2f}-${strategy.config.upper_price:.2f}",
+            'open_positions': open_positions,
+            'unrealized_pnl': unrealized_pnl,
+            'positions_profitable': can_rebalance,
+            'forced': not can_rebalance
+        })
+        
+        await telegram.grid_rebalance_alert(
+            symbol=symbol,
+            reason=reason,
+            old_range=f"${old_config.lower_price:.2f}-${old_config.upper_price:.2f}",
+            new_range=f"${strategy.config.lower_price:.2f}-${strategy.config.upper_price:.2f}",
+            open_positions=open_positions,
+            unrealized_pnl=unrealized_pnl
+        )
+        
+        logger.warning(f"✅ Rebalanced {symbol}: {profit_msg}")
     
     async def _send_grid_init_message(self, symbol: str, strategy: GridStrategy):
         status = strategy.get_status()
@@ -297,7 +365,9 @@ class GridPaperSimulator:
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
-        win_rate = (self.winning_trades / max(1, self.total_trades // 2)) * 100
+        sell_trades = sum(1 for sym in self.symbols for pos in self.positions.get(sym, []))
+        completed_pairs = self.total_trades - sell_trades
+        win_rate = (self.winning_trades / max(1, completed_pairs)) * 100 if completed_pairs > 0 else 0
         
         snapshot_data = {
             'balance': self.balance,
@@ -359,7 +429,9 @@ class GridPaperSimulator:
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
-        win_rate = (self.winning_trades / max(1, self.total_trades // 2)) * 100
+        open_positions = sum(len(positions) for positions in self.positions.values())
+        completed_pairs = (self.total_trades - open_positions) // 2
+        win_rate = (self.winning_trades / max(1, completed_pairs)) * 100 if completed_pairs > 0 else 0
         
         snapshot_data = {
             'balance': self.initial_balance,

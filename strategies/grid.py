@@ -45,12 +45,34 @@ class GridStrategy(BaseStrategy):
         self.initialized = False
         self.last_price = 0.0
         self.center_price = 0.0
+        self.last_rebalance_time: Optional[datetime] = None
+        self.positions_carried_over: int = 0
         
     def build_strategy(self, data_source=None, start_date=None, end_date=None, symbol=None):
         pass
     
-    def initialize_grid(self, current_price: float, atr: float, total_investment: float) -> GridConfig:
-        atr_multiplier = 3.0
+    def _calculate_dynamic_multiplier(self, data: pd.DataFrame) -> float:
+        if data is None or len(data) < 30:
+            return 7.0
+        
+        close_prices = data['close'].tail(30)
+        daily_returns = close_prices.pct_change().dropna()
+        volatility = daily_returns.std()
+        
+        if volatility > 0.05:
+            multiplier = 10.0
+            logger.info(f"{self.symbol}: High volatility ({volatility:.3f}) → multiplier = {multiplier}")
+        elif volatility > 0.03:
+            multiplier = 7.0
+            logger.info(f"{self.symbol}: Medium volatility ({volatility:.3f}) → multiplier = {multiplier}")
+        else:
+            multiplier = 5.0
+            logger.info(f"{self.symbol}: Low volatility ({volatility:.3f}) → multiplier = {multiplier}")
+        
+        return multiplier
+    
+    def initialize_grid(self, current_price: float, atr: float, total_investment: float, data: pd.DataFrame = None) -> GridConfig:
+        atr_multiplier = self._calculate_dynamic_multiplier(data)
         upper_price = current_price + (atr * atr_multiplier)
         lower_price = current_price - (atr * atr_multiplier)
         
@@ -174,6 +196,81 @@ class GridStrategy(BaseStrategy):
                 pnl += profit
         return pnl
     
+    def can_rebalance_positions_profitable(self, current_price: float) -> tuple[bool, str]:
+        from config.settings import settings
+        
+        filled_buys = [l for l in self.grid_levels if l.filled and l.side == "buy"]
+        
+        if not filled_buys:
+            return True, "No open positions"
+        
+        total_unrealized = 0.0
+        unprofitable_count = 0
+        
+        for buy in filled_buys:
+            position_pnl = (current_price - buy.price) * buy.amount
+            total_unrealized += position_pnl
+            if position_pnl < 0:
+                unprofitable_count += 1
+        
+        min_profit = max(
+            settings.grid.min_profit_threshold,
+            self.config.total_investment * (settings.grid.min_profit_threshold_percent / 100)
+        )
+        
+        if total_unrealized < min_profit:
+            return False, f"Unrealized ${total_unrealized:.2f} below threshold ${min_profit:.2f}"
+        
+        if unprofitable_count == 0:
+            return True, f"All {len(filled_buys)} positions profitable (${total_unrealized:.2f})"
+        
+        return False, f"{unprofitable_count}/{len(filled_buys)} positions unprofitable (${total_unrealized:.2f})"
+    
+    def should_rebalance_hybrid(self, current_price: float) -> tuple[bool, str]:
+        from config.settings import settings
+        
+        if not self.initialized:
+            return False, "Not initialized"
+        
+        now = datetime.utcnow()
+        hours_since_rebalance = 0
+        
+        if self.last_rebalance_time:
+            hours_since_rebalance = (now - self.last_rebalance_time).total_seconds() / 3600
+            
+            if hours_since_rebalance < (settings.grid.rebalance_cooldown_minutes / 60):
+                minutes_remaining = settings.grid.rebalance_cooldown_minutes - (hours_since_rebalance * 60)
+                return False, f"Cooldown: {minutes_remaining:.0f}m remaining"
+        
+        buffer = self.config.grid_spacing * settings.grid.breakout_buffer_multiplier
+        price_out_of_range = (
+            current_price > self.config.upper_price + buffer or 
+            current_price < self.config.lower_price - buffer
+        )
+        
+        if price_out_of_range:
+            can_rebalance, profit_msg = self.can_rebalance_positions_profitable(current_price)
+            
+            if hours_since_rebalance >= settings.grid.force_rebalance_after_hours:
+                return True, f"FORCED after {hours_since_rebalance:.1f}h: Price breakout. {profit_msg}"
+            
+            if not can_rebalance and settings.grid.wait_for_profit:
+                return False, f"Price breakout but waiting for profit: {profit_msg}"
+            
+            return True, f"EMERGENCY: Price breakout (${current_price:.2f}). {profit_msg}"
+        
+        rebalance_interval = settings.grid.get_interval_hours(self.symbol)
+        if hours_since_rebalance >= rebalance_interval:
+            can_rebalance, profit_msg = self.can_rebalance_positions_profitable(current_price)
+            
+            if not can_rebalance and settings.grid.wait_for_profit:
+                return False, f"{hours_since_rebalance:.1f}h passed but waiting for profit: {profit_msg}"
+            
+            return True, f"SCHEDULED: {hours_since_rebalance:.1f}h passed. {profit_msg}"
+        
+        next_rebalance_hours = rebalance_interval - hours_since_rebalance
+        return False, f"Next rebalance in {next_rebalance_hours:.1f}h"
+    
     def should_rebalance(self, current_price: float) -> bool:
         if not self.initialized:
             return False
@@ -184,11 +281,23 @@ class GridStrategy(BaseStrategy):
             return True
         return False
     
-    def rebalance(self, current_price: float, atr: float):
-        logger.info(f"Rebalancing grid for {self.symbol} around ${current_price:.2f}")
-        filled_buys = [l for l in self.grid_levels if l.filled and l.side == "buy"]
+    def rebalance(self, current_price: float, atr: float, reason: str = "unknown", data: pd.DataFrame = None):
+        logger.warning(f"🔄 REBALANCING {self.symbol} around ${current_price:.2f}")
+        logger.warning(f"   Reason: {reason}")
         
-        self.initialize_grid(current_price, atr, self.config.total_investment)
+        filled_buys = [l for l in self.grid_levels if l.filled and l.side == "buy"]
+        unrealized = self.calculate_unrealized_pnl(current_price)
+        logger.warning(f"   Open buy levels: {len(filled_buys)}, Unrealized PnL: ${unrealized:.2f}")
+        
+        old_config = self.config
+        self.positions_carried_over += len(filled_buys)
+        
+        self.initialize_grid(current_price, atr, self.config.total_investment, data)
+        self.last_rebalance_time = datetime.utcnow()
+        
+        logger.info(f"   Old range: ${old_config.lower_price:.2f} - ${old_config.upper_price:.2f}")
+        logger.info(f"   New range: ${self.config.lower_price:.2f} - ${self.config.upper_price:.2f}")
+        logger.info(f"   Total positions carried over: {self.positions_carried_over}")
     
     def generate_signal(self, data: pd.DataFrame) -> Signal:
         return self.create_signal(
