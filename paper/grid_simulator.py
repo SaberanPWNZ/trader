@@ -54,6 +54,8 @@ class GridPaperSimulator:
         self._trades_file = "data/grid_trades.csv"
         self._snapshots_file = "data/grid_snapshots.csv"
         self._rebalances_file = "data/grid_rebalances.csv"
+        self._trading_paused = False
+        self._pause_until: Optional[datetime] = None
         self._init_data_files()
         
         for symbol in symbols:
@@ -180,6 +182,15 @@ class GridPaperSimulator:
         
         while self._running:
             try:
+                if self._trading_paused:
+                    if datetime.utcnow() < self._pause_until:
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        self._trading_paused = False
+                        logger.info("Trading resumed")
+                        await telegram.send_message("✅ Trading resumed")
+                
                 data = await self._fetch_market_data(symbol)
                 
                 if data.empty:
@@ -194,6 +205,19 @@ class GridPaperSimulator:
                     strategy.initialize_grid(current_price, atr, investment_per_symbol, data)
                     strategy.last_rebalance_time = datetime.utcnow()
                     await self._send_grid_init_message(symbol, strategy)
+                
+                action = await self.check_portfolio_health()
+                
+                if action == "stop_loss":
+                    await self.close_all_positions("Portfolio stop loss triggered (-5%)")
+                    break
+                elif action == "take_profit":
+                    await self.close_all_positions("Portfolio take profit reached (+10%)")
+                    break
+                elif action == "partial_profit":
+                    await self.close_partial_positions(settings.grid.partial_close_ratio)
+                elif action == "rebalance_warning":
+                    logger.warning(f"{symbol}: Unrealized loss > -3%, monitoring closely")
                 
                 fills = strategy.check_grid_fills(current_price)
                 
@@ -253,6 +277,134 @@ class GridPaperSimulator:
         
         logger.warning(f"✅ Rebalanced {symbol}: {profit_msg}")
     
+    def _calculate_total_unrealized(self) -> float:
+        total = 0.0
+        for symbol, positions in self.positions.items():
+            if not positions:
+                continue
+            strategy = self.strategies.get(symbol)
+            if not strategy or not strategy.grid_levels:
+                continue
+            avg_price = sum(level.price for level in strategy.grid_levels if level.filled) / max(1, sum(1 for level in strategy.grid_levels if level.filled))
+            for pos in positions:
+                total += (avg_price - pos.entry_price) * pos.amount
+        return total
+    
+    async def check_portfolio_health(self) -> Optional[str]:
+        if not settings.grid.enable_portfolio_protection:
+            return None
+        
+        total_unrealized = self._calculate_total_unrealized()
+        total_value = self.balance + total_unrealized
+        unrealized_pnl_pct = ((total_value - self.initial_balance) / self.initial_balance) * 100
+        
+        if unrealized_pnl_pct <= -settings.grid.portfolio_stop_loss_percent:
+            return "stop_loss"
+        
+        if unrealized_pnl_pct >= settings.grid.portfolio_take_profit_percent:
+            return "take_profit"
+        
+        if unrealized_pnl_pct >= settings.grid.partial_close_profit_percent:
+            return "partial_profit"
+        
+        if unrealized_pnl_pct <= -settings.grid.max_unrealized_loss_percent:
+            return "rebalance_warning"
+        
+        return None
+    
+    async def close_all_positions(self, reason: str):
+        logger.warning(f"🚨 CLOSING ALL POSITIONS: {reason}")
+        
+        closed_count = 0
+        total_realized = 0.0
+        
+        for symbol in self.symbols:
+            positions = self.positions[symbol]
+            if not positions:
+                continue
+            
+            data = await self._fetch_market_data(symbol)
+            if data.empty:
+                continue
+            current_price = data['close'].iloc[-1]
+            
+            for position in positions:
+                profit = (current_price - position.entry_price) * position.amount
+                self.balance += position.entry_price * position.amount + profit
+                self.realized_pnl += profit
+                total_realized += profit
+                closed_count += 1
+            
+            self.positions[symbol] = []
+            
+            strategy = self.strategies[symbol]
+            for level in strategy.grid_levels:
+                level.filled = False
+                level.filled_at = None
+        
+        msg = (
+            f"🚨 Portfolio Protection Activated\n"
+            f"Reason: {reason}\n"
+            f"Closed {closed_count} positions\n"
+            f"Realized P&L: ${total_realized:.2f}\n"
+            f"New Balance: ${self.balance:.2f}"
+        )
+        await telegram.send_message(msg)
+        
+        if "stop_loss" in reason.lower():
+            self._trading_paused = True
+            self._pause_until = datetime.utcnow() + timedelta(hours=settings.grid.pause_after_stop_loss_hours)
+            logger.warning(f"Trading paused until {self._pause_until}")
+    
+    async def close_partial_positions(self, ratio: float = 0.5):
+        logger.info(f"💰 Taking partial profits: closing {ratio:.0%} of positions")
+        
+        closed_count = 0
+        total_profit = 0.0
+        
+        for symbol in self.symbols:
+            positions = self.positions[symbol]
+            if not positions:
+                continue
+            
+            data = await self._fetch_market_data(symbol)
+            if data.empty:
+                continue
+            current_price = data['close'].iloc[-1]
+            
+            profitable_positions = [
+                p for p in positions 
+                if (current_price - p.entry_price) > 0
+            ]
+            
+            num_to_close = int(len(profitable_positions) * ratio)
+            positions_to_close = profitable_positions[:num_to_close]
+            
+            for position in positions_to_close:
+                profit = (current_price - position.entry_price) * position.amount
+                self.balance += position.entry_price * position.amount + profit
+                self.realized_pnl += profit
+                total_profit += profit
+                closed_count += 1
+                
+                self.positions[symbol].remove(position)
+                
+                strategy = self.strategies[symbol]
+                for level in strategy.grid_levels:
+                    if level.filled and abs(level.price - position.entry_price) < 0.01:
+                        level.filled = False
+                        level.filled_at = None
+                        break
+        
+        if closed_count > 0:
+            msg = (
+                f"💰 Partial Profit Taking\n"
+                f"Closed {closed_count} positions ({ratio:.0%})\n"
+                f"Profit: ${total_profit:.2f}\n"
+                f"Balance: ${self.balance:.2f}"
+            )
+            await telegram.send_message(msg)
+    
     async def _send_grid_init_message(self, symbol: str, strategy: GridStrategy):
         status = strategy.get_status()
         msg = (
@@ -288,16 +440,11 @@ class GridPaperSimulator:
             emoji = "🔴"
             action = "SELL"
         
-        total_unrealized = 0.0
-        for sym, strategy in self.strategies.items():
-            if strategy.initialized:
-                data = await self._fetch_market_data(sym)
-                if not data.empty:
-                    price = data['close'].iloc[-1]
-                    total_unrealized += strategy.calculate_unrealized_pnl(price)
+        total_unrealized = self._calculate_total_unrealized()
+        total_value = self.balance + total_unrealized
+        roi_percent = ((total_value - self.initial_balance) / self.initial_balance) * 100
         
-        total_value = self.initial_balance + self.realized_pnl + total_unrealized
-        roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
+        health_emoji = "✅" if roi_percent >= 0 else "⚠️" if roi_percent >= -2 else "🚨"
         
         trade_record = TradeRecord(
             timestamp=datetime.utcnow().isoformat(),
@@ -308,22 +455,32 @@ class GridPaperSimulator:
             value=fill['value'],
             realized_pnl=self.realized_pnl,
             unrealized_pnl=total_unrealized,
-            balance=self.initial_balance,
+            balance=self.balance,
             total_value=total_value,
-            roi_percent=roi
+            roi_percent=roi_percent
         )
         self._save_trade(trade_record)
         
         msg = (
             f"{emoji} Grid {action}: {symbol}\n"
             f"Price: ${fill['price']:.2f}\n"
+            f"Amount: {fill['amount']:.4f}\n"
             f"Value: ${fill['value']:.2f}\n"
-            f"Realized: ${self.realized_pnl:.2f}\n"
-            f"Unrealized: ${total_unrealized:.2f}\n"
-            f"Total: ${total_value:.2f}"
         )
+        
+        if fill['side'] == 'sell' and 'profit' in locals():
+            profit_emoji = "✅" if profit > 0 else "❌"
+            msg += f"{profit_emoji} Profit: ${profit:.2f}\n"
+        
+        msg += (
+            f"\n{health_emoji} Portfolio:\n"
+            f"ROI: {roi_percent:+.2f}%\n"
+            f"Balance: ${self.balance:.2f}\n"
+            f"Total Value: ${total_value:.2f}"
+        )
+        
         await telegram.send_message(msg)
-        logger.info(f"Grid {action} {symbol} at ${fill['price']:.2f}, PnL: ${self.realized_pnl:.2f}")
+        logger.info(f"Grid {action} {symbol} at ${fill['price']:.2f}, Portfolio ROI: {roi_percent:+.2f}%")
     
     async def _status_reporter(self):
         self._last_12h_report = datetime.utcnow()
