@@ -205,29 +205,39 @@ class AIStrategy(BaseStrategy):
                     random_state=42,
                     scale_pos_weight=scale_pos_weight,
                     eval_metric='logloss',
-                    reg_alpha=0.1,
-                    reg_lambda=1.0,
+                    reg_alpha=1.0,
+                    reg_lambda=5.0,
                     subsample=0.8,
-                    colsample_bytree=0.8
+                    colsample_bytree=0.8,
+                    early_stopping_rounds=10
                 )
                 if learning_config.hyperparameter_tuning:
                     param_grid = {
                         'n_estimators': [50, 100],
-                        'max_depth': [3, 4, 5],
+                        'max_depth': [3, 4],
                         'learning_rate': [0.01, 0.03, 0.05],
-                        'min_child_weight': [3, 5, 7]
+                        'min_child_weight': [5, 7, 9],
+                        'gamma': [0.1, 0.5, 1.0]
                     }
                     grid_search = GridSearchCV(
                         base_model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1
                     )
-                    grid_search.fit(X_train, y_train)
+                    grid_search.fit(
+                        X_train, y_train,
+                        eval_set=[(X_test, y_test)],
+                        verbose=False
+                    )
                     self.model = grid_search.best_estimator_
                     best_params = grid_search.best_params_
                     cv_score = grid_search.best_score_
                     logger.info(f"Best params: {best_params}, CV score: {cv_score:.3f}")
                 else:
-                    base_model.set_params(n_estimators=100, max_depth=5, learning_rate=0.05)
-                    base_model.fit(X_train, y_train)
+                    base_model.set_params(n_estimators=100, max_depth=3, learning_rate=0.03, gamma=0.5)
+                    base_model.fit(
+                        X_train, y_train,
+                        eval_set=[(X_test, y_test)],
+                        verbose=False
+                    )
                     self.model = base_model
                     best_params = {}
                     cv_score = 0.0
@@ -239,13 +249,16 @@ class AIStrategy(BaseStrategy):
             from sklearn.ensemble import RandomForestClassifier
             base_model = RandomForestClassifier(
                 random_state=42,
-                class_weight='balanced'
+                class_weight='balanced',
+                max_features='sqrt',
+                min_samples_leaf=5
             )
             if learning_config.hyperparameter_tuning:
                 param_grid = {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [5, 10, 15],
-                    'min_samples_split': [2, 5, 10]
+                    'n_estimators': [50, 100],
+                    'max_depth': [5, 7, 10],
+                    'min_samples_split': [5, 10, 20],
+                    'min_samples_leaf': [5, 10]
                 }
                 grid_search = GridSearchCV(
                     base_model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1
@@ -256,7 +269,7 @@ class AIStrategy(BaseStrategy):
                 cv_score = grid_search.best_score_
                 logger.info(f"Best params: {best_params}, CV score: {cv_score:.3f}")
             else:
-                base_model.set_params(n_estimators=100, max_depth=10)
+                base_model.set_params(n_estimators=100, max_depth=7, min_samples_split=10)
                 base_model.fit(X_train, y_train)
                 self.model = base_model
                 best_params = {}
