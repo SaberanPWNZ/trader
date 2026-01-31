@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import json
 import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -41,22 +42,26 @@ class GridPaperSimulator:
     def __init__(self, symbols: List[str], initial_balance: float = 300.0):
         self.symbols = symbols
         self.initial_balance = initial_balance
-        self.balance = initial_balance
+        self._trades_file = "data/grid_trades.csv"
+        self._snapshots_file = "data/grid_snapshots.csv"
+        self._rebalances_file = "data/grid_rebalances.csv"
+        self._state_file = "data/grid_state.json"
+        self._init_data_files()
+        self._load_state()
+        
+        self.balance = self._restore_balance_from_csv() or self.initial_balance
+        self.realized_pnl = self._restore_realized_pnl() or 0.0
+        
         self.strategies: Dict[str, GridStrategy] = {}
         self.positions: Dict[str, List[GridPosition]] = {s: [] for s in symbols}
-        self.realized_pnl = 0.0
         self.total_trades = 0
         self.winning_trades = 0
         self._running = False
         self._start_time = None
         self._last_12h_report = None
         self._last_24h_report = None
-        self._trades_file = "data/grid_trades.csv"
-        self._snapshots_file = "data/grid_snapshots.csv"
-        self._rebalances_file = "data/grid_rebalances.csv"
         self._trading_paused = False
         self._pause_until: Optional[datetime] = None
-        self._init_data_files()
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -126,15 +131,74 @@ class GridPaperSimulator:
                 event_data['forced']
             ])
     
+    def _restore_balance_from_csv(self) -> Optional[float]:
+        try:
+            if os.path.exists(self._trades_file):
+                with open(self._trades_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) > 1:
+                        last_line = lines[-1].strip()
+                        if last_line:
+                            columns = last_line.split(',')
+                            if len(columns) >= 9:
+                                balance = float(columns[8])
+                                logger.info(f"Відновлено баланс з CSV: ${balance:.2f}")
+                                return balance
+        except Exception as e:
+            logger.warning(f"Не вдалося відновити баланс з CSV: {e}")
+        return None
+    
+    def _restore_realized_pnl(self) -> Optional[float]:
+        try:
+            if os.path.exists(self._trades_file):
+                with open(self._trades_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) > 1:
+                        last_line = lines[-1].strip()
+                        if last_line:
+                            columns = last_line.split(',')
+                            if len(columns) >= 7:
+                                realized_pnl = float(columns[6])
+                                logger.info(f"Відновлено realized PnL з CSV: ${realized_pnl:.2f}")
+                                return realized_pnl
+        except Exception as e:
+            logger.warning(f"Не вдалося відновити realized PnL з CSV: {e}")
+        return None
+
+    def _load_state(self) -> None:
+        try:
+            if os.path.exists(self._state_file):
+                with open(self._state_file, 'r') as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    if "initial_balance" in state:
+                        self.initial_balance = float(state["initial_balance"])
+        except Exception as e:
+            logger.warning(f"Не вдалося завантажити стан: {e}")
+
+    def _save_state(self) -> None:
+        try:
+            state = {
+                "initial_balance": self.initial_balance,
+                "started_at": datetime.utcnow().isoformat()
+            }
+            with open(self._state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            logger.warning(f"Не вдалося зберегти стан: {e}")
+    
     async def start(self):
         self._running = True
         self._start_time = datetime.utcnow()
+        if not os.path.exists(self._state_file):
+            self._save_state()
         
         await telegram.send_message(
             f"🔲 Grid Trading Started\n"
             f"Symbols: {', '.join(self.symbols)}\n"
-            f"Balance: ${self.initial_balance:.2f}\n"
-            f"Investment per symbol: ${self.initial_balance/len(self.symbols):.2f}"
+            f"Balance: ${self.balance:.2f}\n"
+            f"Realized PnL: ${self.realized_pnl:.2f}\n"
+            f"Investment per symbol: ${self.balance/len(self.symbols):.2f}"
         )
         
         logger.info(f"Grid paper trading started for {self.symbols}")
@@ -158,7 +222,8 @@ class GridPaperSimulator:
             ticker = yf.Ticker(yf_symbol)
             data = ticker.history(period="7d", interval="1h")
             
-            if data is None or data.empty:
+            if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+                logger.warning(f"No data returned from yfinance for {symbol} ({yf_symbol})")
                 return pd.DataFrame()
             
             data = data.reset_index()
@@ -289,13 +354,21 @@ class GridPaperSimulator:
             for pos in positions:
                 total += (avg_price - pos.entry_price) * pos.amount
         return total
+
+    def _calculate_total_cost_basis(self) -> float:
+        total = 0.0
+        for positions in self.positions.values():
+            for pos in positions:
+                total += pos.entry_price * pos.amount
+        return total
     
     async def check_portfolio_health(self) -> Optional[str]:
         if not settings.grid.enable_portfolio_protection:
             return None
         
         total_unrealized = self._calculate_total_unrealized()
-        total_value = self.balance + total_unrealized
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         unrealized_pnl_pct = ((total_value - self.initial_balance) / self.initial_balance) * 100
         
         if unrealized_pnl_pct <= -settings.grid.portfolio_stop_loss_percent:
@@ -420,6 +493,7 @@ class GridPaperSimulator:
         self.total_trades += 1
         
         if fill['side'] == 'buy':
+            self.balance -= fill['value']
             self.positions[symbol].append(GridPosition(
                 symbol=symbol,
                 side='long',
@@ -430,6 +504,7 @@ class GridPaperSimulator:
             emoji = "🟢"
             action = "BUY"
         else:
+            self.balance += fill['value']
             profit = 0.0
             if self.positions[symbol]:
                 pos = self.positions[symbol].pop(0)
@@ -441,7 +516,8 @@ class GridPaperSimulator:
             action = "SELL"
         
         total_unrealized = self._calculate_total_unrealized()
-        total_value = self.balance + total_unrealized
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         roi_percent = ((total_value - self.initial_balance) / self.initial_balance) * 100
         
         health_emoji = "✅" if roi_percent >= 0 else "⚠️" if roi_percent >= -2 else "🚨"
@@ -518,7 +594,8 @@ class GridPaperSimulator:
                     )
         
         total_pnl = self.realized_pnl + total_unrealized
-        total_value = self.balance + total_unrealized
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
