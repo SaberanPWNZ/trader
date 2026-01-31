@@ -91,7 +91,7 @@ class SelfLearningConfig:
     min_samples_for_training: int = 1000
     max_models_to_keep: int = 5
     db_path: str = field(default_factory=lambda: os.getenv("LEARNING_DB_PATH", "data/learning.db"))
-    performance_lookback_days: int = 365
+    performance_lookback_days: int = 180
     holdout_days: int = 7
     auto_deploy_enabled: bool = False
     backtest_before_deploy: bool = True
@@ -139,7 +139,7 @@ class BacktestConfig:
     """Backtesting configuration."""
     start_date: str = "2024-01-01"
     end_date: str = "2024-12-01"
-    initial_balance: float = 100.0  # Start with $100 for paper trading
+    initial_balance: float = 2000.0
     trading_fee: float = 0.001  # 0.1%
     slippage: float = 0.0005  # 0.05%
     

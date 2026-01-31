@@ -31,6 +31,9 @@ class LearningTelegramBot:
             "/train": self._cmd_train,
             "/lastrun": self._cmd_lastrun,
             "/deploy": self._cmd_deploy,
+            "/balance": self._cmd_balance,
+            "/grid": self._cmd_grid,
+            "/trades": self._cmd_trades,
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -123,15 +126,21 @@ class LearningTelegramBot:
 
     async def _cmd_start(self, args: list) -> None:
         await self._send_message("""
-🤖 <b>Trading Bot Learning System</b>
+🤖 <b>Trading Bot System</b>
 
-Commands:
+<b>Grid Trading:</b>
+/balance - Portfolio balance & ROI
+/grid - Grid ranges & prices
+/trades [N] - Last N trades (default 10)
+
+<b>AI Models:</b>
 /status - System status
 /models - List trained models
 /performance - Performance stats
 /train &lt;symbol&gt; - Force training
 /lastrun - Last training details
 /deploy &lt;model_id&gt; - Deploy model
+
 /help - Show this help
 """)
 
@@ -260,3 +269,155 @@ Commands:
             await self._send_message(f"🚀 Model {model_id} deployed for {symbol}")
         except Exception as e:
             await self._send_message(f"❌ Deploy failed: {e}")
+
+    async def _cmd_balance(self, args: list) -> None:
+        import os
+        import csv
+        import json
+        
+        trades_file = "data/grid_trades.csv"
+        state_file = "data/grid_state.json"
+        if not os.path.exists(trades_file):
+            await self._send_message("❌ No trading data found")
+            return
+        
+        try:
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                trades = list(reader)
+            
+            if not trades:
+                await self._send_message("❌ No trades yet")
+                return
+            
+            last_trade = trades[-1]
+            balance = float(last_trade['balance'])
+            total_value = float(last_trade['total_value'])
+            roi_percent = float(last_trade['roi_percent'])
+            realized_pnl = float(last_trade['realized_pnl'])
+            unrealized_pnl = float(last_trade['unrealized_pnl'])
+            initial_balance = None
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                if isinstance(state, dict) and "initial_balance" in state:
+                    initial_balance = float(state["initial_balance"])
+            total_trades = len(trades)
+            buy_trades = sum(1 for t in trades if t['side'] == 'BUY')
+            sell_trades = sum(1 for t in trades if t['side'] == 'SELL')
+            
+            roi_emoji = "✅" if roi_percent >= 0 else "⚠️" if roi_percent >= -2 else "🚨"
+            
+            lines = [
+                "💰 <b>Portfolio Balance</b>",
+                "",
+                f"{roi_emoji} <b>Total Value:</b> ${total_value:.2f}",
+                f"<b>Balance:</b> ${balance:.2f}",
+                f"<b>ROI:</b> {roi_percent:+.2f}%"
+            ]
+            if initial_balance is not None:
+                change = total_value - initial_balance
+                change_percent = (change / initial_balance) * 100 if initial_balance else 0.0
+                lines.append(f"<b>Change:</b> ${change:+.2f} ({change_percent:+.2f}%)")
+            
+            lines.extend([
+                "",
+                "<b>PnL Breakdown:</b>",
+                f"├ Realized: ${realized_pnl:+.2f}",
+                f"└ Unrealized: ${unrealized_pnl:+.2f}",
+                "",
+                "<b>Trading Activity:</b>",
+                f"├ Total Trades: {total_trades}",
+                f"├ BUY: {buy_trades}",
+                f"└ SELL: {sell_trades}",
+                "",
+                f"<i>Updated: {last_trade['timestamp'][:19]}</i>"
+            ])
+            await self._send_message("\n".join(lines))
+        except Exception as e:
+            logger.error(f"Balance command error: {e}")
+            await self._send_message(f"❌ Error reading balance: {e}")
+
+    async def _cmd_grid(self, args: list) -> None:
+        import yfinance as yf
+        
+        symbols_map = {
+            'BTC/USDT': 'BTC-USD',
+            'ETH/USDT': 'ETH-USD',
+            'SOL/USDT': 'SOL-USD',
+            'DOGE/USDT': 'DOGE-USD'
+        }
+        
+        grid_ranges = {
+            'BTC/USDT': (85893, 89394),
+            'ETH/USDT': (2572, 2875),
+            'SOL/USDT': (109, 121),
+            'DOGE/USDT': (0.11, 0.12)
+        }
+        
+        lines = ["📊 <b>Grid Trading Status</b>\n"]
+        
+        for symbol, yf_symbol in symbols_map.items():
+            try:
+                ticker = yf.Ticker(yf_symbol)
+                data = ticker.history(period='1d', interval='1h')
+                if not data.empty:
+                    price = data['Close'].iloc[-1]
+                    low_range, high_range = grid_ranges.get(symbol, (0, 0))
+                    
+                    if low_range <= price <= high_range:
+                        status = "✅ IN RANGE"
+                    elif price < low_range:
+                        status = "⬇️ BELOW"
+                    else:
+                        status = "⬆️ ABOVE"
+                    
+                    lines.append(f"<b>{symbol}</b>")
+                    lines.append(f"├ Price: ${price:,.2f} {status}")
+                    lines.append(f"└ Range: ${low_range:,.2f} - ${high_range:,.2f}\n")
+            except Exception as e:
+                lines.append(f"<b>{symbol}</b>: ❌ Error: {e}\n")
+        
+        await self._send_message("\n".join(lines))
+
+    async def _cmd_trades(self, args: list) -> None:
+        import os
+        import csv
+        
+        limit = int(args[0]) if args and args[0].isdigit() else 10
+        trades_file = "data/grid_trades.csv"
+        
+        if not os.path.exists(trades_file):
+            await self._send_message("❌ No trading data found")
+            return
+        
+        try:
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                trades = list(reader)[-limit:]
+            
+            if not trades:
+                await self._send_message("❌ No trades yet")
+                return
+            
+            lines = [f"📈 <b>Last {len(trades)} Trades</b>\n"]
+            
+            for trade in trades:
+                side_emoji = "🟢" if trade['side'] == 'BUY' else "🔴"
+                timestamp = trade['timestamp'][11:19]
+                symbol = trade['symbol'].split('/')[0]
+                price = float(trade['price'])
+                value = float(trade['value'])
+                roi = float(trade['roi_percent'])
+                
+                lines.append(
+                    f"{side_emoji} <b>{symbol}</b> {trade['side']} "
+                    f"${price:,.2f} (${value:.0f}) "
+                    f"ROI: {roi:+.2f}% "
+                    f"<code>{timestamp}</code>"
+                )
+            
+            await self._send_message("\n".join(lines))
+        except Exception as e:
+            logger.error(f"Trades command error: {e}")
+            await self._send_message(f"❌ Error reading trades: {e}")

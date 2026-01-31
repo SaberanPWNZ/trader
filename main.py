@@ -34,6 +34,8 @@ async def run_grid_trading(args):
     grid_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"]
     initial_balance = args.initial_balance if hasattr(args, 'initial_balance') and args.initial_balance else 2000.0
     
+    logger.info(f"Initializing grid trading with balance: ${initial_balance:.2f}")
+    
     simulator = GridPaperSimulator(
         symbols=grid_symbols,
         initial_balance=initial_balance
@@ -545,7 +547,7 @@ Examples:
     
     # Grid trading parser
     grid_parser = subparsers.add_parser("grid", help="Run grid trading bot")
-    grid_parser.add_argument("--initial-balance", type=float, default=500.0, help="Initial balance for grid trading")
+    grid_parser.add_argument("--initial-balance", type=float, default=2000.0, help="Initial balance for grid trading")
     
     # Live trading parser
     live_parser = subparsers.add_parser("live", help="Run live trading (PyBroker integration)")
