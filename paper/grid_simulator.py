@@ -39,7 +39,7 @@ class GridPosition:
 
 
 class GridPaperSimulator:
-    def __init__(self, symbols: List[str], initial_balance: float = 300.0):
+    def __init__(self, symbols: List[str], initial_balance: float = 1000.0):
         self.symbols = symbols
         self.initial_balance = initial_balance
         self._trades_file = "data/grid_trades.csv"
@@ -54,6 +54,7 @@ class GridPaperSimulator:
         
         self.strategies: Dict[str, GridStrategy] = {}
         self.positions: Dict[str, List[GridPosition]] = {s: [] for s in symbols}
+        self.current_prices: Dict[str, float] = {}
         self.total_trades = 0
         self.winning_trades = 0
         self._running = False
@@ -62,6 +63,8 @@ class GridPaperSimulator:
         self._last_24h_report = None
         self._trading_paused = False
         self._pause_until: Optional[datetime] = None
+        self._market_falling_pause = False
+        self._market_pause_until: Optional[datetime] = None
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -264,6 +267,7 @@ class GridPaperSimulator:
                 
                 data = TechnicalIndicators.add_all_indicators(data)
                 current_price = data['close'].iloc[-1]
+                self.current_prices[symbol] = current_price
                 atr = data['atr'].iloc[-1] if 'atr' in data.columns else current_price * 0.02
                 
                 if not strategy.initialized:
@@ -287,6 +291,10 @@ class GridPaperSimulator:
                 fills = strategy.check_grid_fills(current_price)
                 
                 for fill in fills:
+                    should_skip = await self._check_market_falling_protection(fill)
+                    if should_skip:
+                        logger.warning(f"⏸️ Skipping {fill['side']} {symbol} due to market falling protection")
+                        continue
                     await self._process_fill(symbol, fill, current_price)
                 
                 should_rebalance, reason = strategy.should_rebalance_hybrid(current_price)
@@ -347,12 +355,11 @@ class GridPaperSimulator:
         for symbol, positions in self.positions.items():
             if not positions:
                 continue
-            strategy = self.strategies.get(symbol)
-            if not strategy or not strategy.grid_levels:
+            current_price = self.current_prices.get(symbol)
+            if current_price is None:
                 continue
-            avg_price = sum(level.price for level in strategy.grid_levels if level.filled) / max(1, sum(1 for level in strategy.grid_levels if level.filled))
             for pos in positions:
-                total += (avg_price - pos.entry_price) * pos.amount
+                total += (current_price - pos.entry_price) * pos.amount
         return total
 
     def _calculate_total_cost_basis(self) -> float:
@@ -473,10 +480,49 @@ class GridPaperSimulator:
             msg = (
                 f"💰 Partial Profit Taking\n"
                 f"Closed {closed_count} positions ({ratio:.0%})\n"
-                f"Profit: ${total_profit:.2f}\n"
-                f"Balance: ${self.balance:.2f}"
+                f"Profit: ${total_profit:.2f}"
             )
             await telegram.send_message(msg)
+    
+    async def _check_market_falling_protection(self, fill: Dict) -> bool:
+        """
+        Перевіряє чи потрібно зупинити BUY угоди через падіння ринку.
+        Повертає True якщо угоду потрібно пропустити.
+        """
+        if fill['side'] != 'buy':
+            return False
+        
+        if self._market_falling_pause and datetime.utcnow() < self._market_pause_until:
+            return True
+        elif self._market_falling_pause:
+            self._market_falling_pause = False
+            logger.info("✅ Market falling protection lifted")
+            await telegram.send_message("✅ Market recovery detected - resuming BUY orders")
+        
+        total_unrealized = self._calculate_total_unrealized()
+        total_cost_basis = self._calculate_total_cost_basis()
+        
+        if total_cost_basis == 0:
+            return False
+        
+        unrealized_pnl_percent = (total_unrealized / total_cost_basis) * 100
+        
+        if unrealized_pnl_percent < -3.0:
+            self._market_falling_pause = True
+            self._market_pause_until = datetime.utcnow() + timedelta(minutes=30)
+            
+            msg = (
+                f"⏸️ MARKET FALLING PROTECTION ACTIVATED\n"
+                f"Unrealized P&L: {unrealized_pnl_percent:.2f}% (< -3%)\n"
+                f"All BUY orders paused for 30 minutes\n"
+                f"Current positions will remain open\n"
+                f"Resume at: {self._market_pause_until.strftime('%H:%M')}"
+            )
+            logger.warning(msg)
+            await telegram.send_message(msg)
+            return True
+        
+        return False
     
     async def _send_grid_init_message(self, symbol: str, strategy: GridStrategy):
         status = strategy.get_status()
@@ -659,7 +705,8 @@ class GridPaperSimulator:
                     )
         
         total_pnl = self.realized_pnl + total_unrealized
-        total_value = self.initial_balance + total_pnl
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
@@ -668,7 +715,7 @@ class GridPaperSimulator:
         win_rate = (self.winning_trades / max(1, completed_pairs)) * 100 if completed_pairs > 0 else 0
         
         snapshot_data = {
-            'balance': self.initial_balance,
+            'balance': self.balance,
             'realized_pnl': self.realized_pnl,
             'unrealized_pnl': total_unrealized,
             'total_value': total_value,
@@ -706,7 +753,8 @@ class GridPaperSimulator:
                     total_unrealized += strategy.calculate_unrealized_pnl(current_price)
         
         total_pnl = self.realized_pnl + total_unrealized
-        total_value = self.initial_balance + total_pnl
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         
@@ -728,11 +776,14 @@ class GridPaperSimulator:
             for strategy in self.strategies.values() 
             if strategy.initialized
         )
+        total_cost_basis = self._calculate_total_cost_basis()
+        total_value = self.balance + total_cost_basis + total_unrealized
         return {
             "initial_balance": self.initial_balance,
+            "balance": self.balance,
             "realized_pnl": self.realized_pnl,
             "unrealized_pnl": total_unrealized,
-            "total_value": self.initial_balance + self.realized_pnl + total_unrealized,
+            "total_value": total_value,
             "total_trades": self.total_trades,
             "positions": sum(len(p) for p in self.positions.values()),
             "winning_trades": self.winning_trades

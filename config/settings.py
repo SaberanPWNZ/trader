@@ -194,12 +194,12 @@ class GridConfig:
     breakout_buffer_multiplier: float = 2.0
     force_rebalance_after_hours: float = 24.0
     
-    portfolio_stop_loss_percent: float = 5.0
-    portfolio_take_profit_percent: float = 10.0
-    max_unrealized_loss_percent: float = 3.0
+    portfolio_stop_loss_percent: float = 10.0
+    portfolio_take_profit_percent: float = 15.0
+    max_unrealized_loss_percent: float = 5.0
     partial_close_profit_percent: float = 2.0
     partial_close_ratio: float = 0.5
-    enable_portfolio_protection: bool = True
+    enable_portfolio_protection: bool = False
     pause_after_stop_loss_hours: int = 24
     
     def get_interval_hours(self, symbol: str) -> float:
