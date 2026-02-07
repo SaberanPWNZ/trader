@@ -120,6 +120,7 @@ class GridStrategy(BaseStrategy):
     
     def check_grid_fills(self, current_price: float) -> List[Dict]:
         if not self.initialized:
+            logger.debug(f"check_grid_fills: Grid not initialized yet")
             return []
         
         fills = []
@@ -127,7 +128,22 @@ class GridStrategy(BaseStrategy):
         self.last_price = current_price
         
         if previous_price == 0:
+            logger.debug(f"check_grid_fills: First price update, setting last_price=${current_price:.2f}")
             return []
+        
+        logger.debug(f"check_grid_fills: Checking {len(self.grid_levels)} levels, previous=${previous_price:.2f}, current=${current_price:.2f}")
+        active_levels = [l for l in self.grid_levels if not l.filled]
+        logger.debug(f"check_grid_fills: Active levels: {len(active_levels)} unfilled")
+        
+        if active_levels:
+            buy_levels = [l for l in active_levels if l.side == "buy"]
+            sell_levels = [l for l in active_levels if l.side == "sell"]
+            if buy_levels:
+                buy_prices = [l.price for l in buy_levels]
+                logger.debug(f"check_grid_fills: BUY levels at: ${min(buy_prices):.2f} - ${max(buy_prices):.2f}")
+            if sell_levels:
+                sell_prices = [l.price for l in sell_levels]
+                logger.debug(f"check_grid_fills: SELL levels at: ${min(sell_prices):.2f} - ${max(sell_prices):.2f}")
         
         for level in self.grid_levels:
             if level.filled:
