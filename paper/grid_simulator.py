@@ -62,9 +62,16 @@ class GridPaperSimulator:
         self._last_12h_report = None
         self._last_24h_report = None
         self._trading_paused = False
+
+        self._restore_positions_from_csv()
         self._pause_until: Optional[datetime] = None
         self._market_falling_pause = False
         self._market_pause_until: Optional[datetime] = None
+        self._fetch_failures: Dict[str, int] = {s: 0 for s in symbols}
+        self._last_success: Dict[str, Optional[datetime]] = {s: None for s in symbols}
+        self._data_alert_sent: Dict[str, bool] = {s: False for s in symbols}
+        self._max_consecutive_failures = 10
+        self._last_health_check: Optional[datetime] = None
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -168,6 +175,41 @@ class GridPaperSimulator:
             logger.warning(f"Не вдалося відновити realized PnL з CSV: {e}")
         return None
 
+    def _restore_positions_from_csv(self):
+        try:
+            if not os.path.exists(self._trades_file):
+                return
+            with open(self._trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    symbol = row['symbol']
+                    if symbol not in self.positions:
+                        continue
+                    self.total_trades += 1
+                    if row['side'] == 'BUY':
+                        self.positions[symbol].append(GridPosition(
+                            symbol=symbol,
+                            side='long',
+                            entry_price=float(row['price']),
+                            amount=float(row['amount']),
+                            opened_at=datetime.fromisoformat(row['timestamp'])
+                        ))
+                    elif row['side'] == 'SELL':
+                        if self.positions[symbol]:
+                            pos = self.positions[symbol].pop(0)
+                            profit = (float(row['price']) - pos.entry_price) * pos.amount
+                            if profit > 0:
+                                self.winning_trades += 1
+
+            for symbol in self.symbols:
+                count = len(self.positions[symbol])
+                if count > 0:
+                    logger.info(f"Відновлено {count} позицій для {symbol}")
+            total = sum(len(p) for p in self.positions.values())
+            logger.info(f"Всього відновлено {total} відкритих позицій, {self.total_trades} торгів")
+        except Exception as e:
+            logger.warning(f"Не вдалося відновити позиції з CSV: {e}")
+
     def _load_state(self) -> None:
         try:
             if os.path.exists(self._state_file):
@@ -208,6 +250,7 @@ class GridPaperSimulator:
         
         tasks = [self._trading_loop(symbol) for symbol in self.symbols]
         tasks.append(self._status_reporter())
+        tasks.append(self._data_health_monitor())
         
         await asyncio.gather(*tasks)
     
@@ -219,30 +262,83 @@ class GridPaperSimulator:
     async def _fetch_market_data(self, symbol: str, limit: int = 200):
         import yfinance as yf
         import pandas as pd
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
         
-        try:
+        def fetch_sync():
             yf_symbol = settings.get_symbol_for_pybroker(symbol)
             ticker = yf.Ticker(yf_symbol)
-            data = ticker.history(period="7d", interval="1h")
+            return ticker.history(period="1d", interval="1m")
+        
+        try:
+            logger.debug(f"Fetching market data for {symbol}...")
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(executor, fetch_sync),
+                    timeout=30.0
+                )
             
             if data is None or not isinstance(data, pd.DataFrame) or data.empty:
                 logger.warning(f"No data returned from yfinance for {symbol} ({yf_symbol})")
                 return pd.DataFrame()
             
+            logger.debug(f"{symbol}: Received {len(data)} rows, columns: {data.columns.tolist()}")
             data = data.reset_index()
+            logger.debug(f"{symbol}: After reset_index, columns: {data.columns.tolist()}")
             data.columns = [c.lower() for c in data.columns]
+            logger.debug(f"{symbol}: After lowercase, columns: {data.columns.tolist()}")
             if 'datetime' in data.columns:
                 data = data.rename(columns={'datetime': 'timestamp'})
             elif 'date' in data.columns:
                 data = data.rename(columns={'date': 'timestamp'})
             
+            logger.debug(f"{symbol}: Final columns: {data.columns.tolist()}, returning {len(data)} rows")
             data['symbol'] = symbol
+            self._fetch_failures[symbol] = 0
+            self._last_success[symbol] = datetime.utcnow()
+            if self._data_alert_sent.get(symbol):
+                self._data_alert_sent[symbol] = False
+                await telegram.send_message(f"✅ {symbol}: Отримання даних відновлено")
             return data.tail(limit)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching data for {symbol}")
+            await self._handle_fetch_failure(symbol, "Timeout")
+            return pd.DataFrame()
         except Exception as e:
             logger.error(f"Error fetching data for {symbol}: {e}")
-            import pandas as pd
+            await self._handle_fetch_failure(symbol, str(e))
             return pd.DataFrame()
     
+    async def _handle_fetch_failure(self, symbol: str, error: str):
+        self._fetch_failures[symbol] = self._fetch_failures.get(symbol, 0) + 1
+        count = self._fetch_failures[symbol]
+        if count >= self._max_consecutive_failures and not self._data_alert_sent.get(symbol):
+            self._data_alert_sent[symbol] = True
+            last = self._last_success.get(symbol)
+            last_str = last.strftime("%H:%M:%S") if last else "невідомо"
+            await telegram.send_message(
+                f"🚨 <b>ЗБІЙ ДАНИХ: {symbol}</b>\n"
+                f"Помилка: {error[:100]}\n"
+                f"Невдалих спроб поспіль: {count}\n"
+                f"Остання успішна: {last_str}\n"
+                f"Торгівля по {symbol} призупинена"
+            )
+
+    async def _data_health_monitor(self):
+        while self._running:
+            await asyncio.sleep(300)
+            all_failing = all(
+                self._fetch_failures.get(s, 0) >= self._max_consecutive_failures
+                for s in self.symbols
+            )
+            if all_failing:
+                await telegram.send_message(
+                    "🔴 <b>КРИТИЧНО: Всі джерела даних недоступні!</b>\n"
+                    "Жоден символ не отримує ринкових даних.\n"
+                    "Перевірте з'єднання з інтернетом та DNS."
+                )
+
     async def _trading_loop(self, symbol: str):
         logger.info(f"Starting grid trading loop for {symbol}")
         strategy = self.strategies[symbol]
@@ -262,11 +358,14 @@ class GridPaperSimulator:
                 data = await self._fetch_market_data(symbol)
                 
                 if data.empty:
+                    logger.warning(f"{symbol}: Received empty data, skipping iteration")
                     await asyncio.sleep(30)
                     continue
                 
+                logger.debug(f"{symbol}: Processing data, shape={data.shape}")
                 data = TechnicalIndicators.add_all_indicators(data)
                 current_price = data['close'].iloc[-1]
+                logger.info(f"{symbol}: Current price ${current_price:.2f}")
                 self.current_prices[symbol] = current_price
                 atr = data['atr'].iloc[-1] if 'atr' in data.columns else current_price * 0.02
                 
@@ -279,16 +378,25 @@ class GridPaperSimulator:
                 
                 if action == "stop_loss":
                     await self.close_all_positions("Portfolio stop loss triggered (-5%)")
+                    self._running = False
+                    self._trading_paused = True
+                    self._pause_until = datetime.utcnow() + timedelta(hours=settings.grid.pause_after_stop_loss_hours)
                     break
                 elif action == "take_profit":
-                    await self.close_all_positions("Portfolio take profit reached (+10%)")
+                    await self.close_all_positions("Portfolio take profit reached (+15%)")
+                    self._running = False
                     break
                 elif action == "partial_profit":
                     await self.close_partial_positions(settings.grid.partial_close_ratio)
                 elif action == "rebalance_warning":
                     logger.warning(f"{symbol}: Unrealized loss > -3%, monitoring closely")
                 
+                logger.debug(f"{symbol}: Checking grid fills at price ${current_price:.2f}, grid initialized={strategy.initialized}")
                 fills = strategy.check_grid_fills(current_price)
+                logger.debug(f"{symbol}: check_grid_fills returned {len(fills) if fills else 0} fills")
+                
+                if fills:
+                    logger.info(f"{symbol}: Found {len(fills)} fills to process")
                 
                 for fill in fills:
                     should_skip = await self._check_market_falling_protection(fill)
@@ -357,6 +465,7 @@ class GridPaperSimulator:
                 continue
             current_price = self.current_prices.get(symbol)
             if current_price is None:
+                logger.warning(f"No current price for {symbol}, using entry price (unrealized PnL = 0)")
                 continue
             for pos in positions:
                 total += (current_price - pos.entry_price) * pos.amount
@@ -536,6 +645,23 @@ class GridPaperSimulator:
         await telegram.send_message(msg)
     
     async def _process_fill(self, symbol: str, fill: Dict, current_price: float):
+        if fill['side'] == 'buy':
+            total_positions = sum(len(positions) for positions in self.positions.values())
+            if total_positions >= settings.grid.max_open_positions:
+                logger.warning(f"⚠️ Max open positions reached ({total_positions}), skipping BUY")
+                return
+            
+            min_cash_required = self.initial_balance * (settings.grid.min_cash_reserve_percent / 100)
+            if self.balance - fill['value'] < min_cash_required:
+                logger.warning(f"⚠️ Insufficient cash reserve (${self.balance:.2f} < ${min_cash_required:.2f}), skipping BUY")
+                return
+            
+            total_value = self.balance + self._calculate_total_cost_basis() + self._calculate_total_unrealized()
+            max_position_value = total_value * (settings.grid.max_position_cost_percent / 100)
+            if fill['value'] > max_position_value:
+                logger.warning(f"⚠️ Position too large (${fill['value']:.2f} > ${max_position_value:.2f}), skipping BUY")
+                return
+        
         self.total_trades += 1
         
         if fill['side'] == 'buy':
@@ -550,17 +676,20 @@ class GridPaperSimulator:
             emoji = "🟢"
             action = "BUY"
         else:
+            if not self.positions[symbol]:
+                logger.warning(f"{symbol}: SELL signal but no open position! Skipping.")
+                return
+            
+            pos = self.positions[symbol].pop(0)
+            profit = (fill['price'] - pos.entry_price) * pos.amount
             self.balance += fill['value']
-            profit = 0.0
-            if self.positions[symbol]:
-                pos = self.positions[symbol].pop(0)
-                profit = (fill['price'] - pos.entry_price) * pos.amount
-                self.realized_pnl += profit
-                if profit > 0:
-                    self.winning_trades += 1
+            self.realized_pnl += profit
+            if profit > 0:
+                self.winning_trades += 1
             emoji = "🔴"
             action = "SELL"
         
+        self.current_prices[symbol] = current_price
         total_unrealized = self._calculate_total_unrealized()
         total_cost_basis = self._calculate_total_cost_basis()
         total_value = self.balance + total_cost_basis + total_unrealized
@@ -670,11 +799,13 @@ class GridPaperSimulator:
             f"━━━━━━━━━━━━━━━━\n"
             f"⏱ Runtime: {hours:.1f}h\n"
             f"💰 Initial: ${self.initial_balance:.2f}\n"
-            f"💵 Current: ${total_value:.2f}\n"
+            f"💵 Balance: ${self.balance:.2f}\n"
+            f"📊 Invested: ${total_cost_basis:.2f}\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"📈 Realized PnL: ${self.realized_pnl:.2f}\n"
             f"📊 Unrealized: ${total_unrealized:.2f}\n"
             f"💹 Total PnL: ${total_pnl:.2f}\n"
+            f"💵 Total Value: ${total_value:.2f}\n"
             f"📉 ROI: {roi:+.2f}%\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"🔄 Trades: {self.total_trades}\n"
@@ -732,10 +863,14 @@ class GridPaperSimulator:
             f"━━━━━━━━━━━━━━━━\n"
             f"⏱ Runtime: {hours:.1f}h\n"
             f"💰 Initial: ${self.initial_balance:.2f}\n"
+            f"� Balance: ${self.balance:.2f}\n"
+            f"📊 Invested: ${total_cost_basis:.2f}\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"📈 Realized PnL: ${self.realized_pnl:.2f}\n"
-            f"📊 Unrealized PnL: ${total_unrealized:.2f}\n"
-            f"💵 Total Value: ${total_value:.2f}\n"
+            f"📊 Unrealized: ${total_unrealized:.2f}\n"
+            f"💹 Total Value: ${total_value:.2f}\n"
             f"📉 ROI: {roi:+.2f}%\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"🔄 Trades: {self.total_trades}\n"
             f"🎯 Win Rate: {win_rate:.1f}%\n"
             f"━━━━━━━━━━━━━━━━\n"

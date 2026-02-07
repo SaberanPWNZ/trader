@@ -28,11 +28,24 @@ async def run_backtest(args):
 async def run_grid_trading(args):
     from paper.grid_simulator import GridPaperSimulator
     from monitoring.alerts import telegram
+    from config.settings import settings
+    import json
+    import os
     
     logger.info("🔲 Starting Grid Trading mode")
     
-    grid_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"]
-    initial_balance = args.initial_balance if hasattr(args, 'initial_balance') and args.initial_balance else 2000.0
+    grid_symbols = settings.trading.symbols
+    
+    initial_balance = 5000.0
+    state_file = "data/grid_state.json"
+    if os.path.exists(state_file):
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+            if isinstance(state, dict) and "initial_balance" in state:
+                initial_balance = float(state["initial_balance"])
+    
+    if hasattr(args, 'initial_balance') and args.initial_balance:
+        initial_balance = args.initial_balance
     
     logger.info(f"Initializing grid trading with balance: ${initial_balance:.2f}")
     

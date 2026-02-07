@@ -24,19 +24,19 @@ class ExchangeConfig:
 @dataclass
 class TradingConfig:
     """Trading parameters configuration."""
-    symbols: List[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"])
+    symbols: List[str] = field(default_factory=lambda: ["ETH/USDT"])
     timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
     default_timeframe: str = "1h"
-    mode: str = "paper"  # paper, live, backtest
+    mode: str = "paper"
 
 
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
-    max_risk_per_trade: float = 0.02  # 2%
-    max_daily_loss: float = 0.10  # 10%
-    max_drawdown: float = 0.20  # 20% - portfolio kill switch
-    max_position_size: float = 0.05  # 5% of portfolio per trade
+    max_risk_per_trade: float = 0.05
+    max_daily_loss: float = 0.15
+    max_drawdown: float = 0.25
+    max_position_size: float = 0.15
     stop_loss_atr_multiplier: float = 1.5
     take_profit_atr_multiplier: float = 3.0
     max_consecutive_losses: int = 5
@@ -194,13 +194,17 @@ class GridConfig:
     breakout_buffer_multiplier: float = 2.0
     force_rebalance_after_hours: float = 24.0
     
-    portfolio_stop_loss_percent: float = 10.0
-    portfolio_take_profit_percent: float = 15.0
-    max_unrealized_loss_percent: float = 5.0
-    partial_close_profit_percent: float = 2.0
+    portfolio_stop_loss_percent: float = 5.0
+    portfolio_take_profit_percent: float = 50.0
+    max_unrealized_loss_percent: float = 3.0
+    partial_close_profit_percent: float = 10.0
     partial_close_ratio: float = 0.5
-    enable_portfolio_protection: bool = False
+    enable_portfolio_protection: bool = True
     pause_after_stop_loss_hours: int = 24
+    
+    max_open_positions: int = 10
+    min_cash_reserve_percent: float = 20.0
+    max_position_cost_percent: float = 10.0
     
     def get_interval_hours(self, symbol: str) -> float:
         if isinstance(self.rebalance_interval_hours, dict):
