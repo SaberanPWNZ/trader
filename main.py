@@ -23,6 +23,25 @@ async def run_backtest(args):
     sys.exit(1)
 
 
+async def run_grid_live(args):
+    from execution.grid_live import GridLiveTrader
+    from config.settings import settings
+    
+    logger.info("🔲 Starting Grid LIVE Trading mode (Testnet)")
+    
+    grid_symbols = settings.trading.symbols
+    
+    trader = GridLiveTrader(
+        symbols=grid_symbols,
+        testnet=True
+    )
+    
+    try:
+        await trader.start()
+    except KeyboardInterrupt:
+        logger.info("Stopping grid live trading...")
+    finally:
+        await trader.stop()
 
 
 async def run_grid_trading(args):
@@ -101,6 +120,171 @@ def show_grid_status():
     
     print("💡 Full analysis: python analyze_grid.py")
     print("📊 Live monitor: ./monitor_grid.sh\n")
+
+
+async def show_testnet_status():
+    import json
+    import os
+    from exchange.factory import create_exchange
+    from datetime import datetime
+    
+    ex = create_exchange(testnet=True)
+    await ex.connect()
+    
+    balance = await ex.fetch_balance()
+    ticker = await ex.fetch_ticker('ETH/USDT')
+    eth_price = ticker['last']
+    
+    usdt_total = balance.get('USDT', {}).get('total', 0)
+    usdt_free = balance.get('USDT', {}).get('free', 0)
+    usdt_used = balance.get('USDT', {}).get('used', 0)
+    eth_total = balance.get('ETH', {}).get('total', 0)
+    eth_free = balance.get('ETH', {}).get('free', 0)
+    eth_value = eth_total * eth_price
+    total_value = usdt_total + eth_value
+    
+    state_file = "data/grid_live_balance.json"
+    state = {"initial_balance": 10000.0, "start_time": datetime.now().isoformat()}
+    if os.path.exists(state_file):
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+    
+    initial = state.get("initial_balance", 10000.0)
+    start_time = datetime.fromisoformat(state.get("start_time", datetime.now().isoformat()))
+    runtime = datetime.now() - start_time
+    runtime_hours = runtime.total_seconds() / 3600
+    
+    pnl = total_value - initial
+    pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
+    
+    orders = await ex.fetch_open_orders('ETH/USDT')
+    trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+    
+    buy_count = sum(1 for t in trades if t['side'] == 'buy')
+    sell_count = sum(1 for t in trades if t['side'] == 'sell')
+    
+    print()
+    print("╔═══════════════════════════════════════════════════════╗")
+    print("║       📊 BINANCE TESTNET - GRID LIVE STATUS           ║")
+    print("╠═══════════════════════════════════════════════════════╣")
+    print(f"║  💵 USDT Balance:     ${usdt_total:>10,.2f}                  ║")
+    print(f"║     ├─ Free:         ${usdt_free:>10,.2f}                  ║")
+    print(f"║     └─ In Orders:    ${usdt_used:>10,.2f}                  ║")
+    print(f"║  🪙 ETH Balance:      {eth_total:>10.6f} (${eth_value:,.2f})     ║")
+    print(f"║  📈 ETH Price:        ${eth_price:>10,.2f}                  ║")
+    print("╠═══════════════════════════════════════════════════════╣")
+    print(f"║  📦 Initial Balance:  ${initial:>10,.2f}                  ║")
+    print(f"║  💰 Current Value:    ${total_value:>10,.2f}                  ║")
+    pnl_icon = '📈' if pnl >= 0 else '📉'
+    print(f"║  {pnl_icon} PnL:               ${pnl:>+10,.2f} ({pnl_pct:+.2f}%)        ║")
+    print("╠═══════════════════════════════════════════════════════╣")
+    print(f"║  ⏱  Runtime:          {runtime_hours:>10.1f} hours               ║")
+    print(f"║  📋 Open Orders:      {len(orders):>10}                       ║")
+    print(f"║  🔄 Total Trades:     {len(trades):>10} (B:{buy_count} S:{sell_count})        ║")
+    print("╠═══════════════════════════════════════════════════════╣")
+    print("║  📋 OPEN ORDERS:                                      ║")
+    for o in orders:
+        side = o['side'].upper()
+        icon = "🟢" if side == "BUY" else "🔴"
+        print(f"║     {icon} {side:4} @ ${o['price']:>8.2f} - {o['amount']:.4f} ETH           ║")
+    print("╚═══════════════════════════════════════════════════════╝")
+    print()
+    
+    await ex.disconnect()
+
+
+async def show_testnet_trades():
+    from exchange.factory import create_exchange
+    from datetime import datetime
+    
+    ex = create_exchange(testnet=True)
+    await ex.connect()
+    
+    trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+    
+    print()
+    print("╔═══════════════════════════════════════════════════════════════╗")
+    print("║          📜 BINANCE TESTNET - RECENT TRADES                   ║")
+    print("╠═══════════════════════════════════════════════════════════════╣")
+    
+    if not trades:
+        print("║  No trades yet                                                ║")
+    else:
+        total_volume = 0
+        for t in trades[-20:]:
+            side = t['side'].upper()
+            icon = "🟢" if side == "BUY" else "🔴"
+            ts = datetime.fromtimestamp(t['timestamp']/1000).strftime('%m-%d %H:%M')
+            cost = t['cost']
+            total_volume += cost
+            print(f"║  {ts} {icon} {side:4} {t['amount']:.4f} ETH @ ${t['price']:.2f} = ${cost:.2f}  ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print(f"║  Total Volume: ${total_volume:,.2f}                                     ║")
+    
+    print("╚═══════════════════════════════════════════════════════════════╝")
+    print()
+    
+    await ex.disconnect()
+
+
+async def show_testnet_daily():
+    import json
+    import os
+    from exchange.factory import create_exchange
+    from datetime import datetime, timedelta
+    from monitoring.alerts import telegram
+    
+    ex = create_exchange(testnet=True)
+    await ex.connect()
+    
+    balance = await ex.fetch_balance()
+    ticker = await ex.fetch_ticker('ETH/USDT')
+    eth_price = ticker['last']
+    
+    usdt_total = balance.get('USDT', {}).get('total', 0)
+    eth_total = balance.get('ETH', {}).get('total', 0)
+    eth_value = eth_total * eth_price
+    total_value = usdt_total + eth_value
+    
+    state_file = "data/grid_live_balance.json"
+    state = {"initial_balance": total_value}
+    if os.path.exists(state_file):
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+    
+    initial = state.get("initial_balance", total_value)
+    start_time = datetime.fromisoformat(state.get("start_time", datetime.now().isoformat()))
+    runtime = datetime.now() - start_time
+    
+    pnl = total_value - initial
+    pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
+    
+    trades = await ex.fetch_my_trades('ETH/USDT', limit=100)
+    orders = await ex.fetch_open_orders('ETH/USDT')
+    
+    today = datetime.now().date()
+    today_trades = [t for t in trades if datetime.fromtimestamp(t['timestamp']/1000).date() == today]
+    
+    report = (
+        f"📊 DAILY REPORT - BINANCE TESTNET\n"
+        f"{'='*35}\n"
+        f"💰 Balance: ${total_value:,.2f}\n"
+        f"{'📈' if pnl >= 0 else '📉'} PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)\n"
+        f"⏱ Runtime: {runtime.days}d {runtime.seconds//3600}h\n"
+        f"{'='*35}\n"
+        f"🔄 Trades Today: {len(today_trades)}\n"
+        f"📋 Open Orders: {len(orders)}\n"
+        f"🪙 ETH: {eth_total:.4f} (${eth_value:,.2f})\n"
+        f"💵 USDT: ${usdt_total:,.2f}\n"
+        f"📈 ETH Price: ${eth_price:,.2f}"
+    )
+    
+    print(report)
+    
+    await telegram.send_message(report)
+    print("\n✅ Report sent to Telegram")
+    
+    await ex.disconnect()
 
 
 async def run_paper_trading(args):
@@ -562,6 +746,9 @@ Examples:
     grid_parser = subparsers.add_parser("grid", help="Run grid trading bot")
     grid_parser.add_argument("--initial-balance", type=float, default=2000.0, help="Initial balance for grid trading")
     
+    # Grid LIVE trading parser (Binance Testnet)
+    grid_live_parser = subparsers.add_parser("grid-live", help="Run grid trading on Binance Testnet")
+    
     # Live trading parser
     live_parser = subparsers.add_parser("live", help="Run live trading (PyBroker integration)")
     live_parser.add_argument("--strategy", choices=["rule_based", "ai"], default="rule_based")
@@ -618,6 +805,10 @@ Examples:
     
     status_parser = subparsers.add_parser("status", help="Show grid trading status")
     
+    testnet_status_parser = subparsers.add_parser("testnet-status", help="Show Binance Testnet balance and orders")
+    testnet_trades_parser = subparsers.add_parser("testnet-trades", help="Show recent trades on Testnet")
+    testnet_daily_parser = subparsers.add_parser("testnet-daily", help="Show daily report for Testnet")
+    
     args = parser.parse_args()
     
     if not args.mode:
@@ -636,12 +827,20 @@ Examples:
         asyncio.run(run_paper_trading(args))
     elif args.mode == "grid":
         asyncio.run(run_grid_trading(args))
+    elif args.mode == "grid-live":
+        asyncio.run(run_grid_live(args))
     elif args.mode == "live":
         asyncio.run(run_live_trading(args))
     elif args.mode == "train":
         asyncio.run(train_model(args))
     elif args.mode == "status":
         show_grid_status()
+    elif args.mode == "testnet-status":
+        asyncio.run(show_testnet_status())
+    elif args.mode == "testnet-trades":
+        asyncio.run(show_testnet_trades())
+    elif args.mode == "testnet-daily":
+        asyncio.run(show_testnet_daily())
     # Dev mode commands
     elif args.mode == "dev-gen":
         asyncio.run(dev_generate_data(args))
