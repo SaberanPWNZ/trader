@@ -80,7 +80,7 @@ class GridStrategy(BaseStrategy):
             symbol=self.symbol,
             upper_price=upper_price,
             lower_price=lower_price,
-            num_grids=10,
+            num_grids=5,
             total_investment=total_investment
         )
         

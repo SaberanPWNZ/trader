@@ -85,25 +85,25 @@ class DevConfig:
 
 @dataclass
 class SelfLearningConfig:
-    enabled: bool = False
-    training_interval_hours: int = field(default_factory=lambda: int(os.getenv("TRAINING_INTERVAL_HOURS", "4")))
-    min_accuracy_improvement: float = 0.02
-    min_samples_for_training: int = 1000
-    max_models_to_keep: int = 5
+    enabled: bool = True
+    training_interval_hours: int = field(default_factory=lambda: int(os.getenv("TRAINING_INTERVAL_HOURS", "6")))
+    min_accuracy_improvement: float = 0.03
+    min_samples_for_training: int = 2000
+    max_models_to_keep: int = 3
     db_path: str = field(default_factory=lambda: os.getenv("LEARNING_DB_PATH", "data/learning.db"))
-    performance_lookback_days: int = 180
-    holdout_days: int = 7
+    performance_lookback_days: int = 365
+    holdout_days: int = 14
     auto_deploy_enabled: bool = False
     backtest_before_deploy: bool = True
-    min_sharpe_ratio: float = 0.5
-    max_drawdown_percent: float = 20.0
-    min_win_rate: float = 0.45
-    min_profit_factor: float = 1.0
-    max_overfit_gap: float = 0.20
+    min_sharpe_ratio: float = 0.3
+    max_drawdown_percent: float = 25.0
+    min_win_rate: float = 0.52
+    min_profit_factor: float = 1.1
+    max_overfit_gap: float = 0.12
     cv_splits: int = 5
     hyperparameter_tuning: bool = True
-    label_threshold: float = 0.015
-    confidence_threshold: float = 0.60
+    label_threshold: float = 0.01
+    confidence_threshold: float = 0.55
 
 
 @dataclass
