@@ -27,13 +27,15 @@ async def run_grid_live(args):
     from execution.grid_live import GridLiveTrader
     from config.settings import settings
     
-    logger.info("🔲 Starting Grid LIVE Trading mode (Testnet)")
+    max_balance = getattr(args, 'balance', None)
+    logger.info(f"🔲 Starting Grid LIVE Trading mode (Testnet) - Max balance: ${max_balance or 'all'}")
     
     grid_symbols = settings.trading.symbols
     
     trader = GridLiveTrader(
         symbols=grid_symbols,
-        testnet=True
+        testnet=True,
+        max_balance=max_balance
     )
     
     try:
@@ -748,6 +750,7 @@ Examples:
     
     # Grid LIVE trading parser (Binance Testnet)
     grid_live_parser = subparsers.add_parser("grid-live", help="Run grid trading on Binance Testnet")
+    grid_live_parser.add_argument("--balance", type=float, help="Max balance to use (default: all available)")
     
     # Live trading parser
     live_parser = subparsers.add_parser("live", help="Run live trading (PyBroker integration)")
