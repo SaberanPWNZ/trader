@@ -25,9 +25,10 @@ class LiveGridPosition:
 
 
 class GridLiveTrader:
-    def __init__(self, symbols: List[str], testnet: bool = True):
+    def __init__(self, symbols: List[str], testnet: bool = True, max_balance: Optional[float] = None):
         self.symbols = symbols
         self.testnet = testnet
+        self.max_balance = max_balance
         self.exchange = None
         self._trades_file = "data/grid_live_trades.csv"
         self._state_file = "data/grid_live_state.json"
@@ -66,7 +67,12 @@ class GridLiveTrader:
             logger.error(f"Exchange connection failed: {validation['error']}")
             return
         
-        self.balance = validation['balance']
+        actual_balance = validation['balance']
+        if self.max_balance and self.max_balance < actual_balance:
+            self.balance = self.max_balance
+            logger.info(f"⚠️ Using limited balance: ${self.balance:.2f} (available: ${actual_balance:.2f})")
+        else:
+            self.balance = actual_balance
         self.initial_balance = self.balance
         
         logger.info(f"✅ Connected to Binance {'Testnet' if self.testnet else 'Mainnet'}")
@@ -183,12 +189,53 @@ class GridLiveTrader:
         
         strategy = self.strategies[symbol]
         
+        active_levels = strategy.get_active_levels()
+        if len(active_levels) == 0:
+            logger.info(f"{symbol}: All grid levels filled, reinitializing grid...")
+            await self._reinitialize_grid(symbol, current_price)
+            return
+        
         fills = strategy.check_grid_fills(current_price)
         
         for fill in fills:
             await self._process_fill(symbol, fill)
         
         await self._check_and_replace_orders(symbol)
+    
+    async def _reinitialize_grid(self, symbol: str, current_price: float):
+        grid_range_pct = 0.03
+        upper_price = current_price * (1 + grid_range_pct)
+        lower_price = current_price * (1 - grid_range_pct)
+        
+        balance = await self.exchange.get_available_balance('USDT')
+        investment = min(balance * 0.8, 2000.0)
+        
+        from strategies.grid import GridConfig
+        config = GridConfig(
+            symbol=symbol,
+            upper_price=upper_price,
+            lower_price=lower_price,
+            num_grids=5,
+            total_investment=investment
+        )
+        
+        self.strategies[symbol].config = config
+        self.strategies[symbol].center_price = current_price
+        self.strategies[symbol].grid_levels = []
+        self.strategies[symbol]._create_grid_levels(current_price)
+        self.strategies[symbol].last_price = current_price
+        
+        logger.info(f"Grid reinitialized for {symbol}:")
+        logger.info(f"  Price: ${current_price:.2f}")
+        logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}")
+        
+        await telegram.send_message(
+            f"🔄 Grid rebalanced: {symbol}\n"
+            f"Price: ${current_price:.2f}\n"
+            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}"
+        )
+        
+        await self._place_grid_orders(symbol)
     
     async def _process_fill(self, symbol: str, fill: dict):
         side = fill['side'].upper()

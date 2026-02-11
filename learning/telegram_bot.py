@@ -299,165 +299,130 @@ class LearningTelegramBot:
                     positions[symbol].pop(0)
         return {s: sum(vals) for s, vals in positions.items() if vals}
 
+    async def _get_testnet_data(self):
+        from exchange.factory import create_exchange
+        
+        ex = create_exchange(testnet=True)
+        await ex.connect()
+        
+        balance = await ex.fetch_balance()
+        ticker = await ex.fetch_ticker('ETH/USDT')
+        eth_price = ticker['last']
+        
+        usdt_total = balance.get('USDT', {}).get('total', 0)
+        usdt_free = balance.get('USDT', {}).get('free', 0)
+        usdt_used = balance.get('USDT', {}).get('used', 0)
+        eth_total = balance.get('ETH', {}).get('total', 0)
+        eth_value = eth_total * eth_price
+        total_value = usdt_total + eth_value
+        
+        state_file = "data/grid_live_balance.json"
+        initial = 10000.0
+        start_time = None
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+                initial = state.get("initial_balance", 10000.0)
+                start_time = state.get("start_time")
+        
+        orders = await ex.fetch_open_orders('ETH/USDT')
+        trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+        
+        await ex.disconnect()
+        
+        return {
+            'usdt_total': usdt_total,
+            'usdt_free': usdt_free,
+            'usdt_used': usdt_used,
+            'eth_total': eth_total,
+            'eth_value': eth_value,
+            'eth_price': eth_price,
+            'total_value': total_value,
+            'initial_balance': initial,
+            'start_time': start_time,
+            'orders': orders,
+            'trades': trades
+        }
+
     async def _cmd_balance(self, args: list) -> None:
-        trades_file = "data/grid_trades.csv"
-        initial_balance = self._read_initial_balance()
-        
-        if not os.path.exists(trades_file):
-            await self._send_message("❌ No trading data found")
-            return
-        
         try:
-            with open(trades_file, 'r') as f:
-                reader = csv.DictReader(f)
-                trades = list(reader)
+            data = await self._get_testnet_data()
             
-            if not trades:
-                lines = [
-                    "💰 <b>Portfolio Balance</b>",
-                    "",
-                    f"💎 <b>Total Value:</b> ${initial_balance:,.2f}",
-                    f"   └ 💵 Cash: ${initial_balance:,.2f}",
-                    "",
-                    "✅ <b>Performance:</b>",
-                    f"   Initial: ${initial_balance:,.2f}",
-                    f"   Profit: $0.00",
-                    f"   ROI: 0.00%",
-                    "",
-                    "<b>📊 PnL Breakdown:</b>",
-                    "   ├ Realized: $0.00",
-                    "   └ Unrealized: $0.00",
-                    "",
-                    "<b>📈 Activity:</b> 0 trades (0↗ 0↘)",
-                    "",
-                    "<i>Waiting for first trade...</i>"
-                ]
-                await self._send_message("\n".join(lines))
-                return
+            pnl = data['total_value'] - data['initial_balance']
+            pnl_pct = (pnl / data['initial_balance']) * 100 if data['initial_balance'] > 0 else 0
             
-            last_trade = trades[-1]
-            balance = float(last_trade['balance'])
-            total_value = float(last_trade['total_value'])
-            realized_pnl = float(last_trade['realized_pnl'])
-            unrealized_pnl = float(last_trade['unrealized_pnl'])
-            roi_percent = float(last_trade['roi_percent'])
+            buy_count = sum(1 for t in data['trades'] if t['side'] == 'buy')
+            sell_count = sum(1 for t in data['trades'] if t['side'] == 'sell')
             
-            positions = self._count_open_positions(trades)
-            total_invested = sum(positions.values())
-            
-            roi_emoji = "✅" if roi_percent >= 0 else "⚠️" if roi_percent >= -2 else "🚨"
-            
-            total_trades = len(trades)
-            buy_trades = sum(1 for t in trades if t['side'] == 'BUY')
-            sell_trades = sum(1 for t in trades if t['side'] == 'SELL')
+            roi_emoji = "✅" if pnl >= 0 else "⚠️" if pnl >= -50 else "🚨"
             
             lines = [
-                "💰 <b>Portfolio Balance</b>",
+                "💰 <b>Portfolio Balance (Testnet)</b>",
                 "",
-                f"💎 <b>Total Value:</b> ${total_value:,.2f}",
-                f"   ├ 💵 Cash: ${balance:,.2f}",
-                f"   └ 📦 Positions: ${total_invested:,.2f}",
+                f"💎 <b>Total Value:</b> ${data['total_value']:,.2f}",
+                f"   ├ 💵 USDT: ${data['usdt_total']:,.2f}",
+                f"   └ 🪙 ETH: {data['eth_total']:.4f} (${data['eth_value']:,.2f})",
                 "",
                 f"{roi_emoji} <b>Performance:</b>",
-                f"   Initial: ${initial_balance:,.2f}",
-                f"   Profit: ${total_value - initial_balance:+,.2f}",
-                f"   ROI: {roi_percent:+.2f}%",
+                f"   Initial: ${data['initial_balance']:,.2f}",
+                f"   Profit: ${pnl:+,.2f}",
+                f"   ROI: {pnl_pct:+.2f}%",
                 "",
-                "<b>📊 PnL Breakdown:</b>",
-                f"   ├ Realized: ${realized_pnl:+,.2f}",
-                f"   └ Unrealized: ${unrealized_pnl:+,.2f}",
+                f"<b>📈 Activity:</b> {len(data['trades'])} trades ({buy_count}↗ {sell_count}↘)",
+                f"<b>📋 Open Orders:</b> {len(data['orders'])}",
+                "",
+                f"<i>ETH Price: ${data['eth_price']:,.2f}</i>"
             ]
-            
-            if positions:
-                lines.append("")
-                lines.append("<b>📦 Open Positions:</b>")
-                for symbol, cost in sorted(positions.items()):
-                    symbol_short = symbol.split('/')[0]
-                    count = sum(1 for t in trades if t['symbol'] == symbol and t['side'] == 'BUY') - sum(1 for t in trades if t['symbol'] == symbol and t['side'] == 'SELL')
-                    lines.append(f"   • <b>{symbol_short}</b>: ${cost:,.2f} ({count} pos)")
-            
-            lines.append("")
-            lines.append(f"<b>📈 Activity:</b> {total_trades} trades ({buy_trades}↗ {sell_trades}↘)")
-            lines.append("")
-            lines.append(f"<i>{last_trade['timestamp'][:19]} UTC</i>")
             
             await self._send_message("\n".join(lines))
             
         except Exception as e:
             logger.error(f"Balance command error: {e}")
-            await self._send_message(f"❌ Error reading balance: {e}")
+            await self._send_message(f"❌ Error: {e}")
 
     async def _cmd_grid(self, args: list) -> None:
-        import yfinance as yf
-        
-        trades_file = "data/grid_trades.csv"
-        
-        symbols_map = {
-            'BTC/USDT': 'BTC-USD',
-            'ETH/USDT': 'ETH-USD',
-            'SOL/USDT': 'SOL-USD',
-            'DOGE/USDT': 'DOGE-USD'
-        }
-        
-        positions = {}
-        if os.path.exists(trades_file):
-            with open(trades_file, 'r') as f:
-                reader = csv.DictReader(f)
-                trades = list(reader)
-            positions = self._count_open_positions(trades)
-        
-        lines = ["📊 <b>Grid Trading Status</b>\n"]
-        
-        for symbol, yf_symbol in symbols_map.items():
-            try:
-                ticker = yf.Ticker(yf_symbol)
-                data = ticker.history(period='1d', interval='1m')
-                if not data.empty:
-                    price = data['Close'].iloc[-1]
-                    sym = symbol.split('/')[0]
-                    pos_cost = positions.get(symbol, 0)
-                    pos_count = 0
-                    if os.path.exists(trades_file):
-                        pos_count = sum(1 for t in trades if t['symbol'] == symbol and t['side'] == 'BUY') - sum(1 for t in trades if t['symbol'] == symbol and t['side'] == 'SELL')
-                    
-                    lines.append(f"<b>{sym}</b>")
-                    lines.append(f"├ Price: ${price:,.2f}")
-                    if pos_count > 0:
-                        lines.append(f"├ Positions: {pos_count} (${pos_cost:,.2f})")
-                    else:
-                        lines.append(f"├ Positions: none")
-                    lines.append(f"└ Status: {'🟢 Active' if pos_count > 0 else '⚪ Waiting'}\n")
-            except Exception as e:
-                lines.append(f"<b>{symbol}</b>: ❌ Error: {e}\n")
-        
-        await self._send_message("\n".join(lines))
+        try:
+            data = await self._get_testnet_data()
+            
+            lines = ["📊 <b>Grid Trading Status (Testnet)</b>\n"]
+            
+            lines.append(f"<b>ETH/USDT</b>")
+            lines.append(f"├ Price: ${data['eth_price']:,.2f}")
+            lines.append(f"├ Position: {data['eth_total']:.4f} ETH (${data['eth_value']:,.2f})")
+            lines.append(f"└ Orders: {len(data['orders'])}\n")
+            
+            if data['orders']:
+                lines.append("<b>📋 Open Orders:</b>")
+                for o in data['orders']:
+                    side = o['side'].upper()
+                    icon = "🟢" if side == "BUY" else "🔴"
+                    lines.append(f"   {icon} {side} @ ${o['price']:,.2f}")
+            
+            await self._send_message("\n".join(lines))
+            
+        except Exception as e:
+            logger.error(f"Grid command error: {e}")
+            await self._send_message(f"❌ Error: {e}")
 
     async def _cmd_trades(self, args: list) -> None:
-        limit = int(args[0]) if args and args[0].isdigit() else 10
-        trades_file = "data/grid_trades.csv"
-        
-        if not os.path.exists(trades_file):
-            await self._send_message("❌ No trading data found")
-            return
-        
         try:
-            with open(trades_file, 'r') as f:
-                reader = csv.DictReader(f)
-                trades = list(reader)[-limit:]
+            data = await self._get_testnet_data()
+            limit = int(args[0]) if args and args[0].isdigit() else 10
+            
+            trades = data['trades'][-limit:]
             
             if not trades:
                 await self._send_message("❌ No trades yet")
                 return
             
-            lines = [f"📈 <b>Last {len(trades)} Trades</b>\n"]
+            lines = [f"📈 <b>Last {len(trades)} Trades (Testnet)</b>\n"]
             
+            from datetime import datetime
             for trade in trades:
-                side_emoji = "🟢" if trade['side'] == 'BUY' else "🔴"
-                timestamp = trade['timestamp'][11:16]
-                symbol = trade['symbol'].split('/')[0]
+                side_emoji = "🟢" if trade['side'] == 'buy' else "🔴"
+                ts = datetime.fromtimestamp(trade['timestamp']/1000).strftime('%H:%M')
                 price = float(trade['price'])
-                value = float(trade['value'])
-                roi = float(trade['roi_percent'])
+                cost = float(trade['cost'])
                 
                 if price >= 1000:
                     price_str = f"${price:,.0f}"
@@ -467,9 +432,7 @@ class LearningTelegramBot:
                     price_str = f"${price:.4f}"
                 
                 lines.append(
-                    f"{side_emoji} <code>{timestamp}</code> <b>{symbol}</b> "
-                    f"{price_str} ${value:,.0f} "
-                    f"ROI: {roi:+.1f}%"
+                    f"{side_emoji} <code>{ts}</code> ETH {price_str} ${cost:,.0f}"
                 )
             
             await self._send_message("\n".join(lines))
@@ -478,114 +441,26 @@ class LearningTelegramBot:
             await self._send_message(f"❌ Error reading trades: {e}")
     
     async def _cmd_profit(self, args: list) -> None:
-        trades_file = "data/grid_trades.csv"
-        
-        if not os.path.exists(trades_file):
-            await self._send_message("❌ No trading data found")
-            return
-        
         try:
-            hours = int(args[0]) if args else 5
+            data = await self._get_testnet_data()
             
-            with open(trades_file, 'r') as f:
-                reader = csv.DictReader(f)
-                trades = list(reader)
-            
-            if not trades:
-                await self._send_message("❌ No trades yet")
-                return
-            
-            from datetime import datetime, timedelta
-            
-            now = datetime.utcnow()
-            cutoff = now - timedelta(hours=hours)
-            
-            positions = {}
-            profit_before = 0.0
-            profit_after = 0.0
-            trades_in_period = []
-            
-            for trade in trades:
-                timestamp = datetime.fromisoformat(trade['timestamp'].replace('Z', '+00:00').replace('+00:00', ''))
-                symbol = trade['symbol']
-                side = trade['side']
-                price = float(trade['price'])
-                amount = float(trade['amount'])
-                
-                if side == 'BUY':
-                    if symbol not in positions:
-                        positions[symbol] = []
-                    positions[symbol].append({'price': price, 'amount': amount})
-                else:
-                    profit = 0.0
-                    if symbol in positions and positions[symbol]:
-                        pos = positions[symbol].pop(0)
-                        profit = (price - pos['price']) * pos['amount']
-                        
-                        if timestamp < cutoff:
-                            profit_before += profit
-                        else:
-                            profit_after += profit
-                            if profit != 0:
-                                trades_in_period.append({
-                                    'timestamp': trade['timestamp'],
-                                    'symbol': symbol,
-                                    'profit': profit,
-                                    'price': price,
-                                    'buy_price': pos['price']
-                                })
-            
-            total_profit = profit_before + profit_after
+            total_pnl = data['total_pnl']
+            pnl_pct = data['pnl_percent']
+            usdt = data['usdt_balance']
+            eth = data['eth_total']
+            eth_val = data['eth_value']
+            total = usdt + eth_val
             
             lines = [
-                f"💰 <b>Profit Report ({hours}h)</b>",
+                "💰 <b>Profit Report (Testnet)</b>",
                 "",
-                f"<b>Period:</b> Last {hours} hours",
-                f"<b>Profit in period:</b> ${profit_after:+.2f}",
-                f"<b>Total profit:</b> ${total_profit:+.2f}",
-                ""
+                f"<b>Balance:</b> ${usdt:,.2f} USDT",
+                f"<b>Position:</b> {eth:.4f} ETH (${eth_val:,.2f})",
+                f"<b>Total Value:</b> ${total:,.2f}",
+                "",
+                f"<b>Realized PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)",
+                f"<b>Trades:</b> {len(data['trades'])}",
             ]
-            
-            if trades_in_period:
-                lines.append(f"<b>Trades in period:</b> {len(trades_in_period)}")
-                lines.append("")
-                
-                by_symbol = {}
-                for t in trades_in_period:
-                    sym = t['symbol'].split('/')[0]
-                    if sym not in by_symbol:
-                        by_symbol[sym] = 0
-                    by_symbol[sym] += t['profit']
-                
-                for sym, profit in sorted(by_symbol.items(), key=lambda x: x[1], reverse=True):
-                    emoji = "✅" if profit > 0 else "❌"
-                    lines.append(f"{emoji} <b>{sym}:</b> ${profit:+.2f}")
-                
-                lines.append("")
-                lines.append("<b>Last 5 trades:</b>")
-                for t in trades_in_period[-5:]:
-                    time = t['timestamp'][11:16]
-                    sym = t['symbol'].split('/')[0]
-                    emoji = "✅" if t['profit'] > 0 else "❌"
-                    pct = ((t['price'] - t['buy_price']) / t['buy_price']) * 100
-                    
-                    if t['price'] >= 1000:
-                        bp = f"${t['buy_price']:,.0f}"
-                        sp = f"${t['price']:,.0f}"
-                    elif t['price'] >= 1:
-                        bp = f"${t['buy_price']:,.2f}"
-                        sp = f"${t['price']:,.2f}"
-                    else:
-                        bp = f"${t['buy_price']:.4f}"
-                        sp = f"${t['price']:.4f}"
-                    
-                    lines.append(
-                        f"{emoji} <code>{time}</code> {sym} "
-                        f"{bp}→{sp} "
-                        f"${t['profit']:+.2f} ({pct:+.1f}%)"
-                    )
-            else:
-                lines.append(f"<i>No trades in last {hours} hours</i>")
             
             await self._send_message("\n".join(lines))
             
@@ -594,101 +469,45 @@ class LearningTelegramBot:
             await self._send_message(f"❌ Error: {e}")
 
     async def _cmd_daily(self, args: list) -> None:
-        from collections import defaultdict
-        
-        trades_file = "data/grid_trades.csv"
-        initial_balance = self._read_initial_balance()
-        
-        if not os.path.exists(trades_file):
-            await self._send_message("❌ Файл grid_trades.csv не знайдено!")
-            return
-        
         try:
-            with open(trades_file, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                trades = []
-                for row in reader:
-                    row['timestamp'] = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00').replace('+00:00', ''))
-                    row['date'] = row['timestamp'].date()
-                    row['realized_pnl'] = float(row['realized_pnl'])
-                    row['unrealized_pnl'] = float(row['unrealized_pnl'])
-                    row['balance'] = float(row['balance'])
-                    row['total_value'] = float(row['total_value'])
-                    row['roi_percent'] = float(row['roi_percent'])
-                    trades.append(row)
+            data = await self._get_testnet_data()
             
-            if not trades:
-                await self._send_message("📊 Поки що немає трейдів!")
-                return
+            total_pnl = data['total_pnl']
+            pnl_pct = data['pnl_percent']
+            usdt = data['usdt_balance']
+            eth = data['eth_total']
+            eth_val = data['eth_value']
+            total = usdt + eth_val
+            trades = data['trades']
+            
+            from collections import defaultdict
+            from datetime import datetime
             
             trades_by_date = defaultdict(list)
-            for trade in trades:
-                trades_by_date[trade['date']].append(trade)
+            for t in trades:
+                date = datetime.fromtimestamp(t['timestamp']/1000).date()
+                trades_by_date[date].append(t)
             
-            daily_stats = []
-            dates = sorted(trades_by_date.keys())
+            lines = ["📅 <b>Daily Report (Testnet)</b>", ""]
             
-            for date in dates:
+            for date in sorted(trades_by_date.keys()):
                 day_trades = trades_by_date[date]
-                last_trade = day_trades[-1]
+                buys = sum(1 for t in day_trades if t['side'] == 'buy')
+                sells = sum(1 for t in day_trades if t['side'] == 'sell')
+                date_str = date.strftime('%d.%m.%Y')
                 
-                if daily_stats:
-                    prev_total_value = daily_stats[-1]['total_value']
-                    daily_profit = last_trade['total_value'] - prev_total_value
-                else:
-                    daily_profit = last_trade['total_value'] - initial_balance
-                
-                buy_count = len([t for t in day_trades if t['side'] == 'BUY'])
-                sell_count = len([t for t in day_trades if t['side'] == 'SELL'])
-                
-                daily_stats.append({
-                    'date': date,
-                    'trades_count': len(day_trades),
-                    'daily_profit': daily_profit,
-                    'total_value': last_trade['total_value'],
-                    'roi_percent': last_trade['roi_percent'],
-                    'ending_balance': last_trade['balance'],
-                    'buy_trades': buy_count,
-                    'sell_trades': sell_count
-                })
-            
-            lines = ["📅 <b>Денний звіт по прибутку</b>", ""]
-            
-            total_profit = 0
-            for stat in daily_stats:
-                total_profit += stat['daily_profit']
-                emoji = "✅" if stat['daily_profit'] >= 0 else "❌"
-                date_str = stat['date'].strftime('%d.%m.%Y')
-                
-                lines.append(
-                    f"<b>{date_str}</b> {emoji} ${stat['daily_profit']:+,.2f}\n"
-                    f"   Трейдів: {stat['trades_count']} (🟢{stat['buy_trades']}↗ 🔴{stat['sell_trades']}↘)\n"
-                    f"   ROI: {stat['roi_percent']:+.2f}% | Value: ${stat['total_value']:,.2f}"
-                )
+                lines.append(f"<b>{date_str}</b>")
+                lines.append(f"   Trades: {len(day_trades)} (🟢{buys}↗ 🔴{sells}↘)")
                 lines.append("")
             
-            lines.append(f"━━━━━━━━━━━━━━━━")
-            last_stat = daily_stats[-1]
-            current_value = last_stat['total_value']
-            total_profit_actual = current_value - initial_balance
-            lines.append(f"<b>ВСЬОГО:</b> ${total_profit_actual:+,.2f} (Value: ${current_value:,.2f})")
-            lines.append("")
-            
-            best_day = max(daily_stats, key=lambda x: x['daily_profit'])
-            worst_day = min(daily_stats, key=lambda x: x['daily_profit'])
-            avg_daily = total_profit / len(daily_stats)
-            profitable_days = len([s for s in daily_stats if s['daily_profit'] > 0])
-            win_rate = (profitable_days / len(daily_stats)) * 100
-            
-            lines.append("<b>🏆 Статистика:</b>")
-            lines.append(f"   Найкращий: {best_day['date'].strftime('%d.%m')} (${best_day['daily_profit']:+,.2f})")
-            lines.append(f"   Найгірший: {worst_day['date'].strftime('%d.%m')} (${worst_day['daily_profit']:+,.2f})")
-            lines.append(f"   Середній: ${avg_daily:+,.2f}/день")
-            lines.append(f"   Прибуткових днів: {profitable_days}/{len(daily_stats)} ({win_rate:.0f}%)")
+            lines.append("━━━━━━━━━━━━━━━━")
+            lines.append(f"<b>Total Value:</b> ${total:,.2f}")
+            lines.append(f"<b>PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
+            lines.append(f"<b>Total Trades:</b> {len(trades)}")
             
             await self._send_message("\n".join(lines))
             
         except Exception as e:
             logger.error(f"Daily command error: {e}")
-            await self._send_message(f"❌ Помилка: {e}")
+            await self._send_message(f"❌ Error: {e}")
 
