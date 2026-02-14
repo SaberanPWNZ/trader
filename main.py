@@ -17,6 +17,20 @@ from monitoring.logger import setup_logging
 from monitoring.alerts import telegram
 
 
+async def fetch_all_trades(exchange, symbol='ETH/USDT'):
+    all_trades = []
+    since = None
+    for _ in range(10):
+        trades = await exchange.fetch_my_trades(symbol, since=since, limit=1000)
+        if not trades:
+            break
+        all_trades.extend(trades)
+        if len(trades) < 100:
+            break
+        since = trades[-1]['timestamp'] + 1
+    return all_trades
+
+
 async def run_backtest(args):
     logger.warning("⚠️ Backtest mode not available - PyBroker not installed")
     logger.info("Available modes: force-train, scheduler, bot")
@@ -28,13 +42,23 @@ async def run_grid_live(args):
     from config.settings import settings
     
     max_balance = getattr(args, 'balance', None)
-    logger.info(f"🔲 Starting Grid LIVE Trading mode (Testnet) - Max balance: ${max_balance or 'all'}")
+    use_mainnet = getattr(args, 'mainnet', False)
+    
+    if use_mainnet:
+        logger.warning("⚠️ MAINNET MODE - REAL MONEY!")
+        confirm = input("Type 'YES' to confirm mainnet trading: ")
+        if confirm != "YES":
+            logger.info("Cancelled. Use --testnet for paper trading.")
+            return
+    
+    mode_str = "MAINNET" if use_mainnet else "Testnet"
+    logger.info(f"🔲 Starting Grid LIVE Trading mode ({mode_str}) - Max balance: ${max_balance or 'all'}")
     
     grid_symbols = settings.trading.symbols
     
     trader = GridLiveTrader(
         symbols=grid_symbols,
-        testnet=True,
+        testnet=not use_mainnet,
         max_balance=max_balance
     )
     
@@ -160,7 +184,7 @@ async def show_testnet_status():
     pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
     
     orders = await ex.fetch_open_orders('ETH/USDT')
-    trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+    trades = await fetch_all_trades(ex, 'ETH/USDT')
     
     buy_count = sum(1 for t in trades if t['side'] == 'buy')
     sell_count = sum(1 for t in trades if t['side'] == 'sell')
@@ -202,11 +226,12 @@ async def show_testnet_trades():
     ex = create_exchange(testnet=True)
     await ex.connect()
     
-    trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+    trades = await fetch_all_trades(ex, 'ETH/USDT')
     
     print()
     print("╔═══════════════════════════════════════════════════════════════╗")
     print("║          📜 BINANCE TESTNET - RECENT TRADES                   ║")
+    print(f"║          Total Trades: {len(trades):>5}                              ║")
     print("╠═══════════════════════════════════════════════════════════════╣")
     
     if not trades:
@@ -261,7 +286,7 @@ async def show_testnet_daily():
     pnl = total_value - initial
     pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
     
-    trades = await ex.fetch_my_trades('ETH/USDT', limit=100)
+    trades = await fetch_all_trades(ex, 'ETH/USDT')
     orders = await ex.fetch_open_orders('ETH/USDT')
     
     today = datetime.now().date()
@@ -744,15 +769,15 @@ Examples:
     paper_parser.add_argument("--model", help="Path to AI model file")
     paper_parser.add_argument("--initial-balance", type=float, help="Initial portfolio balance")
     
-    # Grid trading parser
     grid_parser = subparsers.add_parser("grid", help="Run grid trading bot")
     grid_parser.add_argument("--initial-balance", type=float, default=2000.0, help="Initial balance for grid trading")
     
-    # Grid LIVE trading parser (Binance Testnet)
     grid_live_parser = subparsers.add_parser("grid-live", help="Run grid trading on Binance Testnet")
     grid_live_parser.add_argument("--balance", type=float, help="Max balance to use (default: all available)")
+    grid_live_parser.add_argument("--mainnet", action="store_true", help="Use MAINNET (real money!)")
     
-    # Live trading parser
+    pre_live_parser = subparsers.add_parser("pre-live-check", help="Run pre-live trading checks")
+    
     live_parser = subparsers.add_parser("live", help="Run live trading (PyBroker integration)")
     live_parser.add_argument("--strategy", choices=["rule_based", "ai"], default="rule_based")
     live_parser.add_argument("--model", help="Path to AI model file")
@@ -832,6 +857,9 @@ Examples:
         asyncio.run(run_grid_trading(args))
     elif args.mode == "grid-live":
         asyncio.run(run_grid_live(args))
+    elif args.mode == "pre-live-check":
+        from pre_live_check import main as pre_live_main
+        asyncio.run(pre_live_main())
     elif args.mode == "live":
         asyncio.run(run_live_trading(args))
     elif args.mode == "train":

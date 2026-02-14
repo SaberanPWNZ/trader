@@ -12,13 +12,14 @@ load_dotenv()
 
 @dataclass
 class ExchangeConfig:
-    """Exchange connection configuration."""
     name: str = "binance"
     api_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", ""))
+    testnet_api_key: str = field(default_factory=lambda: os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", "")))
+    testnet_api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", "")))
     testnet: bool = True
-    rate_limit: int = 1200  # requests per minute
-    timeout: int = 30000  # milliseconds
+    rate_limit: int = 1200
+    timeout: int = 30000
 
 
 @dataclass
