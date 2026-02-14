@@ -12,10 +12,17 @@ def create_exchange(
     exchange_id = exchange_id or settings.exchange.name
     testnet = testnet if testnet is not None else settings.exchange.testnet
     
+    if testnet:
+        api_key = settings.exchange.testnet_api_key
+        api_secret = settings.exchange.testnet_api_secret
+    else:
+        api_key = settings.exchange.api_key
+        api_secret = settings.exchange.api_secret
+    
     client = ExchangeClient(
         exchange_id=exchange_id,
-        api_key=settings.exchange.api_key,
-        api_secret=settings.exchange.api_secret,
+        api_key=api_key,
+        api_secret=api_secret,
         testnet=testnet,
         rate_limit=settings.exchange.rate_limit
     )

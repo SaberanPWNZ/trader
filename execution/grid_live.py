@@ -3,8 +3,8 @@ import csv
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
 from loguru import logger
 import pandas as pd
 
@@ -32,6 +32,7 @@ class GridLiveTrader:
         self.exchange = None
         self._trades_file = "data/grid_live_trades.csv"
         self._state_file = "data/grid_live_state.json"
+        self._balance_file = "data/grid_live_balance.json"
         self._init_data_files()
         
         self.strategies: Dict[str, GridStrategy] = {}
@@ -43,6 +44,13 @@ class GridLiveTrader:
         self.realized_pnl = 0.0
         self.total_trades = 0
         self._running = False
+        self._processed_trade_ids: Set[str] = set()
+        self._last_trade_sync: datetime = datetime.min
+        self._max_loss_pct = 0.15
+        self._stop_loss_pct = 0.10
+        self._error_count = 0
+        self._max_errors = 10
+        self._emergency_stop = False
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -55,16 +63,33 @@ class GridLiveTrader:
                 writer = csv.writer(f)
                 writer.writerow([
                     'timestamp', 'symbol', 'side', 'price', 'amount', 'value',
-                    'order_id', 'status', 'realized_pnl', 'balance'
+                    'order_id', 'status', 'realized_pnl', 'balance', 'total_value', 'eth_held'
                 ])
+        
+        self._load_processed_trade_ids()
+    
+    def _load_processed_trade_ids(self):
+        if os.path.exists(self._trades_file):
+            try:
+                df = pd.read_csv(self._trades_file)
+                if 'order_id' in df.columns:
+                    self._processed_trade_ids = set(df['order_id'].dropna().astype(str))
+            except Exception:
+                pass
     
     async def start(self):
-        self.exchange = create_exchange(testnet=self.testnet)
-        await self.exchange.connect()
+        try:
+            self.exchange = create_exchange(testnet=self.testnet)
+            await self.exchange.connect()
+        except Exception as e:
+            logger.error(f"Failed to create exchange: {e}")
+            await telegram.send_message(f"❌ Exchange connection failed: {e}")
+            return
         
         validation = await self._validate_connection()
         if not validation['success']:
             logger.error(f"Exchange connection failed: {validation['error']}")
+            await telegram.send_message(f"❌ Validation failed: {validation['error']}")
             return
         
         actual_balance = validation['balance']
@@ -77,6 +102,7 @@ class GridLiveTrader:
         
         logger.info(f"✅ Connected to Binance {'Testnet' if self.testnet else 'Mainnet'}")
         logger.info(f"💰 Balance: ${self.balance:.2f} USDT")
+        logger.info(f"🛡️ Protection: Max loss {self._max_loss_pct*100:.0f}%, Stop-loss {self._stop_loss_pct*100:.0f}%")
         
         await telegram.send_message(
             f"🚀 GRID LIVE TRADING STARTED\n"
@@ -102,16 +128,173 @@ class GridLiveTrader:
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
+    async def _sync_trades_from_exchange(self, symbol: str):
+        try:
+            trades = await self.exchange.fetch_my_trades(symbol, limit=100)
+            new_trades = []
+            
+            for trade in trades:
+                trade_id = str(trade['id'])
+                if trade_id in self._processed_trade_ids:
+                    continue
+                
+                self._processed_trade_ids.add(trade_id)
+                new_trades.append(trade)
+                
+                side = trade['side'].upper()
+                price = trade['price']
+                amount = trade['amount']
+                value = trade['cost']
+                
+                pnl = 0.0
+                if side == 'SELL' and self.positions[symbol]:
+                    pos = self.positions[symbol].pop(0)
+                    pnl = (price - pos.entry_price) * amount
+                    self.realized_pnl += pnl
+                elif side == 'BUY':
+                    self.positions[symbol].append(LiveGridPosition(
+                        symbol=symbol,
+                        side='long',
+                        entry_price=price,
+                        amount=amount,
+                        order_id=trade_id,
+                        opened_at=datetime.fromisoformat(trade['datetime'].replace('Z', '+00:00'))
+                    ))
+                
+                balance_info = await self.exchange.fetch_balance()
+                usdt_balance = balance_info.get('USDT', {}).get('total', 0)
+                eth_balance = balance_info.get('ETH', {}).get('total', 0)
+                ticker = await self.exchange.fetch_ticker(symbol)
+                eth_value = eth_balance * ticker['last']
+                total_value = usdt_balance + eth_value
+                
+                self._log_trade_from_exchange(
+                    symbol, side, price, amount, value, 
+                    trade_id, pnl, usdt_balance, total_value, eth_balance
+                )
+                
+                self.total_trades += 1
+                logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, PnL: ${pnl:.2f}")
+            
+            if new_trades:
+                logger.info(f"Synced {len(new_trades)} new trades for {symbol}")
+                
+        except Exception as e:
+            logger.error(f"Error syncing trades for {symbol}: {e}")
+    
+    def _log_trade_from_exchange(self, symbol: str, side: str, price: float, amount: float, 
+                                  value: float, order_id: str, pnl: float, balance: float, 
+                                  total_value: float, eth_held: float):
+        with open(self._trades_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.utcnow().isoformat(),
+                symbol, side, price, amount, value,
+                order_id, 'filled', pnl, balance, total_value, eth_held
+            ])
+    
+    async def _update_balance_state(self):
+        try:
+            balance_info = await self.exchange.fetch_balance()
+            usdt_total = balance_info.get('USDT', {}).get('total', 0)
+            eth_total = balance_info.get('ETH', {}).get('total', 0)
+            
+            total_value = usdt_total
+            for symbol in self.symbols:
+                if symbol in self.current_prices:
+                    base_currency = symbol.split('/')[0]
+                    if base_currency == 'ETH':
+                        total_value += eth_total * self.current_prices[symbol]
+            
+            state = {
+                'initial_balance': self.initial_balance,
+                'start_time': datetime.now().isoformat(),
+                'usdt_balance': usdt_total,
+                'eth_balance': eth_total,
+                'total_value': total_value,
+                'realized_pnl': self.realized_pnl,
+                'total_trades': self.total_trades,
+                'last_update': datetime.utcnow().isoformat()
+            }
+            
+            if os.path.exists(self._balance_file):
+                with open(self._balance_file, 'r') as f:
+                    old_state = json.load(f)
+                    state['initial_balance'] = old_state.get('initial_balance', self.initial_balance)
+                    state['start_time'] = old_state.get('start_time', datetime.now().isoformat())
+            
+            with open(self._balance_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            await self._check_portfolio_protection(total_value)
+                
+        except Exception as e:
+            logger.error(f"Error updating balance state: {e}")
+    
+    async def _check_portfolio_protection(self, current_value: float):
+        try:
+            loss = self.initial_balance - current_value
+            loss_pct = (loss / self.initial_balance) if self.initial_balance > 0 else 0
+            
+            if loss_pct >= self._stop_loss_pct:
+                warning_msg = (
+                    f"⚠️ STOP-LOSS TRIGGERED\n"
+                    f"Loss: ${loss:.2f} ({loss_pct*100:.1f}%)\n"
+                    f"Initial: ${self.initial_balance:.2f}\n"
+                    f"Current: ${current_value:.2f}"
+                )
+                logger.warning(warning_msg)
+                await telegram.send_message(warning_msg)
+                
+                if loss_pct >= self._max_loss_pct:
+                    emergency_msg = (
+                        f"🚨 EMERGENCY STOP\n"
+                        f"Max loss reached: {loss_pct*100:.1f}%\n"
+                        f"Stopping trading..."
+                    )
+                    logger.critical(emergency_msg)
+                    await telegram.send_message(emergency_msg)
+                    self._emergency_stop = True
+                    self._running = False
+                    
+        except Exception as e:
+            logger.error(f"Error checking portfolio protection: {e}")
+    
     async def _trading_loop(self):
-        for symbol in self.symbols:
-            await self._initialize_grid(symbol)
+        try:
+            for symbol in self.symbols:
+                await self._initialize_grid(symbol)
+        except Exception as e:
+            logger.error(f"Failed to initialize grids: {e}")
+            await telegram.send_message(f"❌ Initialization failed: {e}")
+            self._running = False
+            return
         
         while self._running:
+            if self._emergency_stop:
+                logger.critical("Emergency stop activated, exiting trading loop")
+                break
+            
             for symbol in self.symbols:
                 try:
+                    await self._sync_trades_from_exchange(symbol)
                     await self._process_symbol(symbol)
+                    self._error_count = 0
                 except Exception as e:
-                    logger.error(f"Error processing {symbol}: {e}")
+                    self._error_count += 1
+                    logger.error(f"Error processing {symbol} (error {self._error_count}/{self._max_errors}): {e}")
+                    
+                    if self._error_count >= self._max_errors:
+                        error_msg = f"🚨 Too many errors ({self._error_count}), stopping trader"
+                        logger.critical(error_msg)
+                        await telegram.send_message(error_msg)
+                        self._running = False
+                        break
+            
+            try:
+                await self._update_balance_state()
+            except Exception as e:
+                logger.error(f"Error updating balance: {e}")
             
             await asyncio.sleep(60)
     

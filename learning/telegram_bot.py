@@ -326,12 +326,26 @@ class LearningTelegramBot:
                 start_time = state.get("start_time")
         
         orders = await ex.fetch_open_orders('ETH/USDT')
-        trades = await ex.fetch_my_trades('ETH/USDT', limit=50)
+        
+        all_trades = []
+        since = None
+        for _ in range(10):
+            trades = await ex.fetch_my_trades('ETH/USDT', since=since, limit=1000)
+            if not trades:
+                break
+            all_trades.extend(trades)
+            if len(trades) < 100:
+                break
+            since = trades[-1]['timestamp'] + 1
         
         await ex.disconnect()
         
+        total_pnl = total_value - initial
+        pnl_percent = (total_pnl / initial * 100) if initial > 0 else 0
+        
         return {
             'usdt_total': usdt_total,
+            'usdt_balance': usdt_total,
             'usdt_free': usdt_free,
             'usdt_used': usdt_used,
             'eth_total': eth_total,
@@ -339,9 +353,11 @@ class LearningTelegramBot:
             'eth_price': eth_price,
             'total_value': total_value,
             'initial_balance': initial,
+            'total_pnl': total_pnl,
+            'pnl_percent': pnl_percent,
             'start_time': start_time,
             'orders': orders,
-            'trades': trades
+            'trades': all_trades
         }
 
     async def _cmd_balance(self, args: list) -> None:

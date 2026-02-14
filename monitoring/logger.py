@@ -65,6 +65,17 @@ def setup_logging() -> None:
             rotation="00:00",
             retention="365 days"
         )
+        
+        # Live trading log file (separate from paper/testnet trading)
+        logger.add(
+            log_dir / "grid_live.log",
+            level="INFO",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
+            filter=lambda record: "grid_live" in record["name"].lower() or "gridlivetrader" in str(record["extra"]),
+            rotation="10 MB",
+            retention="90 days",
+            compression="gz"
+        )
     
     logger.info("Logging configured")
 
