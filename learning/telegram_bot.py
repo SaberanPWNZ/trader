@@ -38,6 +38,7 @@ class LearningTelegramBot:
             "/grid": self._cmd_grid,
             "/trades": self._cmd_trades,
             "/profit": self._cmd_profit,
+            "/stats": self._cmd_stats,
             "/daily": self._cmd_daily,
         }
 
@@ -302,7 +303,7 @@ class LearningTelegramBot:
     async def _get_testnet_data(self):
         from exchange.factory import create_exchange
         
-        ex = create_exchange(testnet=True)
+        ex = create_exchange(testnet=False)
         await ex.connect()
         
         balance = await ex.fetch_balance()
@@ -373,7 +374,7 @@ class LearningTelegramBot:
             roi_emoji = "✅" if pnl >= 0 else "⚠️" if pnl >= -50 else "🚨"
             
             lines = [
-                "💰 <b>Portfolio Balance (Testnet)</b>",
+                "💰 <b>Portfolio Balance (MAINNET 🔴)</b>",
                 "",
                 f"💎 <b>Total Value:</b> ${data['total_value']:,.2f}",
                 f"   ├ 💵 USDT: ${data['usdt_total']:,.2f}",
@@ -400,7 +401,7 @@ class LearningTelegramBot:
         try:
             data = await self._get_testnet_data()
             
-            lines = ["📊 <b>Grid Trading Status (Testnet)</b>\n"]
+            lines = ["📊 <b>Grid Trading Status (MAINNET 🔴)</b>\n"]
             
             lines.append(f"<b>ETH/USDT</b>")
             lines.append(f"├ Price: ${data['eth_price']:,.2f}")
@@ -468,7 +469,7 @@ class LearningTelegramBot:
             total = usdt + eth_val
             
             lines = [
-                "💰 <b>Profit Report (Testnet)</b>",
+                "💰 <b>Profit Report (MAINNET 🔴)</b>",
                 "",
                 f"<b>Balance:</b> ${usdt:,.2f} USDT",
                 f"<b>Position:</b> {eth:.4f} ETH (${eth_val:,.2f})",
@@ -482,6 +483,68 @@ class LearningTelegramBot:
             
         except Exception as e:
             logger.error(f"Profit command error: {e}")
+            await self._send_message(f"❌ Error: {e}")
+    
+    async def _cmd_stats(self, args: list) -> None:
+        try:
+            state_file = "data/grid_live_balance.json"
+            if not os.path.exists(state_file):
+                await self._send_message("❌ No trading data yet")
+                return
+            
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            initial = state.get('initial_balance', 0)
+            initial_eth_price = state.get('initial_eth_price', 0)
+            current_eth_price = state.get('eth_price', 0)
+            total_value = state.get('total_value', 0)
+            trading_pnl = state.get('trading_pnl', 0)
+            holding_pnl = state.get('holding_pnl', 0)
+            realized_pnl = state.get('realized_pnl', 0)
+            total_fees = state.get('total_fees_paid', 0)
+            
+            cycles = state.get('completed_cycles', 0)
+            wins = state.get('winning_trades', 0)
+            losses = state.get('losing_trades', 0)
+            win_rate = state.get('win_rate', 0)
+            avg_profit = state.get('avg_profit_per_cycle', 0)
+            
+            eth_price_change = ((current_eth_price - initial_eth_price) / initial_eth_price * 100) if initial_eth_price > 0 else 0
+            total_pnl = total_value - initial
+            total_pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
+            
+            lines = [
+                "📊 <b>Детальна статистика торгівлі (MAINNET 🔴)</b>",
+                "",
+                "<b>💵 ПРИБУТКИ:</b>",
+                f"├ Trading PnL: <b>${trading_pnl:+.2f}</b>",
+                f"├ Holding PnL: <b>${holding_pnl:+.2f}</b>",
+                f"├ Total PnL: <b>${total_pnl:+.2f}</b> ({total_pnl_pct:+.2f}%)",
+                f"└ Fees Paid: <code>-${total_fees:.2f}</code>",
+                "",
+                "<b>📈 ТОРГІВЛЯ:</b>",
+                f"├ Cycles: <b>{cycles}</b>",
+                f"├ Win Rate: <b>{win_rate:.1f}%</b> ({wins}W / {losses}L)",
+                f"└ Avg per cycle: <b>${avg_profit:+.2f}</b>",
+                "",
+                "<b>💰 БАЛАНС:</b>",
+                f"├ Initial: ${initial:.2f}",
+                f"├ Current: <b>${total_value:.2f}</b>",
+                f"└ ETH price: ${initial_eth_price:.0f} → ${current_eth_price:.0f} ({eth_price_change:+.1f}%)",
+            ]
+            
+            if cycles > 0:
+                lines.append("")
+                lines.append("<b>📌 ПОЯСНЕННЯ:</b>")
+                lines.append("• <b>Trading PnL</b> = прибуток від циклів купівлі-продажу")
+                lines.append("• <b>Holding PnL</b> = зміна вартості через ціну ETH")
+                lines.append("• <b>Win Rate</b> = % прибуткових циклів")
+            
+            await self._send_message("\n".join(lines))
+            
+        except Exception as e:
+            logger.error(f"Stats command error: {e}")
             await self._send_message(f"❌ Error: {e}")
 
     async def _cmd_daily(self, args: list) -> None:

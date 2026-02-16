@@ -15,14 +15,17 @@ def create_exchange(
     if testnet:
         api_key = settings.exchange.testnet_api_key
         api_secret = settings.exchange.testnet_api_secret
+        private_key = ""
     else:
         api_key = settings.exchange.api_key
         api_secret = settings.exchange.api_secret
+        private_key = settings.exchange.private_key
     
     client = ExchangeClient(
         exchange_id=exchange_id,
         api_key=api_key,
         api_secret=api_secret,
+        private_key=private_key,
         testnet=testnet,
         rate_limit=settings.exchange.rate_limit
     )

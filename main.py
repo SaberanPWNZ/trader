@@ -40,16 +40,29 @@ async def run_backtest(args):
 async def run_grid_live(args):
     from execution.grid_live import GridLiveTrader
     from config.settings import settings
+    import os
     
     max_balance = getattr(args, 'balance', None)
     use_mainnet = getattr(args, 'mainnet', False)
     
     if use_mainnet:
         logger.warning("⚠️ MAINNET MODE - REAL MONEY!")
-        confirm = input("Type 'YES' to confirm mainnet trading: ")
-        if confirm != "YES":
-            logger.info("Cancelled. Use --testnet for paper trading.")
-            return
+        
+        # Check environment variable for Docker/automated confirmation
+        auto_confirm = os.getenv('CONFIRM_MAINNET', '').upper()
+        if auto_confirm == 'YES':
+            logger.info("✅ Mainnet confirmed via CONFIRM_MAINNET env variable")
+        else:
+            # Try interactive confirmation (works only in terminal)
+            try:
+                confirm = input("Type 'YES' to confirm mainnet trading: ")
+                if confirm != "YES":
+                    logger.info("Cancelled. Use --testnet for paper trading.")
+                    return
+            except EOFError:
+                logger.error("❌ Cannot confirm mainnet in non-interactive mode.")
+                logger.error("Set CONFIRM_MAINNET=YES environment variable to confirm.")
+                return
     
     mode_str = "MAINNET" if use_mainnet else "Testnet"
     logger.info(f"🔲 Starting Grid LIVE Trading mode ({mode_str}) - Max balance: ${max_balance or 'all'}")

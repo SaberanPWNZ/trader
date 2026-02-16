@@ -41,7 +41,13 @@ class GridLiveTrader:
         self.current_prices: Dict[str, float] = {}
         self.balance = 0.0
         self.initial_balance = 0.0
+        self.initial_eth_price = 0.0
         self.realized_pnl = 0.0
+        self.trading_pnl = 0.0
+        self.total_fees_paid = 0.0
+        self.completed_cycles = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
         self.total_trades = 0
         self._running = False
         self._processed_trade_ids: Set[str] = set()
@@ -51,6 +57,7 @@ class GridLiveTrader:
         self._error_count = 0
         self._max_errors = 10
         self._emergency_stop = False
+        self._buy_positions: Dict[str, List[Dict]] = {s: [] for s in symbols}
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -63,7 +70,8 @@ class GridLiveTrader:
                 writer = csv.writer(f)
                 writer.writerow([
                     'timestamp', 'symbol', 'side', 'price', 'amount', 'value',
-                    'order_id', 'status', 'realized_pnl', 'balance', 'total_value', 'eth_held'
+                    'order_id', 'status', 'fee', 'trading_pnl', 'holding_pnl', 
+                    'realized_pnl', 'balance', 'total_value', 'eth_held'
                 ])
         
         self._load_processed_trade_ids()
@@ -100,15 +108,22 @@ class GridLiveTrader:
             self.balance = actual_balance
         self.initial_balance = self.balance
         
-        logger.info(f"✅ Connected to Binance {'Testnet' if self.testnet else 'Mainnet'}")
-        logger.info(f"💰 Balance: ${self.balance:.2f} USDT")
-        logger.info(f"🛡️ Protection: Max loss {self._max_loss_pct*100:.0f}%, Stop-loss {self._stop_loss_pct*100:.0f}%")
+        mode = '🧪 TESTNET' if self.testnet else '🚀 MAINNET - REAL MONEY'
+        logger.info(f"{'='*60}")
+        logger.info(f"✅ Connected to Binance {mode}")
+        logger.info(f"💰 Initial Balance: ${self.balance:.2f} USDT")
+        logger.info(f"🛡️ Protection: Stop-loss {self._stop_loss_pct*100:.0f}%, Emergency {self._max_loss_pct*100:.0f}%")
+        logger.info(f"📊 Trading Symbols: {', '.join(self.symbols)}")
+        logger.info(f"{'='*60}")
         
+        mode_emoji = '🧪' if self.testnet else '⚠️'
+        mode_text = 'TESTNET' if self.testnet else '🔴 MAINNET (REAL MONEY)'
         await telegram.send_message(
-            f"🚀 GRID LIVE TRADING STARTED\n"
-            f"Exchange: Binance {'Testnet' if self.testnet else '⚠️ MAINNET'}\n"
-            f"Balance: ${self.balance:.2f}\n"
-            f"Symbols: {', '.join(self.symbols)}"
+            f"{mode_emoji} GRID LIVE TRADING STARTED\n"
+            f"Exchange: Binance {mode_text}\n"
+            f"Balance: ${self.balance:.2f} USDT\n"
+            f"Symbols: {', '.join(self.symbols)}\n"
+            f"Protection: {self._stop_loss_pct*100:.0f}% stop-loss"
         )
         
         self._running = True
@@ -146,11 +161,48 @@ class GridLiveTrader:
                 amount = trade['amount']
                 value = trade['cost']
                 
+                logger.info(f"{'='*60}")
+                logger.info(f"📝 NEW TRADE DETECTED: {symbol}")
+                logger.info(f"   Order ID: {trade_id}")
+                logger.info(f"   Side: {side}")
+                logger.info(f"   Price: ${price:.2f}")
+                logger.info(f"   Amount: {amount:.6f}")
+                logger.info(f"   Value: ${value:.2f}")
+                logger.info(f"   Time: {datetime.fromtimestamp(trade['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 pnl = 0.0
+                fee = trade.get('fee', {}).get('cost', 0)
+                self.total_fees_paid += fee
+                
+                trading_pnl = 0.0
+                holding_pnl = 0.0
+                
+                logger.info(f"   Current positions: {len(self.positions[symbol])}")
                 if side == 'SELL' and self.positions[symbol]:
                     pos = self.positions[symbol].pop(0)
-                    pnl = (price - pos.entry_price) * amount
-                    self.realized_pnl += pnl
+                    
+                    total_change = (price - pos.entry_price) * amount
+                    trading_pnl = total_change - fee
+                    holding_pnl = total_change - trading_pnl
+                    
+                    pnl_pct = (total_change / (pos.entry_price * amount)) * 100
+                    self.realized_pnl += total_change
+                    self.trading_pnl += trading_pnl
+                    self.completed_cycles += 1
+                    
+                    if trading_pnl > 0:
+                        self.winning_trades += 1
+                    else:
+                        self.losing_trades += 1
+                    
+                    logger.info(f"   ✅ POSITION CLOSED (Cycle #{self.completed_cycles})")
+                    logger.info(f"   Entry Price: ${pos.entry_price:.2f}")
+                    logger.info(f"   Exit Price: ${price:.2f}")
+                    logger.info(f"   Total Change: ${total_change:+.2f} ({pnl_pct:+.2f}%)")
+                    logger.info(f"   Trading PnL: ${trading_pnl:+.2f} (after ${fee:.4f} fee)")
+                    logger.info(f"   Holding PnL: ${holding_pnl:+.2f}")
+                    logger.info(f"   Win Rate: {self.winning_trades}/{self.completed_cycles} ({self.winning_trades/self.completed_cycles*100:.1f}%)")
+                    logger.info(f"   Total Trading PnL: ${self.trading_pnl:+.2f}")
                 elif side == 'BUY':
                     self.positions[symbol].append(LiveGridPosition(
                         symbol=symbol,
@@ -160,6 +212,12 @@ class GridLiveTrader:
                         order_id=trade_id,
                         opened_at=datetime.fromisoformat(trade['datetime'].replace('Z', '+00:00'))
                     ))
+                    logger.info(f"   🟢 POSITION OPENED")
+                    logger.info(f"   Entry Price: ${price:.2f}")
+                    logger.info(f"   Amount: {amount:.6f} {symbol.split('/')[0]}")
+                    logger.info(f"   Value: ${value:.2f} USDT")
+                    logger.info(f"   Fee: ${fee:.4f}")
+                    logger.info(f"   Total Open Positions: {len(self.positions[symbol])}")
                 
                 balance_info = await self.exchange.fetch_balance()
                 usdt_balance = balance_info.get('USDT', {}).get('total', 0)
@@ -168,13 +226,19 @@ class GridLiveTrader:
                 eth_value = eth_balance * ticker['last']
                 total_value = usdt_balance + eth_value
                 
+                self.total_trades += 1
+                logger.info(f"   Total Trades: {self.total_trades}")
+                logger.info(f"   Balance: ${usdt_balance:.2f} USDT + {eth_balance:.6f} ETH (${eth_value:.2f})")
+                logger.info(f"   Total Value: ${total_value:.2f}")
+                logger.info(f"{'='*60}")
+                
                 self._log_trade_from_exchange(
                     symbol, side, price, amount, value, 
-                    trade_id, pnl, usdt_balance, total_value, eth_balance
+                    trade_id, fee, trading_pnl, holding_pnl, usdt_balance, total_value, eth_balance
                 )
                 
                 self.total_trades += 1
-                logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, PnL: ${pnl:.2f}")
+                logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, Trading PnL: ${trading_pnl:.2f}")
             
             if new_trades:
                 logger.info(f"Synced {len(new_trades)} new trades for {symbol}")
@@ -183,14 +247,15 @@ class GridLiveTrader:
             logger.error(f"Error syncing trades for {symbol}: {e}")
     
     def _log_trade_from_exchange(self, symbol: str, side: str, price: float, amount: float, 
-                                  value: float, order_id: str, pnl: float, balance: float, 
-                                  total_value: float, eth_held: float):
+                                  value: float, order_id: str, fee: float, trading_pnl: float,
+                                  holding_pnl: float, balance: float, total_value: float, eth_held: float):
         with open(self._trades_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 datetime.utcnow().isoformat(),
                 symbol, side, price, amount, value,
-                order_id, 'filled', pnl, balance, total_value, eth_held
+                order_id, 'filled', fee, trading_pnl, holding_pnl,
+                self.realized_pnl, balance, total_value, eth_held
             ])
     
     async def _update_balance_state(self):
@@ -200,20 +265,39 @@ class GridLiveTrader:
             eth_total = balance_info.get('ETH', {}).get('total', 0)
             
             total_value = usdt_total
+            current_eth_price = 0
             for symbol in self.symbols:
                 if symbol in self.current_prices:
                     base_currency = symbol.split('/')[0]
                     if base_currency == 'ETH':
-                        total_value += eth_total * self.current_prices[symbol]
+                        current_eth_price = self.current_prices[symbol]
+                        total_value += eth_total * current_eth_price
+            
+            holding_pnl = 0
+            if self.initial_eth_price > 0 and eth_total > 0:
+                holding_pnl = eth_total * (current_eth_price - self.initial_eth_price)
+            
+            win_rate = (self.winning_trades / self.completed_cycles * 100) if self.completed_cycles > 0 else 0
+            avg_profit_per_cycle = (self.trading_pnl / self.completed_cycles) if self.completed_cycles > 0 else 0
             
             state = {
                 'initial_balance': self.initial_balance,
+                'initial_eth_price': self.initial_eth_price,
                 'start_time': datetime.now().isoformat(),
                 'usdt_balance': usdt_total,
                 'eth_balance': eth_total,
+                'eth_price': current_eth_price,
                 'total_value': total_value,
+                'trading_pnl': self.trading_pnl,
+                'holding_pnl': holding_pnl,
                 'realized_pnl': self.realized_pnl,
+                'total_fees_paid': self.total_fees_paid,
                 'total_trades': self.total_trades,
+                'completed_cycles': self.completed_cycles,
+                'winning_trades': self.winning_trades,
+                'losing_trades': self.losing_trades,
+                'win_rate': win_rate,
+                'avg_profit_per_cycle': avg_profit_per_cycle,
                 'last_update': datetime.utcnow().isoformat()
             }
             
@@ -221,6 +305,7 @@ class GridLiveTrader:
                 with open(self._balance_file, 'r') as f:
                     old_state = json.load(f)
                     state['initial_balance'] = old_state.get('initial_balance', self.initial_balance)
+                    state['initial_eth_price'] = old_state.get('initial_eth_price', self.initial_eth_price)
                     state['start_time'] = old_state.get('start_time', datetime.now().isoformat())
             
             with open(self._balance_file, 'w') as f:
@@ -303,11 +388,15 @@ class GridLiveTrader:
         current_price = ticker['last']
         self.current_prices[symbol] = current_price
         
-        grid_range_pct = 0.03
+        if self.initial_eth_price == 0.0 and symbol == 'ETH/USDT':
+            self.initial_eth_price = current_price
+            logger.info(f"📌 Initial ETH price recorded: ${current_price:.2f}")
+        
+        grid_range_pct = 0.02
         upper_price = current_price * (1 + grid_range_pct)
         lower_price = current_price * (1 - grid_range_pct)
         
-        investment_per_symbol = min(self.balance * 0.8, 2000.0)
+        investment_per_symbol = self.balance * 0.95
         
         from strategies.grid import GridConfig
         config = GridConfig(
@@ -469,8 +558,15 @@ class GridLiveTrader:
                     level.filled = True
                     level.order_id = None
             
+            balance = await self.exchange.fetch_balance()
+            eth_available = balance.get('ETH', {}).get('free', 0)
+            
             for level in active_levels:
                 if not level.order_id and not level.filled:
+                    if level.side == 'sell' and eth_available < level.amount:
+                        logger.debug(f"Skipping SELL order: need {level.amount:.6f} ETH, have {eth_available:.6f}")
+                        continue
+                    
                     try:
                         order = await self.exchange.create_order(
                             symbol=symbol,
@@ -481,6 +577,9 @@ class GridLiveTrader:
                         )
                         level.order_id = order['id']
                         logger.debug(f"Placed new {level.side} order at ${level.price:.2f}")
+                        
+                        if level.side == 'sell':
+                            eth_available -= level.amount
                     except Exception as e:
                         logger.error(f"Failed to place order: {e}")
                         

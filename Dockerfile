@@ -25,5 +25,5 @@ RUN mkdir -p data logs models
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Run the bot
-CMD ["python", "main.py", "paper"]
+# Run grid live trading on mainnet
+CMD ["python", "main.py", "grid-live", "--mainnet"]
