@@ -11,12 +11,14 @@ class ExchangeClient:
         exchange_id: str = "binance",
         api_key: str = "",
         api_secret: str = "",
+        private_key: str = "",
         testnet: bool = True,
         rate_limit: int = 1200
     ):
         self.exchange_id = exchange_id
         self.api_key = api_key
         self.api_secret = api_secret
+        self.private_key = private_key
         self.testnet = testnet
         self.rate_limit = rate_limit
         self._exchange: Optional[ccxt.Exchange] = None
@@ -28,7 +30,6 @@ class ExchangeClient:
         
         config = {
             'apiKey': self.api_key,
-            'secret': self.api_secret,
             'enableRateLimit': True,
             'rateLimit': int(60000 / self.rate_limit),
             'options': {
@@ -36,6 +37,20 @@ class ExchangeClient:
                 'adjustForTimeDifference': True
             }
         }
+        
+        if self.private_key:
+            # Ed25519 private key - wrap in PEM format if needed
+            private_key = self.private_key.strip()
+            if not private_key.startswith('-----BEGIN'):
+                private_key = f"-----BEGIN PRIVATE KEY-----\n{private_key}\n-----END PRIVATE KEY-----"
+            
+            config['secret'] = private_key
+            logger.info("Using Ed25519 private key for authentication")
+        elif self.api_secret:
+            config['secret'] = self.api_secret
+            logger.info("Using HMAC secret for authentication")
+        else:
+            raise ValueError("Either api_secret or private_key must be provided")
         
         if self.testnet:
             config['sandbox'] = True
@@ -67,9 +82,33 @@ class ExchangeClient:
             await asyncio.sleep(self._min_request_interval - elapsed)
         self._last_request_time = asyncio.get_event_loop().time()
 
+    async def _retry_request(self, func, *args, max_retries: int = 3, **kwargs):
+        """Retry API requests with exponential backoff"""
+        for attempt in range(max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except ccxt.RateLimitExceeded as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = 2 ** attempt
+                logger.warning(f"Rate limit exceeded, waiting {wait_time}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            except ccxt.NetworkError as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = 2 ** attempt
+                logger.warning(f"Network error: {e}, retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            except ccxt.ExchangeError as e:
+                logger.error(f"Exchange error: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error in API request: {e}")
+                raise
+
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         await self._rate_limit_wait()
-        return await self._exchange.fetch_ticker(symbol)
+        return await self._retry_request(self._exchange.fetch_ticker, symbol)
 
     async def fetch_ohlcv(
         self,
@@ -79,11 +118,11 @@ class ExchangeClient:
         limit: int = 500
     ) -> List[List]:
         await self._rate_limit_wait()
-        return await self._exchange.fetch_ohlcv(symbol, timeframe, since, limit)
+        return await self._retry_request(self._exchange.fetch_ohlcv, symbol, timeframe, since, limit)
 
     async def fetch_balance(self) -> Dict[str, Any]:
         await self._rate_limit_wait()
-        return await self._exchange.fetch_balance()
+        return await self._retry_request(self._exchange.fetch_balance)
 
     async def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Dict]:
         await self._rate_limit_wait()
@@ -106,22 +145,39 @@ class ExchangeClient:
         
         logger.info(f"Creating {type} {side} order: {amount} {symbol} @ {price or 'market'}")
         
-        order = await self._exchange.create_order(
-            symbol=symbol,
-            type=type,
-            side=side,
-            amount=amount,
-            price=price,
-            params=params
-        )
-        
-        logger.info(f"Order created: {order['id']} status={order['status']}")
-        return order
+        try:
+            order = await self._retry_request(
+                self._exchange.create_order,
+                symbol=symbol,
+                type=type,
+                side=side,
+                amount=amount,
+                price=price,
+                params=params
+            )
+            logger.info(f"Order created: {order['id']} status={order['status']}")
+            return order
+        except ccxt.InsufficientFunds as e:
+            logger.error(f"Insufficient funds for {side} order: {e}")
+            raise
+        except ccxt.InvalidOrder as e:
+            logger.error(f"Invalid order parameters: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to create order: {e}")
+            raise
 
     async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
         await self._rate_limit_wait()
         logger.info(f"Cancelling order {order_id} for {symbol}")
-        return await self._exchange.cancel_order(order_id, symbol)
+        try:
+            return await self._retry_request(self._exchange.cancel_order, order_id, symbol)
+        except ccxt.OrderNotFound:
+            logger.warning(f"Order {order_id} not found, may be already filled or cancelled")
+            return {'id': order_id, 'status': 'not_found'}
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            raise
 
     async def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
         await self._rate_limit_wait()

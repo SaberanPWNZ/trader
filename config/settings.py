@@ -15,6 +15,7 @@ class ExchangeConfig:
     name: str = "binance"
     api_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", ""))
+    private_key: str = field(default_factory=lambda: os.getenv("BINANCE_PRIVATE_KEY", ""))
     testnet_api_key: str = field(default_factory=lambda: os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", "")))
     testnet_api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", "")))
     testnet: bool = True
