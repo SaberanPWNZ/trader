@@ -66,6 +66,7 @@ class ExchangeClient:
         self._exchange = exchange_class(config)
         
         await self._exchange.load_markets()
+        
         logger.info(f"Connected to {self.exchange_id} ({'testnet' if self.testnet else 'mainnet'})")
         logger.info(f"Available markets: {len(self._exchange.markets)}")
 

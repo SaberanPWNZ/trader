@@ -25,14 +25,14 @@ class LiveGridPosition:
 
 
 class GridLiveTrader:
-    def __init__(self, symbols: List[str], testnet: bool = True, max_balance: Optional[float] = None):
+    def __init__(self, symbols: List[str], testnet: bool = True):
         self.symbols = symbols
         self.testnet = testnet
-        self.max_balance = max_balance
         self.exchange = None
         self._trades_file = "data/grid_live_trades.csv"
         self._state_file = "data/grid_live_state.json"
         self._balance_file = "data/grid_live_balance.json"
+        self._processed_trade_ids: Set[str] = set()
         self._init_data_files()
         
         self.strategies: Dict[str, GridStrategy] = {}
@@ -50,7 +50,6 @@ class GridLiveTrader:
         self.losing_trades = 0
         self.total_trades = 0
         self._running = False
-        self._processed_trade_ids: Set[str] = set()
         self._last_trade_sync: datetime = datetime.min
         self._max_loss_pct = 0.15
         self._stop_loss_pct = 0.10
@@ -79,11 +78,126 @@ class GridLiveTrader:
     def _load_processed_trade_ids(self):
         if os.path.exists(self._trades_file):
             try:
-                df = pd.read_csv(self._trades_file)
-                if 'order_id' in df.columns:
-                    self._processed_trade_ids = set(df['order_id'].dropna().astype(str))
-            except Exception:
-                pass
+                with open(self._trades_file, 'r') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if not header:
+                        return
+                    for row in reader:
+                        if len(row) >= 7 and row[6]:
+                            self._processed_trade_ids.add(str(row[6]))
+                logger.info(f"Loaded {len(self._processed_trade_ids)} processed trade IDs")
+            except Exception as e:
+                logger.warning(f"Error loading trade IDs: {e}")
+    
+    def _restore_state(self):
+        if not os.path.exists(self._balance_file):
+            return
+        try:
+            with open(self._balance_file, 'r') as f:
+                state = json.load(f)
+            self.initial_balance = state.get('initial_balance', self.initial_balance)
+            self.initial_eth_price = state.get('initial_eth_price', self.initial_eth_price)
+            self.trading_pnl = state.get('trading_pnl', 0)
+            self.realized_pnl = state.get('realized_pnl', 0)
+            self.total_fees_paid = state.get('total_fees_paid', 0)
+            self.completed_cycles = state.get('completed_cycles', 0)
+            self.winning_trades = state.get('winning_trades', 0)
+            self.losing_trades = state.get('losing_trades', 0)
+            self.total_trades = state.get('total_trades', 0)
+            logger.info(f"📂 State restored: {self.completed_cycles} cycles, Trading PnL: ${self.trading_pnl:+.2f}")
+        except Exception as e:
+            logger.warning(f"Error restoring state: {e}")
+
+    def _restore_positions(self):
+        if not os.path.exists(self._trades_file):
+            return
+        try:
+            with open(self._trades_file, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if not header:
+                    return
+                rows = []
+                seen = set()
+                for row in reader:
+                    if len(row) >= 7 and row[6] and row[6] not in seen:
+                        seen.add(row[6])
+                        rows.append(row)
+
+            rows.sort(key=lambda x: x[0])
+            buy_queue: Dict[str, List] = {s: [] for s in self.symbols}
+            for row in rows:
+                symbol = row[1] if len(row) > 1 else self.symbols[0]
+                side = row[2].upper()
+                price = float(row[3])
+                amount = float(row[4])
+                order_id = row[6]
+                ts = row[0]
+                if side == 'BUY':
+                    buy_queue.setdefault(symbol, []).append({
+                        'price': price, 'amount': amount, 'order_id': order_id, 'ts': ts
+                    })
+                elif side == 'SELL':
+                    q = buy_queue.get(symbol, [])
+                    if q:
+                        q.pop(0)
+
+            for symbol in self.symbols:
+                for pos in buy_queue.get(symbol, []):
+                    self.positions[symbol].append(LiveGridPosition(
+                        symbol=symbol,
+                        side='long',
+                        entry_price=pos['price'],
+                        amount=pos['amount'],
+                        order_id=pos['order_id'],
+                        opened_at=datetime.fromisoformat(pos['ts']) if pos['ts'] else datetime.now()
+                    ))
+                if self.positions[symbol]:
+                    logger.info(f"📂 Restored {len(self.positions[symbol])} open positions for {symbol}")
+        except Exception as e:
+            logger.warning(f"Error restoring positions: {e}")
+
+    async def _ensure_bnb_for_fees(self):
+        try:
+            balance_info = await self.exchange.fetch_balance()
+            bnb_free = balance_info.get('BNB', {}).get('free', 0)
+
+            ticker = await self.exchange.fetch_ticker('BNB/USDT')
+            bnb_price = ticker['last']
+            bnb_value = bnb_free * bnb_price
+
+            if bnb_value < 3.0:
+                usdt_free = balance_info.get('USDT', {}).get('free', 0)
+                bnb_buy_usdt = 6.0
+                if usdt_free >= bnb_buy_usdt:
+                    bnb_qty = round(bnb_buy_usdt / bnb_price, 3)
+                    bnb_qty = max(bnb_qty, 0.01)
+                    order = await self.exchange.create_order(
+                        symbol='BNB/USDT',
+                        type='market',
+                        side='buy',
+                        amount=bnb_qty
+                    )
+                    logger.info(f"🔶 Bought {bnb_qty} BNB for fee discount (${bnb_qty * bnb_price:.2f})")
+                    await telegram.send_message(f"🔶 Bought BNB for fee discount: {bnb_qty} BNB (${bnb_qty * bnb_price:.2f})")
+                else:
+                    logger.info(f"⏭️ Not enough free USDT for BNB (${usdt_free:.2f}), will buy after freeing capital")
+            else:
+                logger.info(f"🔶 BNB available for fees: {bnb_free:.4f} BNB (${bnb_value:.2f})")
+
+            try:
+                exchange = self.exchange._exchange if hasattr(self.exchange, '_exchange') else self.exchange
+                resp = await exchange.sapiGetBnbBurn()
+                if not resp.get('spotBNBBurn', False):
+                    await exchange.sapiPostBnbBurn({'spotBNBBurn': 'true'})
+                    logger.info("🔶 BNB burn enabled for spot fees (0.075% instead of 0.1%)")
+                else:
+                    logger.info("🔶 BNB burn already enabled")
+            except Exception as e:
+                logger.warning(f"Could not check/enable BNB burn: {e}")
+        except Exception as e:
+            logger.warning(f"Error ensuring BNB for fees: {e}")
     
     async def start(self):
         try:
@@ -100,13 +214,9 @@ class GridLiveTrader:
             await telegram.send_message(f"❌ Validation failed: {validation['error']}")
             return
         
-        actual_balance = validation['balance']
-        if self.max_balance and self.max_balance < actual_balance:
-            self.balance = self.max_balance
-            logger.info(f"⚠️ Using limited balance: ${self.balance:.2f} (available: ${actual_balance:.2f})")
-        else:
-            self.balance = actual_balance
+        self.balance = validation['balance']
         self.initial_balance = self.balance
+        logger.info(f"💰 Total account value: ${self.balance:.2f} (USDT: ${validation['usdt_total']:.2f} + ETH: ${validation['eth_value']:.2f})")
         
         mode = '🧪 TESTNET' if self.testnet else '🚀 MAINNET - REAL MONEY'
         logger.info(f"{'='*60}")
@@ -127,6 +237,8 @@ class GridLiveTrader:
         )
         
         self._running = True
+        self._restore_state()
+        self._restore_positions()
         
         try:
             await self._trading_loop()
@@ -138,8 +250,24 @@ class GridLiveTrader:
     
     async def _validate_connection(self) -> dict:
         try:
-            balance = await self.exchange.get_available_balance('USDT')
-            return {'success': True, 'balance': balance}
+            balance_info = await self.exchange.fetch_balance()
+            usdt_total = balance_info.get('USDT', {}).get('total', 0)
+            eth_total = balance_info.get('ETH', {}).get('total', 0)
+
+            eth_value = 0.0
+            if eth_total > 0:
+                ticker = await self.exchange.fetch_ticker(self.symbols[0])
+                eth_value = eth_total * ticker['last']
+
+            total_value = usdt_total + eth_value
+            return {
+                'success': True,
+                'balance': total_value,
+                'usdt_total': usdt_total,
+                'usdt_free': balance_info.get('USDT', {}).get('free', 0),
+                'eth_total': eth_total,
+                'eth_value': eth_value
+            }
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
@@ -181,12 +309,12 @@ class GridLiveTrader:
                 if side == 'SELL' and self.positions[symbol]:
                     pos = self.positions[symbol].pop(0)
                     
-                    total_change = (price - pos.entry_price) * amount
-                    trading_pnl = total_change - fee
-                    holding_pnl = total_change - trading_pnl
+                    gross_pnl = (price - pos.entry_price) * amount
+                    trading_pnl = gross_pnl - fee
+                    holding_pnl = (self.current_prices.get(symbol, price) - pos.entry_price) * amount if pos.entry_price != price else 0
                     
-                    pnl_pct = (total_change / (pos.entry_price * amount)) * 100
-                    self.realized_pnl += total_change
+                    pnl_pct = (gross_pnl / (pos.entry_price * amount)) * 100
+                    self.realized_pnl += gross_pnl
                     self.trading_pnl += trading_pnl
                     self.completed_cycles += 1
                     
@@ -198,9 +326,8 @@ class GridLiveTrader:
                     logger.info(f"   ✅ POSITION CLOSED (Cycle #{self.completed_cycles})")
                     logger.info(f"   Entry Price: ${pos.entry_price:.2f}")
                     logger.info(f"   Exit Price: ${price:.2f}")
-                    logger.info(f"   Total Change: ${total_change:+.2f} ({pnl_pct:+.2f}%)")
+                    logger.info(f"   Gross PnL: ${gross_pnl:+.2f} ({pnl_pct:+.2f}%)")
                     logger.info(f"   Trading PnL: ${trading_pnl:+.2f} (after ${fee:.4f} fee)")
-                    logger.info(f"   Holding PnL: ${holding_pnl:+.2f}")
                     logger.info(f"   Win Rate: {self.winning_trades}/{self.completed_cycles} ({self.winning_trades/self.completed_cycles*100:.1f}%)")
                     logger.info(f"   Total Trading PnL: ${self.trading_pnl:+.2f}")
                 elif side == 'BUY':
@@ -237,7 +364,6 @@ class GridLiveTrader:
                     trade_id, fee, trading_pnl, holding_pnl, usdt_balance, total_value, eth_balance
                 )
                 
-                self.total_trades += 1
                 logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, Trading PnL: ${trading_pnl:.2f}")
             
             if new_trades:
@@ -280,10 +406,21 @@ class GridLiveTrader:
             win_rate = (self.winning_trades / self.completed_cycles * 100) if self.completed_cycles > 0 else 0
             avg_profit_per_cycle = (self.trading_pnl / self.completed_cycles) if self.completed_cycles > 0 else 0
             
+            persisted_initial = self.initial_balance
+            persisted_eth_price = self.initial_eth_price
+            persisted_start_time = datetime.now().isoformat()
+            
+            if os.path.exists(self._balance_file):
+                with open(self._balance_file, 'r') as f:
+                    old_state = json.load(f)
+                    persisted_initial = old_state.get('initial_balance', self.initial_balance)
+                    persisted_eth_price = old_state.get('initial_eth_price', self.initial_eth_price)
+                    persisted_start_time = old_state.get('start_time', persisted_start_time)
+            
             state = {
-                'initial_balance': self.initial_balance,
-                'initial_eth_price': self.initial_eth_price,
-                'start_time': datetime.now().isoformat(),
+                'initial_balance': persisted_initial,
+                'initial_eth_price': persisted_eth_price,
+                'start_time': persisted_start_time,
                 'usdt_balance': usdt_total,
                 'eth_balance': eth_total,
                 'eth_price': current_eth_price,
@@ -300,13 +437,6 @@ class GridLiveTrader:
                 'avg_profit_per_cycle': avg_profit_per_cycle,
                 'last_update': datetime.utcnow().isoformat()
             }
-            
-            if os.path.exists(self._balance_file):
-                with open(self._balance_file, 'r') as f:
-                    old_state = json.load(f)
-                    state['initial_balance'] = old_state.get('initial_balance', self.initial_balance)
-                    state['initial_eth_price'] = old_state.get('initial_eth_price', self.initial_eth_price)
-                    state['start_time'] = old_state.get('start_time', datetime.now().isoformat())
             
             with open(self._balance_file, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -384,6 +514,21 @@ class GridLiveTrader:
             await asyncio.sleep(60)
     
     async def _initialize_grid(self, symbol: str):
+        try:
+            existing_orders = await self.exchange.fetch_open_orders(symbol)
+            if existing_orders:
+                logger.info(f"Cancelling {len(existing_orders)} existing orders before grid init...")
+                for order in existing_orders:
+                    try:
+                        await self.exchange.cancel_order(order['id'], symbol)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel order {order['id']}: {e}")
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"Error cancelling old orders: {e}")
+
+        await self._ensure_bnb_for_fees()
+
         ticker = await self.exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         self.current_prices[symbol] = current_price
@@ -392,18 +537,24 @@ class GridLiveTrader:
             self.initial_eth_price = current_price
             logger.info(f"📌 Initial ETH price recorded: ${current_price:.2f}")
         
-        grid_range_pct = 0.02
+        grid_range_pct = 0.03
         upper_price = current_price * (1 + grid_range_pct)
         lower_price = current_price * (1 - grid_range_pct)
         
-        investment_per_symbol = self.balance * 0.95
+        balance_info = await self.exchange.fetch_balance()
+        usdt_free = balance_info.get('USDT', {}).get('free', 0)
+        investment_per_symbol = usdt_free * 0.95
+        
+        num_grids = max(2, min(4, int(investment_per_symbol / 50)))
+        if investment_per_symbol / max(num_grids, 1) < 5.5:
+            num_grids = max(1, int(investment_per_symbol / 5.5))
         
         from strategies.grid import GridConfig
         config = GridConfig(
             symbol=symbol,
             upper_price=upper_price,
             lower_price=lower_price,
-            num_grids=5,
+            num_grids=num_grids,
             total_investment=investment_per_symbol
         )
         
@@ -432,26 +583,35 @@ class GridLiveTrader:
         strategy = self.strategies[symbol]
         active_levels = strategy.get_active_levels()
         
+        balance_info = await self.exchange.fetch_balance()
+        eth_available = balance_info.get('ETH', {}).get('free', 0)
+        
         for level in active_levels:
             if level.order_id:
                 continue
             
             try:
-                side = 'buy' if level.side == 'buy' else 'sell'
+                side = level.side
                 
-                if side == 'buy':
-                    order = await self.exchange.create_order(
-                        symbol=symbol,
-                        type='limit',
-                        side=side,
-                        amount=level.amount,
-                        price=level.price
-                    )
-                    level.order_id = order['id']
-                    logger.info(f"Placed {side.upper()} order at ${level.price:.2f}, id={order['id']}")
+                if side == 'sell' and eth_available < level.amount:
+                    logger.debug(f"Skipping SELL at ${level.price:.2f}: need {level.amount:.6f} ETH, have {eth_available:.6f}")
+                    continue
+                
+                order = await self.exchange.create_order(
+                    symbol=symbol,
+                    type='limit',
+                    side=side,
+                    amount=level.amount,
+                    price=level.price
+                )
+                level.order_id = order['id']
+                logger.info(f"Placed {side.upper()} order at ${level.price:.2f}, amount={level.amount:.6f}, id={order['id']}")
+                
+                if side == 'sell':
+                    eth_available -= level.amount
                 
             except Exception as e:
-                logger.error(f"Failed to place order at ${level.price:.2f}: {e}")
+                logger.error(f"Failed to place {side.upper()} order at ${level.price:.2f}: {e}")
     
     async def _process_symbol(self, symbol: str):
         ticker = await self.exchange.fetch_ticker(symbol)
@@ -475,19 +635,36 @@ class GridLiveTrader:
         await self._check_and_replace_orders(symbol)
     
     async def _reinitialize_grid(self, symbol: str, current_price: float):
+        try:
+            existing_orders = await self.exchange.fetch_open_orders(symbol)
+            if existing_orders:
+                logger.info(f"Cancelling {len(existing_orders)} orders before rebalance...")
+                for order in existing_orders:
+                    try:
+                        await self.exchange.cancel_order(order['id'], symbol)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel order {order['id']}: {e}")
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"Error cancelling old orders: {e}")
+
         grid_range_pct = 0.03
         upper_price = current_price * (1 + grid_range_pct)
         lower_price = current_price * (1 - grid_range_pct)
         
-        balance = await self.exchange.get_available_balance('USDT')
-        investment = min(balance * 0.8, 2000.0)
+        balance_info = await self.exchange.fetch_balance()
+        usdt_free = balance_info.get('USDT', {}).get('free', 0)
+        investment = usdt_free * 0.95
+        num_grids = max(2, min(4, int(investment / 50)))
+        if investment / max(num_grids, 1) < 5.5:
+            num_grids = max(1, int(investment / 5.5))
         
         from strategies.grid import GridConfig
         config = GridConfig(
             symbol=symbol,
             upper_price=upper_price,
             lower_price=lower_price,
-            num_grids=5,
+            num_grids=num_grids,
             total_investment=investment
         )
         
@@ -510,39 +687,7 @@ class GridLiveTrader:
         await self._place_grid_orders(symbol)
     
     async def _process_fill(self, symbol: str, fill: dict):
-        side = fill['side'].upper()
-        price = fill['price']
-        amount = fill['amount']
-        value = fill['value']
-        
-        if side == 'BUY':
-            self.positions[symbol].append(LiveGridPosition(
-                symbol=symbol,
-                side='long',
-                entry_price=price,
-                amount=amount,
-                order_id=fill.get('order_id', ''),
-                opened_at=datetime.utcnow()
-            ))
-            logger.info(f"📥 BUY filled: {symbol} @ ${price:.2f}")
-        else:
-            pnl = 0.0
-            if self.positions[symbol]:
-                pos = self.positions[symbol].pop(0)
-                pnl = (price - pos.entry_price) * amount
-                self.realized_pnl += pnl
-            logger.info(f"📤 SELL filled: {symbol} @ ${price:.2f}, PnL: ${pnl:.2f}")
-        
-        self.total_trades += 1
-        
-        self._log_trade(symbol, side, price, amount, value, pnl)
-        
-        await telegram.send_message(
-            f"{'📥' if side == 'BUY' else '📤'} {side}: {symbol}\n"
-            f"Price: ${price:.2f}\n"
-            f"Amount: {amount:.6f}\n"
-            f"Value: ${value:.2f}"
-        )
+        logger.debug(f"Grid fill detected: {fill['side']} @ ${fill['price']:.2f} - will be synced from exchange")
     
     async def _check_and_replace_orders(self, symbol: str):
         try:
@@ -587,13 +732,7 @@ class GridLiveTrader:
             logger.error(f"Error checking orders for {symbol}: {e}")
     
     def _log_trade(self, symbol: str, side: str, price: float, amount: float, value: float, pnl: float):
-        with open(self._trades_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.utcnow().isoformat(),
-                symbol, side, price, amount, value,
-                '', 'filled', pnl, self.balance
-            ])
+        pass
     
     async def stop(self):
         self._running = False

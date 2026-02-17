@@ -71,8 +71,7 @@ async def run_grid_live(args):
     
     trader = GridLiveTrader(
         symbols=grid_symbols,
-        testnet=not use_mainnet,
-        max_balance=max_balance
+        testnet=not use_mainnet
     )
     
     try:

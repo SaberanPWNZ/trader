@@ -278,15 +278,6 @@ class LearningTelegramBot:
         except Exception as e:
             await self._send_message(f"❌ Deploy failed: {e}")
 
-    def _read_initial_balance(self) -> float:
-        state_file = "data/grid_state.json"
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
-                state = json.load(f)
-                if isinstance(state, dict) and "initial_balance" in state:
-                    return float(state["initial_balance"])
-        return 2000.0
-
     def _count_open_positions(self, trades: list) -> dict:
         positions = {}
         for trade in trades:
@@ -300,7 +291,7 @@ class LearningTelegramBot:
                     positions[symbol].pop(0)
         return {s: sum(vals) for s, vals in positions.items() if vals}
 
-    async def _get_testnet_data(self):
+    async def _get_live_data(self):
         from exchange.factory import create_exchange
         
         ex = create_exchange(testnet=False)
@@ -318,13 +309,17 @@ class LearningTelegramBot:
         total_value = usdt_total + eth_value
         
         state_file = "data/grid_live_balance.json"
-        initial = 10000.0
+        initial = total_value
         start_time = None
+        trading_pnl = 0
+        holding_pnl = 0
         if os.path.exists(state_file):
             with open(state_file, 'r') as f:
                 state = json.load(f)
-                initial = state.get("initial_balance", 10000.0)
+                initial = state.get("initial_balance", total_value)
                 start_time = state.get("start_time")
+                trading_pnl = state.get("trading_pnl", 0)
+                holding_pnl = state.get("holding_pnl", 0)
         
         orders = await ex.fetch_open_orders('ETH/USDT')
         
@@ -356,6 +351,8 @@ class LearningTelegramBot:
             'initial_balance': initial,
             'total_pnl': total_pnl,
             'pnl_percent': pnl_percent,
+            'trading_pnl': trading_pnl,
+            'holding_pnl': holding_pnl,
             'start_time': start_time,
             'orders': orders,
             'trades': all_trades
@@ -363,15 +360,17 @@ class LearningTelegramBot:
 
     async def _cmd_balance(self, args: list) -> None:
         try:
-            data = await self._get_testnet_data()
+            data = await self._get_live_data()
             
-            pnl = data['total_value'] - data['initial_balance']
-            pnl_pct = (pnl / data['initial_balance']) * 100 if data['initial_balance'] > 0 else 0
+            trading_pnl = data.get('trading_pnl', 0)
+            holding_pnl = data.get('holding_pnl', 0)
+            total_pnl = data['total_pnl']
+            pnl_pct = data['pnl_percent']
             
             buy_count = sum(1 for t in data['trades'] if t['side'] == 'buy')
             sell_count = sum(1 for t in data['trades'] if t['side'] == 'sell')
             
-            roi_emoji = "✅" if pnl >= 0 else "⚠️" if pnl >= -50 else "🚨"
+            roi_emoji = "✅" if total_pnl >= 0 else "⚠️" if total_pnl >= -50 else "🚨"
             
             lines = [
                 "💰 <b>Portfolio Balance (MAINNET 🔴)</b>",
@@ -382,8 +381,9 @@ class LearningTelegramBot:
                 "",
                 f"{roi_emoji} <b>Performance:</b>",
                 f"   Initial: ${data['initial_balance']:,.2f}",
-                f"   Profit: ${pnl:+,.2f}",
-                f"   ROI: {pnl_pct:+.2f}%",
+                f"   Trading PnL: ${trading_pnl:+.2f}",
+                f"   Holding PnL: ${holding_pnl:+.2f}",
+                f"   Total: ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                 "",
                 f"<b>📈 Activity:</b> {len(data['trades'])} trades ({buy_count}↗ {sell_count}↘)",
                 f"<b>📋 Open Orders:</b> {len(data['orders'])}",
@@ -399,7 +399,7 @@ class LearningTelegramBot:
 
     async def _cmd_grid(self, args: list) -> None:
         try:
-            data = await self._get_testnet_data()
+            data = await self._get_live_data()
             
             lines = ["📊 <b>Grid Trading Status (MAINNET 🔴)</b>\n"]
             
@@ -423,7 +423,7 @@ class LearningTelegramBot:
 
     async def _cmd_trades(self, args: list) -> None:
         try:
-            data = await self._get_testnet_data()
+            data = await self._get_live_data()
             limit = int(args[0]) if args and args[0].isdigit() else 10
             
             trades = data['trades'][-limit:]
@@ -432,7 +432,7 @@ class LearningTelegramBot:
                 await self._send_message("❌ No trades yet")
                 return
             
-            lines = [f"📈 <b>Last {len(trades)} Trades (Testnet)</b>\n"]
+            lines = [f"📈 <b>Last {len(trades)} Trades (MAINNET 🔴)</b>\n"]
             
             from datetime import datetime
             for trade in trades:
@@ -459,8 +459,10 @@ class LearningTelegramBot:
     
     async def _cmd_profit(self, args: list) -> None:
         try:
-            data = await self._get_testnet_data()
+            data = await self._get_live_data()
             
+            trading_pnl = data.get('trading_pnl', 0)
+            holding_pnl = data.get('holding_pnl', 0)
             total_pnl = data['total_pnl']
             pnl_pct = data['pnl_percent']
             usdt = data['usdt_balance']
@@ -475,7 +477,9 @@ class LearningTelegramBot:
                 f"<b>Position:</b> {eth:.4f} ETH (${eth_val:,.2f})",
                 f"<b>Total Value:</b> ${total:,.2f}",
                 "",
-                f"<b>Realized PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)",
+                f"<b>Trading PnL:</b> ${trading_pnl:+.2f}",
+                f"<b>Holding PnL:</b> ${holding_pnl:+.2f}",
+                f"<b>Total PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                 f"<b>Trades:</b> {len(data['trades'])}",
             ]
             
@@ -549,7 +553,7 @@ class LearningTelegramBot:
 
     async def _cmd_daily(self, args: list) -> None:
         try:
-            data = await self._get_testnet_data()
+            data = await self._get_live_data()
             
             total_pnl = data['total_pnl']
             pnl_pct = data['pnl_percent']
@@ -567,7 +571,7 @@ class LearningTelegramBot:
                 date = datetime.fromtimestamp(t['timestamp']/1000).date()
                 trades_by_date[date].append(t)
             
-            lines = ["📅 <b>Daily Report (Testnet)</b>", ""]
+            lines = ["📅 <b>Daily Report (MAINNET 🔴)</b>", ""]
             
             for date in sorted(trades_by_date.keys()):
                 day_trades = trades_by_date[date]
