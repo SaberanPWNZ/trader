@@ -83,7 +83,7 @@ def show_stats():
         print("📝 ОСТАННІ ТРЕЙДИ:")
         print("="*80)
         
-        df = pd.read_csv(trades_file)
+        df = pd.read_csv(trades_file, on_bad_lines='skip')
         if not df.empty:
             last_trades = df.tail(10)
             print(f"\nПоказано останні {len(last_trades)} трейдів:")
