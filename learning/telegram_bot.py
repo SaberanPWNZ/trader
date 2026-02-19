@@ -293,21 +293,52 @@ class LearningTelegramBot:
 
     async def _get_live_data(self):
         from exchange.factory import create_exchange
-        
+
+        symbols = settings.trading.symbols
         ex = create_exchange(testnet=False)
         await ex.connect()
-        
+
         balance = await ex.fetch_balance()
-        ticker = await ex.fetch_ticker('ETH/USDT')
-        eth_price = ticker['last']
-        
+
         usdt_total = balance.get('USDT', {}).get('total', 0)
         usdt_free = balance.get('USDT', {}).get('free', 0)
         usdt_used = balance.get('USDT', {}).get('used', 0)
-        eth_total = balance.get('ETH', {}).get('total', 0)
-        eth_value = eth_total * eth_price
-        total_value = usdt_total + eth_value
-        
+
+        base_holdings = {}
+        total_base_value = 0
+        base_prices = {}
+        all_orders = []
+        all_trades = []
+
+        for symbol in symbols:
+            base = symbol.split('/')[0]
+            ticker = await ex.fetch_ticker(symbol)
+            price = ticker['last']
+            base_prices[base] = price
+
+            base_total = balance.get(base, {}).get('total', 0)
+            base_value = base_total * price
+            base_holdings[base] = {'total': base_total, 'value': base_value, 'price': price}
+            total_base_value += base_value
+
+            try:
+                orders = await ex.fetch_open_orders(symbol)
+                all_orders.extend(orders)
+            except Exception:
+                pass
+
+            since = None
+            for _ in range(10):
+                trades = await ex.fetch_my_trades(symbol, since=since, limit=1000)
+                if not trades:
+                    break
+                all_trades.extend(trades)
+                if len(trades) < 100:
+                    break
+                since = trades[-1]['timestamp'] + 1
+
+        total_value = usdt_total + total_base_value
+
         state_file = "data/grid_live_balance.json"
         initial = total_value
         start_time = None
@@ -320,33 +351,21 @@ class LearningTelegramBot:
                 start_time = state.get("start_time")
                 trading_pnl = state.get("trading_pnl", 0)
                 holding_pnl = state.get("holding_pnl", 0)
-        
-        orders = await ex.fetch_open_orders('ETH/USDT')
-        
-        all_trades = []
-        since = None
-        for _ in range(10):
-            trades = await ex.fetch_my_trades('ETH/USDT', since=since, limit=1000)
-            if not trades:
-                break
-            all_trades.extend(trades)
-            if len(trades) < 100:
-                break
-            since = trades[-1]['timestamp'] + 1
-        
+
         await ex.disconnect()
-        
+
         total_pnl = total_value - initial
         pnl_percent = (total_pnl / initial * 100) if initial > 0 else 0
-        
+
         return {
+            'symbols': symbols,
             'usdt_total': usdt_total,
             'usdt_balance': usdt_total,
             'usdt_free': usdt_free,
             'usdt_used': usdt_used,
-            'eth_total': eth_total,
-            'eth_value': eth_value,
-            'eth_price': eth_price,
+            'base_holdings': base_holdings,
+            'base_prices': base_prices,
+            'total_base_value': total_base_value,
             'total_value': total_value,
             'initial_balance': initial,
             'total_pnl': total_pnl,
@@ -354,30 +373,35 @@ class LearningTelegramBot:
             'trading_pnl': trading_pnl,
             'holding_pnl': holding_pnl,
             'start_time': start_time,
-            'orders': orders,
+            'orders': all_orders,
             'trades': all_trades
         }
 
     async def _cmd_balance(self, args: list) -> None:
         try:
             data = await self._get_live_data()
-            
+
             trading_pnl = data.get('trading_pnl', 0)
             holding_pnl = data.get('holding_pnl', 0)
             total_pnl = data['total_pnl']
             pnl_pct = data['pnl_percent']
-            
+
             buy_count = sum(1 for t in data['trades'] if t['side'] == 'buy')
             sell_count = sum(1 for t in data['trades'] if t['side'] == 'sell')
-            
+
             roi_emoji = "✅" if total_pnl >= 0 else "⚠️" if total_pnl >= -50 else "🚨"
-            
+
             lines = [
                 "💰 <b>Portfolio Balance (MAINNET 🔴)</b>",
                 "",
                 f"💎 <b>Total Value:</b> ${data['total_value']:,.2f}",
                 f"   ├ 💵 USDT: ${data['usdt_total']:,.2f}",
-                f"   └ 🪙 ETH: {data['eth_total']:.4f} (${data['eth_value']:,.2f})",
+            ]
+
+            for base, info in data['base_holdings'].items():
+                lines.append(f"   ├ 🪙 {base}: {info['total']:.4f} (${info['value']:,.2f})")
+
+            lines.extend([
                 "",
                 f"{roi_emoji} <b>Performance:</b>",
                 f"   Initial: ${data['initial_balance']:,.2f}",
@@ -387,12 +411,16 @@ class LearningTelegramBot:
                 "",
                 f"<b>📈 Activity:</b> {len(data['trades'])} trades ({buy_count}↗ {sell_count}↘)",
                 f"<b>📋 Open Orders:</b> {len(data['orders'])}",
-                "",
-                f"<i>ETH Price: ${data['eth_price']:,.2f}</i>"
-            ]
-            
+            ])
+
+            price_parts = []
+            for base, info in data['base_holdings'].items():
+                price_parts.append(f"{base} ${info['price']:,.2f}")
+            if price_parts:
+                lines.append(f"\n<i>{' | '.join(price_parts)}</i>")
+
             await self._send_message("\n".join(lines))
-            
+
         except Exception as e:
             logger.error(f"Balance command error: {e}")
             await self._send_message(f"❌ Error: {e}")
@@ -400,23 +428,31 @@ class LearningTelegramBot:
     async def _cmd_grid(self, args: list) -> None:
         try:
             data = await self._get_live_data()
-            
+
             lines = ["📊 <b>Grid Trading Status (MAINNET 🔴)</b>\n"]
-            
-            lines.append(f"<b>ETH/USDT</b>")
-            lines.append(f"├ Price: ${data['eth_price']:,.2f}")
-            lines.append(f"├ Position: {data['eth_total']:.4f} ETH (${data['eth_value']:,.2f})")
-            lines.append(f"└ Orders: {len(data['orders'])}\n")
-            
-            if data['orders']:
-                lines.append("<b>📋 Open Orders:</b>")
-                for o in data['orders']:
-                    side = o['side'].upper()
-                    icon = "🟢" if side == "BUY" else "🔴"
-                    lines.append(f"   {icon} {side} @ ${o['price']:,.2f}")
-            
+
+            for symbol in data['symbols']:
+                base = symbol.split('/')[0]
+                info = data['base_holdings'].get(base, {})
+                price = info.get('price', 0)
+                total = info.get('total', 0)
+                value = info.get('value', 0)
+                sym_orders = [o for o in data['orders'] if o.get('symbol') == symbol]
+
+                lines.append(f"<b>{symbol}</b>")
+                lines.append(f"├ Price: ${price:,.2f}")
+                lines.append(f"├ Position: {total:.4f} {base} (${value:,.2f})")
+                lines.append(f"└ Orders: {len(sym_orders)}\n")
+
+                if sym_orders:
+                    for o in sym_orders:
+                        side = o['side'].upper()
+                        icon = "🟢" if side == "BUY" else "🔴"
+                        lines.append(f"   {icon} {side} {o['remaining']:.3f} @ ${o['price']:,.2f}")
+                    lines.append("")
+
             await self._send_message("\n".join(lines))
-            
+
         except Exception as e:
             logger.error(f"Grid command error: {e}")
             await self._send_message(f"❌ Error: {e}")
@@ -425,33 +461,34 @@ class LearningTelegramBot:
         try:
             data = await self._get_live_data()
             limit = int(args[0]) if args and args[0].isdigit() else 10
-            
-            trades = data['trades'][-limit:]
-            
+
+            trades = sorted(data['trades'], key=lambda t: t['timestamp'])[-limit:]
+
             if not trades:
                 await self._send_message("❌ No trades yet")
                 return
-            
+
             lines = [f"📈 <b>Last {len(trades)} Trades (MAINNET 🔴)</b>\n"]
-            
+
             from datetime import datetime
             for trade in trades:
                 side_emoji = "🟢" if trade['side'] == 'buy' else "🔴"
                 ts = datetime.fromtimestamp(trade['timestamp']/1000).strftime('%H:%M')
                 price = float(trade['price'])
                 cost = float(trade['cost'])
-                
+                sym = trade.get('symbol', '').split('/')[0]
+
                 if price >= 1000:
                     price_str = f"${price:,.0f}"
                 elif price >= 1:
                     price_str = f"${price:,.2f}"
                 else:
                     price_str = f"${price:.4f}"
-                
+
                 lines.append(
-                    f"{side_emoji} <code>{ts}</code> ETH {price_str} ${cost:,.0f}"
+                    f"{side_emoji} <code>{ts}</code> {sym} {price_str} ${cost:,.0f}"
                 )
-            
+
             await self._send_message("\n".join(lines))
         except Exception as e:
             logger.error(f"Trades command error: {e}")
@@ -460,31 +497,33 @@ class LearningTelegramBot:
     async def _cmd_profit(self, args: list) -> None:
         try:
             data = await self._get_live_data()
-            
+
             trading_pnl = data.get('trading_pnl', 0)
             holding_pnl = data.get('holding_pnl', 0)
             total_pnl = data['total_pnl']
             pnl_pct = data['pnl_percent']
             usdt = data['usdt_balance']
-            eth = data['eth_total']
-            eth_val = data['eth_value']
-            total = usdt + eth_val
-            
+
             lines = [
                 "💰 <b>Profit Report (MAINNET 🔴)</b>",
                 "",
                 f"<b>Balance:</b> ${usdt:,.2f} USDT",
-                f"<b>Position:</b> {eth:.4f} ETH (${eth_val:,.2f})",
-                f"<b>Total Value:</b> ${total:,.2f}",
+            ]
+
+            for base, info in data['base_holdings'].items():
+                lines.append(f"<b>Position:</b> {info['total']:.4f} {base} (${info['value']:,.2f})")
+
+            lines.extend([
+                f"<b>Total Value:</b> ${data['total_value']:,.2f}",
                 "",
                 f"<b>Trading PnL:</b> ${trading_pnl:+.2f}",
                 f"<b>Holding PnL:</b> ${holding_pnl:+.2f}",
                 f"<b>Total PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                 f"<b>Trades:</b> {len(data['trades'])}",
-            ]
-            
+            ])
+
             await self._send_message("\n".join(lines))
-            
+
         except Exception as e:
             logger.error(f"Profit command error: {e}")
             await self._send_message(f"❌ Error: {e}")
@@ -495,29 +534,28 @@ class LearningTelegramBot:
             if not os.path.exists(state_file):
                 await self._send_message("❌ No trading data yet")
                 return
-            
+
             with open(state_file, 'r') as f:
                 state = json.load(f)
-            
+
             initial = state.get('initial_balance', 0)
-            initial_eth_price = state.get('initial_eth_price', 0)
-            current_eth_price = state.get('eth_price', 0)
             total_value = state.get('total_value', 0)
             trading_pnl = state.get('trading_pnl', 0)
             holding_pnl = state.get('holding_pnl', 0)
-            realized_pnl = state.get('realized_pnl', 0)
             total_fees = state.get('total_fees_paid', 0)
-            
+
             cycles = state.get('completed_cycles', 0)
             wins = state.get('winning_trades', 0)
             losses = state.get('losing_trades', 0)
             win_rate = state.get('win_rate', 0)
             avg_profit = state.get('avg_profit_per_cycle', 0)
-            
-            eth_price_change = ((current_eth_price - initial_eth_price) / initial_eth_price * 100) if initial_eth_price > 0 else 0
+
+            symbols = state.get('symbols', settings.trading.symbols)
+            initial_prices = state.get('initial_base_prices', {})
+
             total_pnl = total_value - initial
             total_pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
-            
+
             lines = [
                 "📊 <b>Детальна статистика торгівлі (MAINNET 🔴)</b>",
                 "",
@@ -534,19 +572,26 @@ class LearningTelegramBot:
                 "",
                 "<b>💰 БАЛАНС:</b>",
                 f"├ Initial: ${initial:.2f}",
-                f"├ Current: <b>${total_value:.2f}</b>",
-                f"└ ETH price: ${initial_eth_price:.0f} → ${current_eth_price:.0f} ({eth_price_change:+.1f}%)",
+                f"└ Current: <b>${total_value:.2f}</b>",
             ]
-            
+
+            for sym in symbols:
+                base = sym.split('/')[0]
+                ip = initial_prices.get(base, 0)
+                cp = state.get(f'{base.lower()}_price', ip)
+                if ip > 0:
+                    change = ((cp - ip) / ip * 100)
+                    lines.append(f"   {base}: ${ip:.2f} → ${cp:.2f} ({change:+.1f}%)")
+
             if cycles > 0:
                 lines.append("")
                 lines.append("<b>📌 ПОЯСНЕННЯ:</b>")
                 lines.append("• <b>Trading PnL</b> = прибуток від циклів купівлі-продажу")
-                lines.append("• <b>Holding PnL</b> = зміна вартості через ціну ETH")
+                lines.append("• <b>Holding PnL</b> = зміна вартості через ціну")
                 lines.append("• <b>Win Rate</b> = % прибуткових циклів")
-            
+
             await self._send_message("\n".join(lines))
-            
+
         except Exception as e:
             logger.error(f"Stats command error: {e}")
             await self._send_message(f"❌ Error: {e}")
@@ -554,42 +599,38 @@ class LearningTelegramBot:
     async def _cmd_daily(self, args: list) -> None:
         try:
             data = await self._get_live_data()
-            
+
             total_pnl = data['total_pnl']
             pnl_pct = data['pnl_percent']
-            usdt = data['usdt_balance']
-            eth = data['eth_total']
-            eth_val = data['eth_value']
-            total = usdt + eth_val
             trades = data['trades']
-            
+
             from collections import defaultdict
             from datetime import datetime
-            
+
             trades_by_date = defaultdict(list)
             for t in trades:
                 date = datetime.fromtimestamp(t['timestamp']/1000).date()
                 trades_by_date[date].append(t)
-            
+
             lines = ["📅 <b>Daily Report (MAINNET 🔴)</b>", ""]
-            
+
             for date in sorted(trades_by_date.keys()):
                 day_trades = trades_by_date[date]
                 buys = sum(1 for t in day_trades if t['side'] == 'buy')
                 sells = sum(1 for t in day_trades if t['side'] == 'sell')
                 date_str = date.strftime('%d.%m.%Y')
-                
+
                 lines.append(f"<b>{date_str}</b>")
                 lines.append(f"   Trades: {len(day_trades)} (🟢{buys}↗ 🔴{sells}↘)")
                 lines.append("")
-            
+
             lines.append("━━━━━━━━━━━━━━━━")
-            lines.append(f"<b>Total Value:</b> ${total:,.2f}")
+            lines.append(f"<b>Total Value:</b> ${data['total_value']:,.2f}")
             lines.append(f"<b>PnL:</b> ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
             lines.append(f"<b>Total Trades:</b> {len(trades)}")
-            
+
             await self._send_message("\n".join(lines))
-            
+
         except Exception as e:
             logger.error(f"Daily command error: {e}")
             await self._send_message(f"❌ Error: {e}")

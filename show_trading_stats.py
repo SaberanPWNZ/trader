@@ -34,46 +34,45 @@ def show_stats():
         win_rate = state.get('win_rate', 0)
         avg_profit = state.get('avg_profit_per_cycle', 0)
         
-        eth_balance = state.get('eth_balance', 0)
         usdt_balance = state.get('usdt_balance', 0)
+        base_balances = state.get('base_balances', {})
+        symbols = state.get('symbols', [])
         
-        eth_price_change = ((current_eth_price - initial_eth_price) / initial_eth_price * 100) if initial_eth_price > 0 else 0
         total_pnl = total_value - initial
         total_pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
         
-        print("\n💵 ПРИБУТКИ:")
+        print("\\n💵 ПРИБУТКИ:")
         print(f"  Trading PnL:  ${trading_pnl:+10.2f}  (прибуток від торгівлі)")
-        print(f"  Holding PnL:  ${holding_pnl:+10.2f}  (зміна через ціну ETH)")
+        print(f"  Holding PnL:  ${holding_pnl:+10.2f}  (зміна через ціну базового активу)")
         print(f"  Fees Paid:    ${-total_fees:10.2f}")
         print(f"  {'─'*45}")
         print(f"  Total PnL:    ${total_pnl:+10.2f}  ({total_pnl_pct:+.2f}%)")
         
-        print("\n📈 ТОРГІВЛЯ:")
+        print("\\n📈 ТОРГІВЛЯ:")
         print(f"  Completed Cycles:    {cycles}")
         print(f"  Winning Trades:      {wins} ({win_rate:.1f}%)")
         print(f"  Losing Trades:       {losses}")
         print(f"  Avg Profit/Cycle:    ${avg_profit:+.2f}")
         
-        print("\n💰 БАЛАНС:")
+        print("\\n💰 БАЛАНС:")
         print(f"  Initial Balance:     ${initial:,.2f}")
         print(f"  Current Balance:     ${total_value:,.2f}")
         print(f"  USDT:                ${usdt_balance:,.2f}")
-        print(f"  ETH:                 {eth_balance:.6f} ETH (${eth_balance * current_eth_price:.2f})")
+        for base, info in base_balances.items():
+            base_total = info.get('total', 0)
+            base_value = info.get('value', 0)
+            base_price = info.get('price', 0)
+            print(f"  {base}:                {base_total:.6f} (${base_value:.2f} @ ${base_price:.2f})")
         
-        print("\n📊 ЦІНА ETH:")
-        print(f"  Start Price:         ${initial_eth_price:.2f}")
-        print(f"  Current Price:       ${current_eth_price:.2f}")
-        print(f"  Price Change:        {eth_price_change:+.2f}%")
-        
-        print("\n" + "="*80)
+        print("\\n" + "="*80)
         print("📌 ПОЯСНЕННЯ:")
         print("="*80)
         print("• Trading PnL  = Реальний прибуток від купівлі-продажу (мінус комісії)")
-        print("• Holding PnL  = Зміна вартості через зростання/падіння ціни ETH")
+        print("• Holding PnL  = Зміна вартості через зростання/падіння ціни базового активу")
         print("• Total PnL    = Trading PnL + Holding PnL")
         print("• Win Rate     = Відсоток прибуткових циклів (купівля → продаж)")
-        print("\n✅ Trading PnL показує РЕАЛЬНИЙ заробіток від торгової стратегії")
-        print("   (не залежить від того, чи зросла ціна ETH чи впала)")
+        print("\\n✅ Trading PnL показує РЕАЛЬНИЙ заробіток від торгової стратегії")
+        print("   (не залежить від того, чи зросла ціна активу чи впала)")
         
     else:
         print("\n❌ Файл статистики не знайдено")
@@ -86,12 +85,14 @@ def show_stats():
         df = pd.read_csv(trades_file, on_bad_lines='skip')
         if not df.empty:
             last_trades = df.tail(10)
-            print(f"\nПоказано останні {len(last_trades)} трейдів:")
+            print(f"\\nПоказано останні {len(last_trades)} трейдів:")
             print()
             
             for _, trade in last_trades.iterrows():
                 ts = datetime.fromisoformat(trade['timestamp'].replace('Z', '')).strftime('%m-%d %H:%M')
                 side = trade['side']
+                symbol = trade.get('symbol', 'UNKNOWN')
+                base = symbol.split('/')[0] if '/' in str(symbol) else 'ASSET'
                 price = float(trade['price'])
                 amount = float(trade['amount'])
                 
@@ -99,10 +100,10 @@ def show_stats():
                     trading_pnl = float(trade['trading_pnl'])
                     side_emoji = "🔴" if side == 'SELL' else "🟢"
                     pnl_str = f"PnL: ${trading_pnl:+.2f}" if side == 'SELL' else ""
-                    print(f"  {side_emoji} {ts} | {side:4s} | {amount:.6f} ETH @ ${price:7.2f} | {pnl_str}")
+                    print(f"  {side_emoji} {ts} | {side:4s} | {amount:.4f} {base} @ ${price:7.2f} | {pnl_str}")
                 else:
                     side_emoji = "🔴" if side == 'SELL' else "🟢"
-                    print(f"  {side_emoji} {ts} | {side:4s} | {amount:.6f} ETH @ ${price:7.2f}")
+                    print(f"  {side_emoji} {ts} | {side:4s} | {amount:.4f} {base} @ ${price:7.2f}")
         else:
             print("\n❌ Ще немає трейдів")
     

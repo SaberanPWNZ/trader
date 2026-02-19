@@ -26,7 +26,7 @@ class ExchangeConfig:
 @dataclass
 class TradingConfig:
     """Trading parameters configuration."""
-    symbols: List[str] = field(default_factory=lambda: ["ETH/USDT"])
+    symbols: List[str] = field(default_factory=lambda: ["SOL/USDT"])
     timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
     default_timeframe: str = "1h"
     mode: str = "paper"
@@ -178,7 +178,15 @@ class DatabaseConfig:
 
 @dataclass
 class GridConfig:
-    """Grid trading rebalancing configuration."""
+    """Grid trading configuration."""
+    grid_range_pct: float = 0.018
+    max_grids: int = 4
+    min_grids: int = 2
+    min_order_value: float = 5.5
+    investment_ratio: float = 0.50
+    max_open_positions: int = 4
+    rebalance_threshold_positions: int = 5
+    
     rebalance_interval_hours: float = field(default_factory=lambda: {
         "BTC/USDT": 12.0,
         "ETH/USDT": 12.0,
@@ -204,8 +212,7 @@ class GridConfig:
     enable_portfolio_protection: bool = True
     pause_after_stop_loss_hours: int = 24
     
-    max_open_positions: int = 10
-    min_cash_reserve_percent: float = 20.0
+    min_cash_reserve_percent: float = 50.0
     max_position_cost_percent: float = 10.0
     
     def get_interval_hours(self, symbol: str) -> float:
