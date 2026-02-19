@@ -17,7 +17,9 @@ from monitoring.logger import setup_logging
 from monitoring.alerts import telegram
 
 
-async def fetch_all_trades(exchange, symbol='ETH/USDT'):
+async def fetch_all_trades(exchange, symbol: str = None):
+    if symbol is None:
+        symbol = settings.trading.symbols[0] if settings.trading.symbols else 'SOL/USDT'
     all_trades = []
     since = None
     for _ in range(10):
@@ -166,20 +168,24 @@ async def show_testnet_status():
     from exchange.factory import create_exchange
     from datetime import datetime
     
+    symbols = settings.trading.symbols
+    symbol = symbols[0] if symbols else 'SOL/USDT'
+    base = symbol.split('/')[0]
+    
     ex = create_exchange(testnet=True)
     await ex.connect()
     
     balance = await ex.fetch_balance()
-    ticker = await ex.fetch_ticker('ETH/USDT')
-    eth_price = ticker['last']
+    ticker = await ex.fetch_ticker(symbol)
+    base_price = ticker['last']
     
     usdt_total = balance.get('USDT', {}).get('total', 0)
     usdt_free = balance.get('USDT', {}).get('free', 0)
     usdt_used = balance.get('USDT', {}).get('used', 0)
-    eth_total = balance.get('ETH', {}).get('total', 0)
-    eth_free = balance.get('ETH', {}).get('free', 0)
-    eth_value = eth_total * eth_price
-    total_value = usdt_total + eth_value
+    base_total = balance.get(base, {}).get('total', 0)
+    base_free = balance.get(base, {}).get('free', 0)
+    base_value = base_total * base_price
+    total_value = usdt_total + base_value
     
     state_file = "data/grid_live_balance.json"
     state = {"initial_balance": 10000.0, "start_time": datetime.now().isoformat()}
@@ -195,21 +201,21 @@ async def show_testnet_status():
     pnl = total_value - initial
     pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
     
-    orders = await ex.fetch_open_orders('ETH/USDT')
-    trades = await fetch_all_trades(ex, 'ETH/USDT')
+    orders = await ex.fetch_open_orders(symbol)
+    trades = await fetch_all_trades(ex, symbol)
     
     buy_count = sum(1 for t in trades if t['side'] == 'buy')
     sell_count = sum(1 for t in trades if t['side'] == 'sell')
     
     print()
     print("╔═══════════════════════════════════════════════════════╗")
-    print("║       📊 BINANCE TESTNET - GRID LIVE STATUS           ║")
+    print(f"║       📊 BINANCE TESTNET - {symbol} STATUS           ║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  💵 USDT Balance:     ${usdt_total:>10,.2f}                  ║")
     print(f"║     ├─ Free:         ${usdt_free:>10,.2f}                  ║")
     print(f"║     └─ In Orders:    ${usdt_used:>10,.2f}                  ║")
-    print(f"║  🪙 ETH Balance:      {eth_total:>10.6f} (${eth_value:,.2f})     ║")
-    print(f"║  📈 ETH Price:        ${eth_price:>10,.2f}                  ║")
+    print(f"║  🪙 {base} Balance:      {base_total:>10.6f} (${base_value:,.2f})     ║")
+    print(f"║  📈 {base} Price:        ${base_price:>10,.2f}                  ║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  📦 Initial Balance:  ${initial:>10,.2f}                  ║")
     print(f"║  💰 Current Value:    ${total_value:>10,.2f}                  ║")
@@ -224,7 +230,7 @@ async def show_testnet_status():
     for o in orders:
         side = o['side'].upper()
         icon = "🟢" if side == "BUY" else "🔴"
-        print(f"║     {icon} {side:4} @ ${o['price']:>8.2f} - {o['amount']:.4f} ETH           ║")
+        print(f"║     {icon} {side:4} @ ${o['price']:>8.2f} - {o['amount']:.4f} {base}           ║")
     print("╚═══════════════════════════════════════════════════════╝")
     print()
     
@@ -235,14 +241,18 @@ async def show_testnet_trades():
     from exchange.factory import create_exchange
     from datetime import datetime
     
+    symbols = settings.trading.symbols
+    symbol = symbols[0] if symbols else 'SOL/USDT'
+    base = symbol.split('/')[0]
+    
     ex = create_exchange(testnet=True)
     await ex.connect()
     
-    trades = await fetch_all_trades(ex, 'ETH/USDT')
+    trades = await fetch_all_trades(ex, symbol)
     
     print()
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║          📜 BINANCE TESTNET - RECENT TRADES                   ║")
+    print(f"║          📜 BINANCE TESTNET - {symbol} TRADES                  ║")
     print(f"║          Total Trades: {len(trades):>5}                              ║")
     print("╠═══════════════════════════════════════════════════════════════╣")
     
@@ -256,7 +266,7 @@ async def show_testnet_trades():
             ts = datetime.fromtimestamp(t['timestamp']/1000).strftime('%m-%d %H:%M')
             cost = t['cost']
             total_volume += cost
-            print(f"║  {ts} {icon} {side:4} {t['amount']:.4f} ETH @ ${t['price']:.2f} = ${cost:.2f}  ║")
+            print(f"║  {ts} {icon} {side:4} {t['amount']:.4f} {base} @ ${t['price']:.2f} = ${cost:.2f}  ║")
         print("╠═══════════════════════════════════════════════════════════════╣")
         print(f"║  Total Volume: ${total_volume:,.2f}                                     ║")
     
@@ -273,17 +283,21 @@ async def show_testnet_daily():
     from datetime import datetime, timedelta
     from monitoring.alerts import telegram
     
+    symbols = settings.trading.symbols
+    symbol = symbols[0] if symbols else 'SOL/USDT'
+    base = symbol.split('/')[0]
+    
     ex = create_exchange(testnet=True)
     await ex.connect()
     
     balance = await ex.fetch_balance()
-    ticker = await ex.fetch_ticker('ETH/USDT')
-    eth_price = ticker['last']
+    ticker = await ex.fetch_ticker(symbol)
+    base_price = ticker['last']
     
     usdt_total = balance.get('USDT', {}).get('total', 0)
-    eth_total = balance.get('ETH', {}).get('total', 0)
-    eth_value = eth_total * eth_price
-    total_value = usdt_total + eth_value
+    base_total = balance.get(base, {}).get('total', 0)
+    base_value = base_total * base_price
+    total_value = usdt_total + base_value
     
     state_file = "data/grid_live_balance.json"
     state = {"initial_balance": total_value}
@@ -298,8 +312,8 @@ async def show_testnet_daily():
     pnl = total_value - initial
     pnl_pct = (pnl / initial) * 100 if initial > 0 else 0
     
-    trades = await fetch_all_trades(ex, 'ETH/USDT')
-    orders = await ex.fetch_open_orders('ETH/USDT')
+    trades = await fetch_all_trades(ex, symbol)
+    orders = await ex.fetch_open_orders(symbol)
     
     today = datetime.now().date()
     today_trades = [t for t in trades if datetime.fromtimestamp(t['timestamp']/1000).date() == today]
@@ -313,9 +327,9 @@ async def show_testnet_daily():
         f"{'='*35}\n"
         f"🔄 Trades Today: {len(today_trades)}\n"
         f"📋 Open Orders: {len(orders)}\n"
-        f"🪙 ETH: {eth_total:.4f} (${eth_value:,.2f})\n"
+        f"🪙 {base}: {base_total:.4f} (${base_value:,.2f})\n"
         f"💵 USDT: ${usdt_total:,.2f}\n"
-        f"📈 ETH Price: ${eth_price:,.2f}"
+        f"📈 {base} Price: ${base_price:,.2f}"
     )
     
     print(report)
