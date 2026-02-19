@@ -180,7 +180,8 @@ class GridStrategy(BaseStrategy):
             new_price = filled_level.price - self.config.grid_spacing
         
         if self.config.lower_price <= new_price <= self.config.upper_price:
-            existing = [l for l in self.grid_levels if abs(l.price - new_price) < 0.01 and not l.filled]
+            tolerance = self.config.grid_spacing * 0.1
+            existing = [l for l in self.grid_levels if abs(l.price - new_price) < tolerance and not l.filled]
             if not existing:
                 self.grid_levels.append(GridLevel(
                     price=new_price,
