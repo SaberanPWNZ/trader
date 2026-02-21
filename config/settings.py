@@ -179,13 +179,13 @@ class DatabaseConfig:
 @dataclass
 class GridConfig:
     """Grid trading configuration."""
-    grid_range_pct: float = 0.018
-    max_grids: int = 4
-    min_grids: int = 2
-    min_order_value: float = 5.5
-    investment_ratio: float = 0.50
-    max_open_positions: int = 4
-    rebalance_threshold_positions: int = 5
+    grid_range_pct: float = 0.05
+    max_grids: int = 6
+    min_grids: int = 3
+    min_order_value: float = 10.0
+    investment_ratio: float = 0.60
+    max_open_positions: int = 6
+    rebalance_threshold_positions: int = 7
     
     rebalance_interval_hours: float = field(default_factory=lambda: {
         "BTC/USDT": 12.0,
@@ -214,6 +214,11 @@ class GridConfig:
     
     min_cash_reserve_percent: float = 50.0
     max_position_cost_percent: float = 10.0
+    
+    ml_advisor_enabled: bool = True
+    ml_min_range_pct: float = 0.025
+    ml_max_range_pct: float = 0.10
+    ml_update_interval_minutes: int = 15
     
     def get_interval_hours(self, symbol: str) -> float:
         if isinstance(self.rebalance_interval_hours, dict):
