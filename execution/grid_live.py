@@ -9,6 +9,7 @@ from loguru import logger
 import pandas as pd
 
 from strategies.grid import GridStrategy, GridLevel, GridConfig
+from strategies.ml_grid_advisor import MLGridAdvisor
 from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
@@ -57,6 +58,7 @@ class GridLiveTrader:
         self._max_errors = 10
         self._emergency_stop = False
         self._buy_positions: Dict[str, List[Dict]] = {s: [] for s in symbols}
+        self._ml_advisor = MLGridAdvisor()
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -96,7 +98,9 @@ class GridLiveTrader:
         try:
             with open(self._balance_file, 'r') as f:
                 state = json.load(f)
-            self.initial_balance = state.get('initial_balance', self.initial_balance)
+            saved_initial = state.get('initial_balance', 0)
+            if saved_initial > 0:
+                self.initial_balance = saved_initial
             saved_prices = state.get('initial_base_prices', {})
             if saved_prices:
                 self.initial_base_price.update(saved_prices)
@@ -145,7 +149,14 @@ class GridLiveTrader:
                 elif side == 'SELL':
                     q = buy_queue.get(symbol, [])
                     if q:
-                        q.pop(0)
+                        best_i = 0
+                        best_p = -float('inf')
+                        for qi, qpos in enumerate(q):
+                            p = (price - qpos['price']) * amount
+                            if p > best_p:
+                                best_p = p
+                                best_i = qi
+                        q.pop(best_i)
 
             for symbol in self.symbols:
                 for pos in buy_queue.get(symbol, []):
@@ -161,6 +172,42 @@ class GridLiveTrader:
                     logger.info(f"📂 Restored {len(self.positions[symbol])} open positions for {symbol}")
         except Exception as e:
             logger.warning(f"Error restoring positions: {e}")
+
+    async def _reconcile_positions(self):
+        try:
+            balance_info = await self.exchange.fetch_balance()
+            for symbol in self.symbols:
+                base = symbol.split('/')[0]
+                actual_balance = balance_info.get(base, {}).get('total', 0)
+                tracked_amount = sum(p.amount for p in self.positions[symbol])
+                untracked = actual_balance - tracked_amount
+
+                if untracked > 0.001:
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    untracked_value = untracked * current_price
+
+                    if untracked_value > settings.grid.min_order_value:
+                        self.positions[symbol].append(LiveGridPosition(
+                            symbol=symbol,
+                            side='long',
+                            entry_price=current_price,
+                            amount=untracked,
+                            order_id=f"reconciled_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            opened_at=datetime.now()
+                        ))
+                        logger.info(f"🔄 Reconciled {untracked:.4f} {base} (${untracked_value:.2f}) as position @ ${current_price:.2f}")
+                        await telegram.send_message(
+                            f"🔄 Position reconciled: {symbol}\n"
+                            f"Untracked: {untracked:.4f} {base} (${untracked_value:.2f})\n"
+                            f"Added as position @ ${current_price:.2f}"
+                        )
+                elif tracked_amount > actual_balance + 0.001:
+                    logger.warning(f"⚠️ {symbol}: Tracked {tracked_amount:.4f} > actual {actual_balance:.4f}, adjusting")
+                    while self.positions[symbol] and sum(p.amount for p in self.positions[symbol]) > actual_balance + 0.001:
+                        self.positions[symbol].pop()
+        except Exception as e:
+            logger.warning(f"Error reconciling positions: {e}")
 
     async def _ensure_bnb_for_fees(self):
         try:
@@ -243,7 +290,11 @@ class GridLiveTrader:
         
         self._running = True
         self._restore_state()
+        if self.initial_balance <= 0:
+            self.initial_balance = self.balance
+            logger.info(f"📌 Initial balance set from validation: ${self.initial_balance:.2f}")
         self._restore_positions()
+        await self._reconcile_positions()
 
         for sym in self.symbols:
             if sym not in self.initial_base_price:
@@ -294,55 +345,90 @@ class GridLiveTrader:
     async def _sync_trades_from_exchange(self, symbol: str):
         try:
             trades = await self.exchange.fetch_my_trades(symbol, limit=100)
-            new_trades = []
-            
+            new_fills = []
+
             for trade in trades:
                 trade_id = str(trade['id'])
                 if trade_id in self._processed_trade_ids:
                     continue
-                
                 self._processed_trade_ids.add(trade_id)
-                new_trades.append(trade)
-                
+                new_fills.append(trade)
+
+            if not new_fills:
+                return
+
+            aggregated: Dict[str, dict] = {}
+            for fill in new_fills:
+                order_id = str(fill.get('order', fill['id']))
+                if order_id in aggregated:
+                    agg = aggregated[order_id]
+                    old_cost = agg['price'] * agg['amount']
+                    new_cost = fill['price'] * fill['amount']
+                    agg['amount'] += fill['amount']
+                    agg['cost'] += fill['cost']
+                    agg['price'] = (old_cost + new_cost) / agg['amount'] if agg['amount'] > 0 else fill['price']
+                    agg_fee = agg.get('fee', {}).get('cost', 0)
+                    fill_fee = fill.get('fee', {}).get('cost', 0)
+                    agg['fee'] = {'cost': agg_fee + fill_fee, 'currency': fill.get('fee', {}).get('currency', 'BNB')}
+                    agg['fill_count'] += 1
+                else:
+                    aggregated[order_id] = {
+                        **fill,
+                        'id': order_id,
+                        'fill_count': 1,
+                        'fee': dict(fill.get('fee', {'cost': 0, 'currency': 'BNB'}))
+                    }
+
+            new_trades = sorted(aggregated.values(), key=lambda t: t.get('timestamp', 0))
+
+            for trade in new_trades:
+                trade_id = str(trade['id'])
                 side = trade['side'].upper()
                 price = trade['price']
                 amount = trade['amount']
                 value = trade['cost']
-                
+                fill_count = trade.get('fill_count', 1)
+
                 logger.info(f"{'='*60}")
                 logger.info(f"📝 NEW TRADE DETECTED: {symbol}")
-                logger.info(f"   Order ID: {trade_id}")
+                logger.info(f"   Order ID: {trade_id}{f' ({fill_count} fills aggregated)' if fill_count > 1 else ''}")
                 logger.info(f"   Side: {side}")
                 logger.info(f"   Price: ${price:.2f}")
                 logger.info(f"   Amount: {amount:.6f}")
                 logger.info(f"   Value: ${value:.2f}")
                 logger.info(f"   Time: {datetime.fromtimestamp(trade['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                pnl = 0.0
+
                 fee = trade.get('fee', {}).get('cost', 0)
                 self.total_fees_paid += fee
-                
+
                 trading_pnl = 0.0
                 holding_pnl = 0.0
-                
+
                 logger.info(f"   Current positions: {len(self.positions[symbol])}")
                 if side == 'SELL' and self.positions[symbol]:
-                    pos = self.positions[symbol].pop(0)
-                    
+                    best_idx = 0
+                    best_profit = -float('inf')
+                    for idx, p in enumerate(self.positions[symbol]):
+                        profit = (price - p.entry_price) * amount
+                        if profit > best_profit:
+                            best_profit = profit
+                            best_idx = idx
+                    pos = self.positions[symbol].pop(best_idx)
+
                     gross_pnl = (price - pos.entry_price) * amount
                     trading_pnl = gross_pnl - fee
                     holding_pnl = (self.current_prices.get(symbol, price) - pos.entry_price) * amount if pos.entry_price != price else 0
-                    
-                    pnl_pct = (gross_pnl / (pos.entry_price * amount)) * 100
+
+                    pnl_pct = (gross_pnl / (pos.entry_price * amount)) * 100 if (pos.entry_price * amount) > 0 else 0
                     self.realized_pnl += gross_pnl
                     self.trading_pnl += trading_pnl
                     self.completed_cycles += 1
-                    
+
                     if trading_pnl > 0:
                         self.winning_trades += 1
                     else:
                         self.losing_trades += 1
-                    
+
                     logger.info(f"   ✅ POSITION CLOSED (Cycle #{self.completed_cycles})")
                     logger.info(f"   Entry Price: ${pos.entry_price:.2f}")
                     logger.info(f"   Exit Price: ${price:.2f}")
@@ -365,7 +451,7 @@ class GridLiveTrader:
                     logger.info(f"   Value: ${value:.2f} USDT")
                     logger.info(f"   Fee: ${fee:.4f}")
                     logger.info(f"   Total Open Positions: {len(self.positions[symbol])}")
-                
+
                 balance_info = await self.exchange.fetch_balance()
                 usdt_balance = balance_info.get('USDT', {}).get('total', 0)
                 base = symbol.split('/')[0]
@@ -389,12 +475,11 @@ class GridLiveTrader:
                     symbol, side, price, amount, value, fee,
                     trading_pnl, total_value, usdt_balance, base_balance, base
                 )
-                
+
                 logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, Trading PnL: ${trading_pnl:.2f}")
-            
-            if new_trades:
-                logger.info(f"Synced {len(new_trades)} new trades for {symbol}")
-                
+
+            logger.info(f"Synced {len(new_trades)} new trades for {symbol} ({len(new_fills)} fills)")
+
         except Exception as e:
             logger.error(f"Error syncing trades for {symbol}: {e}")
     
@@ -483,8 +568,14 @@ class GridLiveTrader:
             if os.path.exists(self._balance_file):
                 with open(self._balance_file, 'r') as f:
                     old_state = json.load(f)
-                    persisted_initial = old_state.get('initial_balance', self.initial_balance)
+                    saved_initial = old_state.get('initial_balance', 0)
+                    if saved_initial > 0:
+                        persisted_initial = saved_initial
                     persisted_start_time = old_state.get('start_time', persisted_start_time)
+
+            if persisted_initial <= 0:
+                persisted_initial = total_value
+                logger.warning(f"⚠️ initial_balance was 0, setting to current total_value: ${total_value:.2f}")
 
             state = {
                 'initial_balance': persisted_initial,
@@ -566,22 +657,48 @@ class GridLiveTrader:
                     self._error_count = 0
                 except Exception as e:
                     self._error_count += 1
+                    backoff = min(15 * (2 ** min(self._error_count - 1, 4)), 300)
                     logger.error(f"Error processing {symbol} (error {self._error_count}/{self._max_errors}): {e}")
                     
                     if self._error_count >= self._max_errors:
-                        error_msg = f"🚨 Too many errors ({self._error_count}), stopping trader"
-                        logger.critical(error_msg)
-                        await telegram.send_message(error_msg)
-                        self._running = False
-                        break
+                        logger.warning(f"⚠️ {self._error_count} consecutive errors, reconnecting exchange...")
+                        await telegram.send_message(f"⚠️ Reconnecting after {self._error_count} errors...")
+                        try:
+                            if self.exchange:
+                                await self.exchange.disconnect()
+                            self.exchange = create_exchange(testnet=self.testnet)
+                            await self.exchange.connect()
+                            self._error_count = 0
+                            logger.info("✅ Exchange reconnected successfully")
+                        except Exception as reconnect_err:
+                            logger.error(f"Reconnect failed: {reconnect_err}")
+                            await asyncio.sleep(backoff)
+                    else:
+                        await asyncio.sleep(backoff)
+                    continue
             
             try:
                 await self._update_balance_state()
             except Exception as e:
                 logger.error(f"Error updating balance: {e}")
             
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
     
+    async def _get_ml_advice(self, symbol: str):
+        if not settings.grid.ml_advisor_enabled:
+            return self._ml_advisor._default_advice("ML advisor disabled in config")
+        try:
+            ohlcv_raw = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
+            if not ohlcv_raw or len(ohlcv_raw) < 50:
+                return self._ml_advisor._default_advice("not enough OHLCV data")
+            df = pd.DataFrame(ohlcv_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return self._ml_advisor.get_advice(symbol, df)
+        except Exception as e:
+            logger.warning(f"ML advice fetch failed for {symbol}: {e}")
+            return self._ml_advisor._default_advice(f"fetch error: {e}")
+
     async def _initialize_grid(self, symbol: str):
         try:
             existing_orders = await self.exchange.fetch_open_orders(symbol)
@@ -607,19 +724,20 @@ class GridLiveTrader:
             self.initial_base_price[base] = current_price
             logger.info(f"📌 Initial {base} price recorded: ${current_price:.6f}")
 
-        grid_range_pct = settings.grid.grid_range_pct
-        upper_price = current_price * (1 + grid_range_pct)
-        lower_price = current_price * (1 - grid_range_pct)
+        advice = await self._get_ml_advice(symbol)
+        grid_range_pct = advice.grid_range_pct
+        center = current_price * (1 + advice.trend_bias)
+        upper_price = center * (1 + grid_range_pct)
+        lower_price = center * (1 - grid_range_pct)
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
         investment_per_symbol = usdt_free * settings.grid.investment_ratio
 
-        num_grids = max(settings.grid.min_grids, min(settings.grid.max_grids, int(investment_per_symbol / 25)))
+        num_grids = advice.recommended_grids
         if investment_per_symbol / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment_per_symbol / settings.grid.min_order_value))
         
-        from strategies.grid import GridConfig
         config = GridConfig(
             symbol=symbol,
             upper_price=upper_price,
@@ -633,16 +751,19 @@ class GridLiveTrader:
         self.strategies[symbol]._create_grid_levels(current_price)
         self.strategies[symbol].initialized = True
         
+        ml_tag = f"🤖 ML: {advice.reason}" if advice.confidence > 0 else "📊 Default params"
         logger.info(f"Grid initialized for {symbol}:")
+        logger.info(f"  {ml_tag}")
         logger.info(f"  Price: ${current_price:.2f}")
-        logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}")
+        logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})")
         logger.info(f"  Spacing: ${config.grid_spacing:.2f}")
         logger.info(f"  Amount per grid: ${config.amount_per_grid:.2f}")
         
         await telegram.send_message(
             f"📊 Grid initialized: {symbol}\n"
+            f"{ml_tag}\n"
             f"Price: ${current_price:.2f}\n"
-            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}\n"
+            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})\n"
             f"Spacing: ${config.grid_spacing:.2f}\n"
             f"Order size: ${config.amount_per_grid:.2f}"
         )
@@ -765,18 +886,19 @@ class GridLiveTrader:
         except Exception as e:
             logger.warning(f"Error cancelling old orders: {e}")
 
-        grid_range_pct = settings.grid.grid_range_pct
-        upper_price = current_price * (1 + grid_range_pct)
-        lower_price = current_price * (1 - grid_range_pct)
+        advice = await self._get_ml_advice(symbol)
+        grid_range_pct = advice.grid_range_pct
+        center = current_price * (1 + advice.trend_bias)
+        upper_price = center * (1 + grid_range_pct)
+        lower_price = center * (1 - grid_range_pct)
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
         investment = usdt_free * settings.grid.investment_ratio
-        num_grids = max(settings.grid.min_grids, min(settings.grid.max_grids, int(investment / 25)))
+        num_grids = advice.recommended_grids
         if investment / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment / settings.grid.min_order_value))
         
-        from strategies.grid import GridConfig
         config = GridConfig(
             symbol=symbol,
             upper_price=upper_price,
@@ -791,14 +913,18 @@ class GridLiveTrader:
         self.strategies[symbol]._create_grid_levels(current_price)
         self.strategies[symbol].last_price = current_price
         
+        ml_tag = f"🤖 {advice.reason}" if advice.confidence > 0 else ""
         logger.info(f"Grid reinitialized for {symbol}:")
         logger.info(f"  Price: ${current_price:.2f}")
-        logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}")
+        logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})")
+        if ml_tag:
+            logger.info(f"  {ml_tag}")
         
         await telegram.send_message(
             f"🔄 Grid rebalanced: {symbol}\n"
             f"Price: ${current_price:.2f}\n"
-            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f}"
+            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})"
+            + (f"\n{ml_tag}" if ml_tag else "")
         )
         
         await self._place_grid_orders(symbol)
@@ -807,48 +933,59 @@ class GridLiveTrader:
         open_positions = len(self.positions[symbol])
         max_positions = settings.grid.max_open_positions
         threshold = settings.grid.rebalance_threshold_positions
-        
+
         if open_positions < threshold:
             return
-        
+
         positions_to_close = open_positions - (max_positions - 1)
         if positions_to_close <= 0:
             return
-        
-        logger.warning(f"⚠️ {symbol}: Too many positions ({open_positions}), closing {positions_to_close} at market price")
-        
+
+        sorted_positions = sorted(
+            enumerate(self.positions[symbol]),
+            key=lambda x: x[1].entry_price,
+            reverse=True
+        )
+        worst_positions = sorted_positions[:positions_to_close]
+
+        avg_entry = sum(p.entry_price for _, p in worst_positions) / len(worst_positions)
+        sell_price = max(avg_entry * 1.002, current_price * 1.001)
+
+        total_amount = sum(p.amount for _, p in worst_positions)
+
+        logger.warning(f"⚠️ {symbol}: {open_positions} positions, placing limit sell for {positions_to_close} worst @ ${sell_price:.2f} (avg entry ${avg_entry:.2f})")
+
         await telegram.send_message(
             f"⚠️ REBALANCING {symbol}\n"
             f"Open positions: {open_positions}\n"
-            f"Closing {positions_to_close} positions at market\n"
-            f"Price: ${current_price:.2f}"
+            f"Closing {positions_to_close} worst positions\n"
+            f"Avg entry: ${avg_entry:.2f}\n"
+            f"Limit sell: ${sell_price:.2f}\n"
+            f"Current: ${current_price:.2f}"
         )
-        
+
         base = symbol.split('/')[0]
         balance_info = await self.exchange.fetch_balance()
         base_available = balance_info.get(base, {}).get('free', 0)
-        
-        total_amount_to_sell = 0
-        for i in range(positions_to_close):
-            if i < len(self.positions[symbol]):
-                total_amount_to_sell += self.positions[symbol][i].amount
-        
-        if total_amount_to_sell > base_available:
-            total_amount_to_sell = base_available * 0.99
-        
-        if total_amount_to_sell > 0:
+
+        if total_amount > base_available:
+            total_amount = base_available * 0.99
+
+        if total_amount > 0:
             try:
                 market = await self._get_market_info(symbol)
-                amount = self._round_amount(total_amount_to_sell, market.get('amount_precision', 0.001))
-                
+                amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
+                sell_price = self._round_price(sell_price, market.get('price_precision', 0.01))
+
                 if amount > 0:
                     order = await self.exchange.create_order(
                         symbol=symbol,
-                        type='market',
+                        type='limit',
                         side='sell',
-                        amount=amount
+                        amount=amount,
+                        price=sell_price
                     )
-                    logger.info(f"📉 Market SELL executed: {amount} {base} @ ~${current_price:.2f}")
+                    logger.info(f"📉 Limit SELL placed: {amount} {base} @ ${sell_price:.2f} (break-even rebalance)")
             except Exception as e:
                 logger.error(f"Failed to execute rebalance sell: {e}")
     
