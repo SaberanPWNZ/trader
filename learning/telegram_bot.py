@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Callable, Dict, Any
 import aiohttp
-from aiohttp import ClientTimeout
+min_order_value: float = 10.0 → 15.0  # Збільшитиfrom aiohttp import ClientTimeout
 import os
 import csv
 import json
