@@ -59,6 +59,9 @@ class GridLiveTrader:
         self._emergency_stop = False
         self._buy_positions: Dict[str, List[Dict]] = {s: [] for s in symbols}
         self._ml_advisor = MLGridAdvisor()
+        self._grid_init_times: Dict[str, datetime] = {}
+        self._last_rebalance_times: Dict[str, datetime] = {}
+        self._grid_init_prices: Dict[str, float] = {}
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -750,6 +753,8 @@ class GridLiveTrader:
         self.strategies[symbol].center_price = current_price
         self.strategies[symbol]._create_grid_levels(current_price)
         self.strategies[symbol].initialized = True
+        self._grid_init_times[symbol] = datetime.utcnow()
+        self._grid_init_prices[symbol] = current_price
         
         ml_tag = f"🤖 ML: {advice.reason}" if advice.confidence > 0 else "📊 Default params"
         logger.info(f"Grid initialized for {symbol}:")
@@ -854,6 +859,11 @@ class GridLiveTrader:
         
         strategy = self.strategies[symbol]
         
+        if self._check_trailing_stop_loss(symbol, current_price):
+            await self._emergency_close_all_positions(symbol, current_price)
+            await self._reinitialize_grid(symbol, current_price)
+            return
+        
         open_positions = len(self.positions[symbol])
         if open_positions >= settings.grid.max_open_positions:
             await self._rebalance_excess_positions(symbol, current_price)
@@ -865,12 +875,125 @@ class GridLiveTrader:
             await self._reinitialize_grid(symbol, current_price)
             return
         
+        if self._should_rebalance_grid(symbol, current_price, active_levels):
+            logger.info(f"{symbol}: Grid rebalance triggered — price drifted from active levels")
+            await self._reinitialize_grid(symbol, current_price)
+            return
+        
         fills = strategy.check_grid_fills(current_price)
         
         for fill in fills:
             await self._process_fill(symbol, fill)
         
         await self._check_and_replace_orders(symbol)
+    
+    def _should_rebalance_grid(self, symbol: str, current_price: float, active_levels: List[GridLevel]) -> bool:
+        if not settings.grid.auto_rebalance_enabled:
+            return False
+
+        init_time = self._grid_init_times.get(symbol)
+        if not init_time:
+            return False
+
+        cooldown = timedelta(minutes=settings.grid.rebalance_cooldown_minutes)
+        if datetime.utcnow() - init_time < cooldown:
+            return False
+
+        buy_levels = [l for l in active_levels if l.side == "buy"]
+        sell_levels = [l for l in active_levels if l.side == "sell"]
+
+        nearest_buy = max((l.price for l in buy_levels), default=0)
+        nearest_sell = min((l.price for l in sell_levels), default=float('inf'))
+
+        if nearest_buy > 0 and nearest_sell < float('inf'):
+            gap_pct = (nearest_sell - nearest_buy) / current_price
+            if gap_pct > 0.04:
+                in_gap = nearest_buy < current_price < nearest_sell
+                if in_gap:
+                    hours_since_init = (datetime.utcnow() - init_time).total_seconds() / 3600
+                    force_hours = settings.grid.force_rebalance_after_hours
+                    if hours_since_init >= force_hours:
+                        logger.info(f"{symbol}: Force rebalance after {hours_since_init:.1f}h, gap={gap_pct:.1%}")
+                        return True
+                    if gap_pct > 0.06:
+                        logger.info(f"{symbol}: Wide gap rebalance, gap={gap_pct:.1%}")
+                        return True
+
+        config = self.strategies[symbol].config
+        if config:
+            if current_price < config.lower_price or current_price > config.upper_price:
+                logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
+                return True
+
+        return False
+    
+    def _check_trailing_stop_loss(self, symbol: str, current_price: float) -> bool:
+        """Перевірка trailing stop loss для захисту від downtrend."""
+        if not settings.grid.trailing_stop_loss_enabled:
+            return False
+        
+        init_price = self._grid_init_prices.get(symbol)
+        if not init_price:
+            return False
+        
+        price_drop_pct = (init_price - current_price) / init_price
+        
+        if price_drop_pct > settings.grid.trailing_stop_loss_trigger_percent / 100:
+            logger.warning(
+                f"{symbol}: Trailing stop loss triggered! "
+                f"Price dropped {price_drop_pct*100:.1f}% "
+                f"(${init_price:.2f} → ${current_price:.2f})"
+            )
+            return True
+        
+        return False
+    
+    async def _emergency_close_all_positions(self, symbol: str, current_price: float):
+        """Екстрене закриття всіх позицій market ордером."""
+        if not self.positions.get(symbol):
+            return
+        
+        base = symbol.split('/')[0]
+        total_amount = sum(p.amount for p in self.positions[symbol])
+        
+        if total_amount <= 0:
+            return
+        
+        logger.warning(f"🚨 EMERGENCY CLOSE: Selling {total_amount} {base} @ market price")
+        
+        try:
+            existing_orders = await self.exchange.fetch_open_orders(symbol)
+            for order in existing_orders:
+                try:
+                    await self.exchange.cancel_order(order['id'], symbol)
+                except Exception as e:
+                    logger.warning(f"Failed to cancel order {order['id']}: {e}")
+            
+            await asyncio.sleep(0.5)
+            
+            market = await self._get_market_info(symbol)
+            amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
+            
+            if amount > 0:
+                order = await self.exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side='sell',
+                    amount=amount
+                )
+                logger.info(f"✅ Emergency sell executed: {amount} {base}")
+                
+                await telegram.send_message(
+                    f"🚨 EMERGENCY STOP LOSS\n"
+                    f"{symbol}\n"
+                    f"Sold {amount} {base} @ market\n"
+                    f"Reason: Price dropped > {settings.grid.trailing_stop_loss_trigger_percent}%"
+                )
+                
+                self.positions[symbol] = []
+                
+        except Exception as e:
+            logger.error(f"Emergency close failed: {e}")
     
     async def _reinitialize_grid(self, symbol: str, current_price: float):
         try:
@@ -892,6 +1015,8 @@ class GridLiveTrader:
         upper_price = center * (1 + grid_range_pct)
         lower_price = center * (1 - grid_range_pct)
 
+        self._grid_init_prices[symbol] = current_price
+        
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
         investment = usdt_free * settings.grid.investment_ratio
@@ -912,6 +1037,7 @@ class GridLiveTrader:
         self.strategies[symbol].grid_levels = []
         self.strategies[symbol]._create_grid_levels(current_price)
         self.strategies[symbol].last_price = current_price
+        self._grid_init_times[symbol] = datetime.utcnow()
         
         ml_tag = f"🤖 {advice.reason}" if advice.confidence > 0 else ""
         logger.info(f"Grid reinitialized for {symbol}:")
@@ -937,6 +1063,12 @@ class GridLiveTrader:
         if open_positions < threshold:
             return
 
+        last_rebalance = self._last_rebalance_times.get(symbol)
+        if last_rebalance:
+            cooldown = timedelta(minutes=5)
+            if datetime.utcnow() - last_rebalance < cooldown:
+                return
+
         positions_to_close = open_positions - (max_positions - 1)
         if positions_to_close <= 0:
             return
@@ -952,17 +1084,13 @@ class GridLiveTrader:
         sell_price = max(avg_entry * 1.002, current_price * 1.001)
 
         total_amount = sum(p.amount for _, p in worst_positions)
+        order_value = total_amount * sell_price
+        
+        if order_value < settings.grid.min_order_value:
+            logger.debug(f"Rebalance order value ${order_value:.2f} below min ${settings.grid.min_order_value}, skipping")
+            return
 
         logger.warning(f"⚠️ {symbol}: {open_positions} positions, placing limit sell for {positions_to_close} worst @ ${sell_price:.2f} (avg entry ${avg_entry:.2f})")
-
-        await telegram.send_message(
-            f"⚠️ REBALANCING {symbol}\n"
-            f"Open positions: {open_positions}\n"
-            f"Closing {positions_to_close} worst positions\n"
-            f"Avg entry: ${avg_entry:.2f}\n"
-            f"Limit sell: ${sell_price:.2f}\n"
-            f"Current: ${current_price:.2f}"
-        )
 
         base = symbol.split('/')[0]
         balance_info = await self.exchange.fetch_balance()
@@ -986,6 +1114,17 @@ class GridLiveTrader:
                         price=sell_price
                     )
                     logger.info(f"📉 Limit SELL placed: {amount} {base} @ ${sell_price:.2f} (break-even rebalance)")
+                    
+                    self._last_rebalance_times[symbol] = datetime.utcnow()
+                    
+                    await telegram.send_message(
+                        f"⚠️ REBALANCING {symbol}\n"
+                        f"Open positions: {open_positions}\n"
+                        f"Closed {positions_to_close} worst positions\n"
+                        f"Avg entry: ${avg_entry:.2f}\n"
+                        f"Limit sell: ${sell_price:.2f}\n"
+                        f"Amount: {amount} {base}"
+                    )
             except Exception as e:
                 logger.error(f"Failed to execute rebalance sell: {e}")
     

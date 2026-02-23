@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Callable, Dict, Any
 import aiohttp
+from aiohttp import ClientTimeout
 import os
 import csv
 import json
@@ -25,6 +26,8 @@ class LearningTelegramBot:
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._last_update_id = 0
+        self._consecutive_failures = 0
+        self._client_timeout = ClientTimeout(total=45, connect=10, sock_read=35)
         self._commands = {
             "/start": self._cmd_start,
             "/help": self._cmd_help,
@@ -44,7 +47,13 @@ class LearningTelegramBot:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(timeout=self._client_timeout)
+        return self._session
+
+    async def _recreate_session(self) -> aiohttp.ClientSession:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = aiohttp.ClientSession(timeout=self._client_timeout)
         return self._session
 
     async def close(self) -> None:
@@ -69,16 +78,27 @@ class LearningTelegramBot:
         while self._running:
             try:
                 updates = await self._get_updates()
-                for update in updates:
-                    await self._handle_update(update)
-                    self._last_update_id = update.get("update_id", 0) + 1
+                if updates is not None:
+                    self._consecutive_failures = 0
+                    for update in updates:
+                        await self._handle_update(update)
+                        self._last_update_id = update.get("update_id", 0) + 1
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Polling error: {e}")
-            await asyncio.sleep(settings.monitoring.telegram_polling_interval)
+                self._consecutive_failures += 1
+                logger.error(f"Polling error (fail #{self._consecutive_failures}): {e}")
 
-    async def _get_updates(self) -> list:
+            if self._consecutive_failures > 0:
+                backoff = min(5 * self._consecutive_failures, 120)
+                if self._consecutive_failures % 10 == 0:
+                    logger.warning(f"Telegram polling: {self._consecutive_failures} consecutive failures, recreating session...")
+                    await self._recreate_session()
+                await asyncio.sleep(backoff)
+            else:
+                await asyncio.sleep(settings.monitoring.telegram_polling_interval)
+
+    async def _get_updates(self) -> Optional[list]:
         try:
             session = await self._get_session()
             async with session.get(
@@ -88,9 +108,19 @@ class LearningTelegramBot:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("result", [])
+                elif response.status == 409:
+                    logger.warning("Telegram 409 Conflict — another bot instance may be polling")
+                    await asyncio.sleep(10)
+                else:
+                    logger.warning(f"Telegram getUpdates returned {response.status}")
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures <= 3 or self._consecutive_failures % 50 == 0:
+                logger.error(f"Failed to get updates (fail #{self._consecutive_failures}): {e}")
         except Exception as e:
-            logger.error(f"Failed to get updates: {e}")
-        return []
+            self._consecutive_failures += 1
+            logger.error(f"Unexpected error getting updates: {e}")
+        return None
 
     async def _handle_update(self, update: dict) -> None:
         message = update.get("message", {})
@@ -119,16 +149,23 @@ class LearningTelegramBot:
                 await self._send_message(f"❌ Error: {e}")
 
     async def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        try:
-            session = await self._get_session()
-            async with session.post(
-                f"{self.base_url}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
-            ) as response:
-                return response.status == 200
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-            return False
+        for attempt in range(3):
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
+                ) as response:
+                    return response.status == 200
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"Send message attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    await self._recreate_session()
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Failed to send message: {e}")
+                break
+        return False
 
     async def _cmd_start(self, args: list) -> None:
         await self._send_message("""
