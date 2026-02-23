@@ -230,13 +230,21 @@ class MLGridAdvisor:
         if ml_confidence > 0.6:
             ml_weight = min((ml_confidence - 0.5) * 2.0, 0.5)
             trend_bias = ml_direction * ml_weight * grid_range_pct * 0.3
+            
+            if ml_direction < 0 and ml_confidence > 0.65:
+                trend_bias *= 1.5
+                grid_range_pct *= 1.2
+                
         elif abs(trend_score) > 0.3:
             trend_bias = trend_score * grid_range_pct * 0.15
+            
+            if trend_score < -0.3:
+                trend_bias *= 1.3
 
         if volatility_regime == "extreme":
-            recommended_grids = settings.grid.max_grids
+            recommended_grids = 3
         elif volatility_regime == "high":
-            recommended_grids = max(settings.grid.min_grids + 1, settings.grid.max_grids - 1)
+            recommended_grids = 3
         elif volatility_regime == "low":
             recommended_grids = settings.grid.min_grids
         else:

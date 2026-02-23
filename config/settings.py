@@ -182,10 +182,10 @@ class GridConfig:
     grid_range_pct: float = 0.05
     max_grids: int = 6
     min_grids: int = 3
-    min_order_value: float = 10.0
+    min_order_value: float = 15.0
     investment_ratio: float = 0.60
-    max_open_positions: int = 6
-    rebalance_threshold_positions: int = 7
+    max_open_positions: int = 4
+    rebalance_threshold_positions: int = 5
     
     rebalance_interval_hours: float = field(default_factory=lambda: {
         "BTC/USDT": 12.0,
@@ -198,16 +198,20 @@ class GridConfig:
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
     min_profit_threshold_percent: float = 0.0
-    rebalance_cooldown_minutes: int = 30
+    rebalance_cooldown_minutes: int = 15
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
     breakout_buffer_multiplier: float = 2.0
-    force_rebalance_after_hours: float = 24.0
+    force_rebalance_after_hours: float = 8.0
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0
     max_unrealized_loss_percent: float = 3.0
     partial_close_profit_percent: float = 10.0
+    
+    trailing_stop_loss_enabled: bool = True
+    trailing_stop_loss_percent: float = 5.0
+    trailing_stop_loss_trigger_percent: float = 3.0
     partial_close_ratio: float = 0.5
     enable_portfolio_protection: bool = True
     pause_after_stop_loss_hours: int = 24
