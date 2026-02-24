@@ -33,7 +33,9 @@ class GridLiveTrader:
         self._trades_file = "data/grid_live_trades.csv"
         self._state_file = "data/grid_live_state.json"
         self._balance_file = "data/grid_live_balance.json"
+        self._fill_ids_file = "data/grid_live_fill_ids.json"
         self._processed_trade_ids: Set[str] = set()
+        self._processed_order_ids: Set[str] = set()
         self._init_data_files()
         
         self.strategies: Dict[str, GridStrategy] = {}
@@ -81,6 +83,14 @@ class GridLiveTrader:
         self._load_processed_trade_ids()
     
     def _load_processed_trade_ids(self):
+        if os.path.exists(self._fill_ids_file):
+            try:
+                with open(self._fill_ids_file, 'r') as f:
+                    self._processed_trade_ids = set(json.load(f))
+                logger.info(f"Loaded {len(self._processed_trade_ids)} processed fill IDs")
+            except Exception as e:
+                logger.warning(f"Error loading fill IDs file: {e}")
+
         if os.path.exists(self._trades_file):
             try:
                 with open(self._trades_file, 'r') as f:
@@ -90,10 +100,17 @@ class GridLiveTrader:
                         return
                     for row in reader:
                         if len(row) >= 7 and row[6]:
-                            self._processed_trade_ids.add(str(row[6]))
-                logger.info(f"Loaded {len(self._processed_trade_ids)} processed trade IDs")
+                            self._processed_order_ids.add(str(row[6]))
+                logger.info(f"Loaded {len(self._processed_order_ids)} processed order IDs")
             except Exception as e:
                 logger.warning(f"Error loading trade IDs: {e}")
+
+    def _save_fill_ids(self):
+        try:
+            with open(self._fill_ids_file, 'w') as f:
+                json.dump(list(self._processed_trade_ids), f)
+        except Exception as e:
+            logger.warning(f"Error saving fill IDs: {e}")
     
     def _restore_state(self):
         if not os.path.exists(self._balance_file):
@@ -383,6 +400,11 @@ class GridLiveTrader:
                     }
 
             new_trades = sorted(aggregated.values(), key=lambda t: t.get('timestamp', 0))
+            new_trades = [t for t in new_trades if str(t['id']) not in self._processed_order_ids]
+
+            if not new_trades:
+                self._save_fill_ids()
+                return
 
             for trade in new_trades:
                 trade_id = str(trade['id'])
@@ -400,6 +422,12 @@ class GridLiveTrader:
                 logger.info(f"   Amount: {amount:.6f}")
                 logger.info(f"   Value: ${value:.2f}")
                 logger.info(f"   Time: {datetime.fromtimestamp(trade['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+
+                trade_time = datetime.fromisoformat(trade['datetime'].replace('Z', '+00:00'))
+                age_minutes = (datetime.now(trade_time.tzinfo) - trade_time).total_seconds() / 60
+                if age_minutes > 60:
+                    logger.info(f"   ⏭️ Skipping old trade (age: {age_minutes/60:.1f}h)")
+                    continue
 
                 fee = trade.get('fee', {}).get('cost', 0)
                 self.total_fees_paid += fee
@@ -446,7 +474,7 @@ class GridLiveTrader:
                         entry_price=price,
                         amount=amount,
                         order_id=trade_id,
-                        opened_at=datetime.fromisoformat(trade['datetime'].replace('Z', '+00:00'))
+                        opened_at=trade_time
                     ))
                     logger.info(f"   🟢 POSITION OPENED")
                     logger.info(f"   Entry Price: ${price:.2f}")
@@ -479,8 +507,10 @@ class GridLiveTrader:
                     trading_pnl, total_value, usdt_balance, base_balance, base
                 )
 
+                self._processed_order_ids.add(trade_id)
                 logger.info(f"📝 Synced trade: {side} {symbol} @ ${price:.2f}, Trading PnL: ${trading_pnl:.2f}")
 
+            self._save_fill_ids()
             logger.info(f"Synced {len(new_trades)} new trades for {symbol} ({len(new_fills)} fills)")
 
         except Exception as e:
@@ -685,6 +715,7 @@ class GridLiveTrader:
             except Exception as e:
                 logger.error(f"Error updating balance: {e}")
             
+            logger.info("💓 Heartbeat - waiting 15s")
             await asyncio.sleep(15)
     
     async def _get_ml_advice(self, symbol: str):
@@ -1084,13 +1115,6 @@ class GridLiveTrader:
         sell_price = max(avg_entry * 1.002, current_price * 1.001)
 
         total_amount = sum(p.amount for _, p in worst_positions)
-        order_value = total_amount * sell_price
-        
-        if order_value < settings.grid.min_order_value:
-            logger.debug(f"Rebalance order value ${order_value:.2f} below min ${settings.grid.min_order_value}, skipping")
-            return
-
-        logger.warning(f"⚠️ {symbol}: {open_positions} positions, placing limit sell for {positions_to_close} worst @ ${sell_price:.2f} (avg entry ${avg_entry:.2f})")
 
         base = symbol.split('/')[0]
         balance_info = await self.exchange.fetch_balance()
@@ -1098,6 +1122,16 @@ class GridLiveTrader:
 
         if total_amount > base_available:
             total_amount = base_available * 0.99
+        
+        order_value = total_amount * sell_price
+        
+        if order_value < settings.grid.min_order_value:
+            logger.info(f"Rebalance: not enough {base} to sell (${order_value:.2f} < ${settings.grid.min_order_value}), clearing stuck positions")
+            self.positions[symbol] = [p for i, p in enumerate(self.positions[symbol]) 
+                                       if i not in [idx for idx, _ in worst_positions]]
+            return
+
+        logger.warning(f"⚠️ {symbol}: {open_positions} positions, placing limit sell for {positions_to_close} worst @ ${sell_price:.2f} (avg entry ${avg_entry:.2f})")
 
         if total_amount > 0:
             try:
