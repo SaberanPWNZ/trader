@@ -1,0 +1,32 @@
+{
+  "initial_balance": 228.3,
+  "initial_base_prices": {
+    "ETH": 1971.54,
+    "DOGE": 0.0988,
+    "SOL": 76.84
+  },
+  "start_time": "2026-02-17T11:00:00",
+  "usdt_balance": 35.38205195,
+  "base_balances": {
+    "SOL": {
+      "total": 2.346,
+      "price": 76.96,
+      "value": 180.54816
+    }
+  },
+  "total_value": 215.93021195,
+  "trading_pnl": 28.17767070999998,
+  "holding_pnl": 0.28151999999997734,
+  "realized_pnl": 28.469459999999987,
+  "total_fees_paid": 0.3062165899999989,
+  "total_trades": 242,
+  "completed_cycles": 71,
+  "winning_trades": 54,
+  "losing_trades": 17,
+  "win_rate": 76.05633802816901,
+  "avg_profit_per_cycle": 0.3968686015492955,
+  "symbols": [
+    "SOL/USDT"
+  ],
+  "last_update": "2026-02-24T07:36:03.438610"
+}
