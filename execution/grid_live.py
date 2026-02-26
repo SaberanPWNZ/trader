@@ -168,15 +168,14 @@ class GridLiveTrader:
                     })
                 elif side == 'SELL':
                     q = buy_queue.get(symbol, [])
-                    if q:
-                        best_i = 0
-                        best_p = -float('inf')
-                        for qi, qpos in enumerate(q):
-                            p = (price - qpos['price']) * amount
-                            if p > best_p:
-                                best_p = p
-                                best_i = qi
-                        q.pop(best_i)
+                    remaining = amount
+                    while q and remaining > 1e-8:
+                        pos = q[0]
+                        matched = min(remaining, pos['amount'])
+                        pos['amount'] -= matched
+                        remaining -= matched
+                        if pos['amount'] < 1e-8:
+                            q.pop(0)
 
             for symbol in self.symbols:
                 for pos in buy_queue.get(symbol, []):
@@ -426,8 +425,7 @@ class GridLiveTrader:
                 trade_time = datetime.fromisoformat(trade['datetime'].replace('Z', '+00:00'))
                 age_minutes = (datetime.now(trade_time.tzinfo) - trade_time).total_seconds() / 60
                 if age_minutes > 60:
-                    logger.info(f"   ⏭️ Skipping old trade (age: {age_minutes/60:.1f}h)")
-                    continue
+                    logger.info(f"   ℹ️ Processing old trade (age: {age_minutes/60:.1f}h)")
 
                 fee = trade.get('fee', {}).get('cost', 0)
                 self.total_fees_paid += fee
@@ -437,21 +435,34 @@ class GridLiveTrader:
 
                 logger.info(f"   Current positions: {len(self.positions[symbol])}")
                 if side == 'SELL' and self.positions[symbol]:
-                    best_idx = 0
-                    best_profit = -float('inf')
-                    for idx, p in enumerate(self.positions[symbol]):
-                        profit = (price - p.entry_price) * amount
-                        if profit > best_profit:
-                            best_profit = profit
-                            best_idx = idx
-                    pos = self.positions[symbol].pop(best_idx)
+                    remaining = amount
+                    total_gross_pnl = 0.0
+                    total_matched = 0.0
+                    matched_entries = []
 
-                    gross_pnl = (price - pos.entry_price) * amount
-                    trading_pnl = gross_pnl - fee
-                    holding_pnl = (self.current_prices.get(symbol, price) - pos.entry_price) * amount if pos.entry_price != price else 0
+                    while remaining > 1e-8 and self.positions[symbol]:
+                        pos = self.positions[symbol][0]
+                        matched = min(remaining, pos.amount)
+                        pnl = (price - pos.entry_price) * matched
+                        total_gross_pnl += pnl
+                        total_matched += matched
+                        matched_entries.append((pos.entry_price, matched))
+                        pos.amount -= matched
+                        remaining -= matched
+                        if pos.amount < 1e-8:
+                            self.positions[symbol].pop(0)
 
-                    pnl_pct = (gross_pnl / (pos.entry_price * amount)) * 100 if (pos.entry_price * amount) > 0 else 0
-                    self.realized_pnl += gross_pnl
+                    trading_pnl = total_gross_pnl - fee
+                    holding_pnl = 0.0
+                    if matched_entries:
+                        avg_entry = sum(e * a for e, a in matched_entries) / total_matched
+                        holding_pnl = (self.current_prices.get(symbol, price) - avg_entry) * total_matched if avg_entry != price else 0
+                        pnl_pct = (total_gross_pnl / (avg_entry * total_matched)) * 100 if (avg_entry * total_matched) > 0 else 0
+                    else:
+                        avg_entry = price
+                        pnl_pct = 0.0
+
+                    self.realized_pnl += trading_pnl
                     self.trading_pnl += trading_pnl
                     self.completed_cycles += 1
 
@@ -461,10 +472,10 @@ class GridLiveTrader:
                         self.losing_trades += 1
 
                     logger.info(f"   ✅ POSITION CLOSED (Cycle #{self.completed_cycles})")
-                    logger.info(f"   Entry Price: ${pos.entry_price:.2f}")
+                    logger.info(f"   Avg Entry: ${avg_entry:.2f}")
                     logger.info(f"   Exit Price: ${price:.2f}")
-                    logger.info(f"   Gross PnL: ${gross_pnl:+.2f} ({pnl_pct:+.2f}%)")
-                    logger.info(f"   Trading PnL: ${trading_pnl:+.2f} (after ${fee:.4f} fee)")
+                    logger.info(f"   Matched: {total_matched:.6f} / {amount:.6f}")
+                    logger.info(f"   Trading PnL: ${trading_pnl:+.2f} ({pnl_pct:+.2f}%, after ${fee:.4f} fee)")
                     logger.info(f"   Win Rate: {self.winning_trades}/{self.completed_cycles} ({self.winning_trades/self.completed_cycles*100:.1f}%)")
                     logger.info(f"   Total Trading PnL: ${self.trading_pnl:+.2f}")
                 elif side == 'BUY':
@@ -946,8 +957,16 @@ class GridLiveTrader:
                     if hours_since_init >= force_hours:
                         logger.info(f"{symbol}: Force rebalance after {hours_since_init:.1f}h, gap={gap_pct:.1%}")
                         return True
-                    if gap_pct > 0.06:
-                        logger.info(f"{symbol}: Wide gap rebalance, gap={gap_pct:.1%}")
+
+                    config = self.strategies[symbol].config
+                    if config and config.num_grids > 0:
+                        full_range_pct = (config.upper_price - config.lower_price) / current_price
+                        gap_threshold = max(0.06, full_range_pct * 1.3)
+                    else:
+                        gap_threshold = 0.06
+
+                    if gap_pct > gap_threshold:
+                        logger.info(f"{symbol}: Wide gap rebalance, gap={gap_pct:.1%} > threshold={gap_threshold:.1%}")
                         return True
 
         config = self.strategies[symbol].config
