@@ -192,8 +192,6 @@ class TradeExecutor:
             del self._prediction_ids[symbol]
         except Exception as e:
             logger.error(f"Failed to update prediction outcome: {e}")
-        
-        return result
     
     async def close_all_positions(self, reason: str = "Close all") -> int:
         closed = 0

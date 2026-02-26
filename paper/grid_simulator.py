@@ -774,8 +774,8 @@ class GridPaperSimulator:
         roi = ((total_value - self.initial_balance) / self.initial_balance) * 100
         runtime = datetime.utcnow() - self._start_time
         hours = runtime.total_seconds() / 3600
-        sell_trades = sum(1 for sym in self.symbols for pos in self.positions.get(sym, []))
-        completed_pairs = self.total_trades - sell_trades
+        open_positions = sum(len(positions) for positions in self.positions.values())
+        completed_pairs = (self.total_trades - open_positions) // 2
         win_rate = (self.winning_trades / max(1, completed_pairs)) * 100 if completed_pairs > 0 else 0
         
         snapshot_data = {
