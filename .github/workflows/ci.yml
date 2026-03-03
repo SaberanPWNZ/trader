@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest -m "not integration" --tb=short -q
+
+      - name: Notify Telegram (success)
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"parse_mode\":\"HTML\",\"text\":\"✅ <b>CI Passed</b>\n\n📦 <code>${GITHUB_REPOSITORY}</code>\n🌿 Branch: <code>${GITHUB_REF_NAME}</code>\n🔗 Commit: <code>${GITHUB_SHA::7}</code>\n👤 ${GITHUB_ACTOR}\"}"
+
+      - name: Notify Telegram (failure)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"parse_mode\":\"HTML\",\"text\":\"❌ <b>CI Failed</b>\n\n📦 <code>${GITHUB_REPOSITORY}</code>\n🌿 Branch: <code>${GITHUB_REF_NAME}</code>\n🔗 Commit: <code>${GITHUB_SHA::7}</code>\n👤 ${GITHUB_ACTOR}\n\n<a href=\\\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\\\">View logs</a>\"}"
