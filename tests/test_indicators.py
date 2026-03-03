@@ -114,7 +114,7 @@ class TestTechnicalIndicators:
         
         expected_columns = [
             'ema_fast', 'ema_medium', 'ema_slow',
-            'rsi', 'macd', 'macd_signal', 'macd_histogram',
+            'rsi', 'macd_line', 'macd_signal', 'macd_histogram',
             'atr', 'bb_upper', 'bb_middle', 'bb_lower',
             'trend'
         ]
