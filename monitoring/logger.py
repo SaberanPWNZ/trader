@@ -1,11 +1,19 @@
 """
 Logging configuration.
 """
+import os
+import re
 import sys
 from pathlib import Path
 from loguru import logger
 
 from config.settings import settings
+
+
+def _get_log_file_name(pattern: str) -> str:
+    service_name = os.getenv("TRADER_SERVICE_NAME", "app").strip().lower() or "app"
+    safe_service_name = re.sub(r"[^a-z0-9_-]+", "_", service_name)
+    return f"{safe_service_name}_{pattern}"
 
 
 def setup_logging() -> None:
@@ -17,10 +25,8 @@ def setup_logging() -> None:
     - File logging with rotation
     - Separate error log file
     """
-    # Remove default handler
     logger.remove()
-    
-    # Console handler
+
     logger.add(
         sys.stdout,
         level="DEBUG",
@@ -30,45 +36,40 @@ def setup_logging() -> None:
                "<level>{message}</level>",
         colorize=True
     )
-    
-    # File logging
+
     if settings.monitoring.log_to_file:
         log_dir = Path(settings.monitoring.log_dir)
         log_dir.mkdir(exist_ok=True)
-        
-        # General log file
+
         logger.add(
-            log_dir / "trading_{time:YYYY-MM-DD}.log",
+            log_dir / _get_log_file_name("trading_{time:YYYY-MM-DD}.log"),
             level=settings.monitoring.log_level,
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-            rotation="00:00",  # Rotate at midnight
+            rotation="00:00",
             retention="30 days",
             compression="gz"
         )
-        
-        # Error log file
+
         logger.add(
-            log_dir / "errors_{time:YYYY-MM-DD}.log",
+            log_dir / _get_log_file_name("errors_{time:YYYY-MM-DD}.log"),
             level="ERROR",
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
             rotation="00:00",
             retention="90 days",
             compression="gz"
         )
-        
-        # Trade log file (INFO and above from execution module)
+
         logger.add(
-            log_dir / "trades_{time:YYYY-MM-DD}.log",
+            log_dir / _get_log_file_name("trades_{time:YYYY-MM-DD}.log"),
             level="INFO",
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}",
             filter=lambda record: "execution" in record["name"].lower() or "trade" in record["message"].lower(),
             rotation="00:00",
             retention="365 days"
         )
-        
-        # Live trading log file (separate from paper/testnet trading)
+
         logger.add(
-            log_dir / "grid_live.log",
+            log_dir / _get_log_file_name("grid_live.log"),
             level="INFO",
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
             filter=lambda record: "grid_live" in record["name"].lower() or "gridlivetrader" in str(record["extra"]),
