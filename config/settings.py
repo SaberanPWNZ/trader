@@ -198,11 +198,11 @@ class GridConfig:
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
     min_profit_threshold_percent: float = 0.0
-    rebalance_cooldown_minutes: int = 15
+    rebalance_cooldown_minutes: int = 60
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
     breakout_buffer_multiplier: float = 2.0
-    force_rebalance_after_hours: float = 8.0
+    force_rebalance_after_hours: float = 24.0
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0

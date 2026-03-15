@@ -815,7 +815,6 @@ class GridLiveTrader:
             f"Order size: ${config.amount_per_grid:.2f}"
         )
         
-        await self._prepare_base_for_sells(symbol, current_price)
         await self._place_grid_orders(symbol)
     
     async def _place_grid_orders(self, symbol: str):
@@ -841,9 +840,16 @@ class GridLiveTrader:
 
                 level.amount = self._round_amount(level.amount, market['amount_precision'])
 
-                if side == 'sell' and base_available < level.amount:
-                    logger.debug(f"Skipping SELL at ${level.price:.4f}: need {level.amount:.2f} {base}, have {base_available:.2f}")
-                    continue
+                if side == 'sell':
+                    if base_available < level.amount:
+                        if base_available > 0:
+                            partial = self._round_amount(base_available * 0.99, market['amount_precision'])
+                            if partial > 0 and partial * level.price >= market['min_notional']:
+                                level.amount = partial
+                            else:
+                                continue
+                        else:
+                            continue
 
                 level.price = self._round_price(level.price, market['price_precision'])
 
@@ -862,61 +868,6 @@ class GridLiveTrader:
 
             except Exception as e:
                 logger.error(f"Failed to place {side.upper()} order at ${level.price:.4f}: {e}")
-
-    async def _prepare_base_for_sells(self, symbol: str, current_price: float):
-        strategy = self.strategies[symbol]
-        base = symbol.split('/')[0]
-
-        sell_levels = [l for l in strategy.get_active_levels() if l.side == 'sell']
-        if not sell_levels:
-            return
-
-        total_base_needed = sum(l.amount for l in sell_levels)
-
-        balance_info = await self.exchange.fetch_balance()
-        base_free = balance_info.get(base, {}).get('free', 0)
-
-        deficit = total_base_needed - base_free
-        if deficit <= 0.001:
-            return
-
-        usdt_free = balance_info.get('USDT', {}).get('free', 0)
-
-        buy_levels = [l for l in strategy.get_active_levels() if l.side == 'buy']
-        usdt_reserved_for_buys = sum(l.amount * l.price for l in buy_levels)
-
-        max_usdt_for_base = usdt_free - usdt_reserved_for_buys
-        if max_usdt_for_base <= 0:
-            logger.warning(f"No USDT available for {base} purchase (all reserved for BUY orders)")
-            return
-
-        cost_estimate = deficit * current_price * 1.005
-        if cost_estimate > max_usdt_for_base:
-            deficit = (max_usdt_for_base * 0.99) / (current_price * 1.005)
-            logger.info(f"Reduced {base} purchase to {deficit:.4f} (limited by available USDT)")
-
-        market = await self._get_market_info(symbol)
-        amount = self._round_amount(deficit, market['amount_precision'])
-
-        if amount <= 0 or amount * current_price < market['min_notional']:
-            return
-
-        try:
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side='buy',
-                amount=amount
-            )
-            fill_price = order.get('average', order.get('price', current_price))
-            cost = order.get('cost', amount * fill_price)
-            logger.info(
-                f"\U0001f504 Market BUY {amount:.4f} {base} @ ${fill_price:.2f} "
-                f"(${cost:.2f}) to fund SELL grid levels"
-            )
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Failed to buy {base} for sell levels: {e}")
 
     async def _get_market_info(self, symbol: str) -> dict:
         try:
@@ -1115,6 +1066,24 @@ class GridLiveTrader:
         except Exception as e:
             logger.warning(f"Error cancelling old orders: {e}")
 
+        base = symbol.split('/')[0]
+        try:
+            balance_info = await self.exchange.fetch_balance()
+            base_free = balance_info.get(base, {}).get('free', 0)
+            if base_free > 0:
+                market = await self._get_market_info(symbol)
+                sell_amount = self._round_amount(base_free * 0.99, market['amount_precision'])
+                if sell_amount > 0 and sell_amount * current_price >= market['min_notional']:
+                    order = await self.exchange.create_order(
+                        symbol=symbol, type='market', side='sell', amount=sell_amount
+                    )
+                    fill_price = order.get('average', order.get('price', current_price))
+                    logger.info(f"🔄 Sold {sell_amount} {base} @ ${fill_price:.2f} before rebalance")
+                    await asyncio.sleep(0.5)
+            self.positions[symbol] = []
+        except Exception as e:
+            logger.warning(f"Error liquidating {base} before rebalance: {e}")
+
         advice = await self._get_ml_advice(symbol)
         grid_range_pct = advice.grid_range_pct
         center = current_price * (1 + advice.trend_bias)
@@ -1159,7 +1128,6 @@ class GridLiveTrader:
             + (f"\n{ml_tag}" if ml_tag else "")
         )
         
-        await self._prepare_base_for_sells(symbol, current_price)
         await self._place_grid_orders(symbol)
     
     async def _rebalance_excess_positions(self, symbol: str, current_price: float):
@@ -1268,9 +1236,17 @@ class GridLiveTrader:
                     level.amount = self._round_amount(level.amount, market['amount_precision'])
                     level.price = self._round_price(level.price, market['price_precision'])
 
-                    if level.side == 'sell' and base_available < level.amount:
-                        logger.debug(f"Skipping SELL: need {level.amount:.2f} {base}, have {base_available:.2f}")
-                        continue
+                    if level.side == 'sell':
+                        if base_available < level.amount:
+                            if base_available > 0:
+                                partial = self._round_amount(base_available * 0.99, market['amount_precision'])
+                                notional_check = partial * level.price
+                                if partial > 0 and notional_check >= market['min_notional']:
+                                    level.amount = partial
+                                else:
+                                    continue
+                            else:
+                                continue
 
                     try:
                         order = await self.exchange.create_order(
