@@ -777,7 +777,8 @@ class GridLiveTrader:
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        investment_per_symbol = usdt_free * settings.grid.investment_ratio
+        num_symbols = max(1, len(self.symbols))
+        investment_per_symbol = (usdt_free * settings.grid.investment_ratio) / num_symbols
 
         num_grids = advice.recommended_grids
         if investment_per_symbol / max(num_grids, 1) < settings.grid.min_order_value:
@@ -1089,45 +1090,26 @@ class GridLiveTrader:
                 market = await self._get_market_info(symbol)
                 sell_amount = self._round_amount(base_free * 0.99, market['amount_precision'])
                 if sell_amount > 0 and sell_amount * current_price >= market['min_notional']:
-                    order = await self.exchange.create_order(
-                        symbol=symbol, type='market', side='sell', amount=sell_amount
-                    )
-                    fill_price = order.get('average', order.get('price', current_price))
-                    logger.info(f"🔄 Sold {sell_amount} {base} @ ${fill_price:.2f} before rebalance")
-
-                    rebalance_pnl = 0.0
-                    remaining = sell_amount
-                    matched_entries = []
-                    while remaining > 1e-8 and self.positions[symbol]:
-                        pos = self.positions[symbol][0]
-                        matched = min(remaining, pos.amount)
-                        pnl = (fill_price - pos.entry_price) * matched
-                        rebalance_pnl += pnl
-                        matched_entries.append((pos.entry_price, matched))
-                        pos.amount -= matched
-                        remaining -= matched
-                        if pos.amount < 1e-8:
-                            self.positions[symbol].pop(0)
-
-                    fee = sell_amount * fill_price * 0.001
-                    rebalance_pnl -= fee
-                    self.realized_pnl += rebalance_pnl
-                    self.trading_pnl += rebalance_pnl
-                    if rebalance_pnl > 0:
-                        self.winning_trades += 1
-                    elif matched_entries:
-                        self.losing_trades += 1
-                    if matched_entries:
-                        self.completed_cycles += 1
-                        avg_entry = sum(e * a for e, a in matched_entries) / sum(a for _, a in matched_entries)
-                        logger.info(f"🔄 Rebalance PnL: ${rebalance_pnl:+.2f} (entry ${avg_entry:.2f} → sell ${fill_price:.2f}, fee ${fee:.4f})")
+                    avg_entry = self._get_avg_entry_price(symbol)
+                    if avg_entry and avg_entry > current_price:
+                        sell_price = avg_entry * 1.003
+                        sell_price = self._round_price(sell_price, market['price_precision'])
+                        order = await self.exchange.create_order(
+                            symbol=symbol, type='limit', side='sell',
+                            amount=sell_amount, price=sell_price
+                        )
+                        logger.info(f"🔄 Placed LIMIT sell {sell_amount} {base} @ ${sell_price:.2f} (entry ${avg_entry:.2f}, +0.3%)")
                     else:
-                        logger.info(f"🔄 Rebalance sell (no matched positions): {sell_amount} {base} @ ${fill_price:.2f}")
-
+                        sell_price = current_price * 1.002
+                        sell_price = self._round_price(sell_price, market['price_precision'])
+                        order = await self.exchange.create_order(
+                            symbol=symbol, type='limit', side='sell',
+                            amount=sell_amount, price=sell_price
+                        )
+                        logger.info(f"🔄 Placed LIMIT sell {sell_amount} {base} @ ${sell_price:.2f} (above market)")
                     await asyncio.sleep(0.5)
-            self.positions[symbol] = []
         except Exception as e:
-            logger.warning(f"Error liquidating {base} before rebalance: {e}")
+            logger.warning(f"Error placing rebalance sell for {base}: {e}")
 
         advice = await self._get_ml_advice(symbol)
         grid_range_pct = advice.grid_range_pct
@@ -1139,7 +1121,8 @@ class GridLiveTrader:
         
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        investment = usdt_free * settings.grid.investment_ratio
+        num_symbols = max(1, len(self.symbols))
+        investment = (usdt_free * settings.grid.investment_ratio) / num_symbols
         num_grids = advice.recommended_grids
         if investment / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment / settings.grid.min_order_value))
