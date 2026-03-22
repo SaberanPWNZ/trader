@@ -26,7 +26,7 @@ class ExchangeConfig:
 @dataclass
 class TradingConfig:
     """Trading parameters configuration."""
-    symbols: List[str] = field(default_factory=lambda: ["SOL/USDT"])
+    symbols: List[str] = field(default_factory=lambda: ["SOL/USDT", "ETH/USDT"])
     timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
     default_timeframe: str = "1h"
     mode: str = "paper"
@@ -179,10 +179,10 @@ class DatabaseConfig:
 @dataclass
 class GridConfig:
     """Grid trading configuration."""
-    grid_range_pct: float = 0.05
-    max_grids: int = 8
-    min_grids: int = 4
-    min_order_value: float = 15.0
+    grid_range_pct: float = 0.03
+    max_grids: int = 10
+    min_grids: int = 5
+    min_order_value: float = 12.0
     investment_ratio: float = 0.85
     max_open_positions: int = 6
     rebalance_threshold_positions: int = 5
@@ -202,7 +202,7 @@ class GridConfig:
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
     breakout_buffer_multiplier: float = 2.0
-    force_rebalance_after_hours: float = 24.0
+    force_rebalance_after_hours: float = 36.0
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0
