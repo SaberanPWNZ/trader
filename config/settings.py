@@ -26,7 +26,7 @@ class ExchangeConfig:
 @dataclass
 class TradingConfig:
     """Trading parameters configuration."""
-    symbols: List[str] = field(default_factory=lambda: ["SOL/USDT", "ETH/USDT"])
+    symbols: List[str] = field(default_factory=lambda: ["SOL/USDT"])
     timeframes: List[str] = field(default_factory=lambda: ["15m", "1h"])
     default_timeframe: str = "1h"
     mode: str = "paper"
