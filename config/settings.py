@@ -180,11 +180,11 @@ class DatabaseConfig:
 class GridConfig:
     """Grid trading configuration."""
     grid_range_pct: float = 0.05
-    max_grids: int = 6
-    min_grids: int = 3
+    max_grids: int = 8
+    min_grids: int = 4
     min_order_value: float = 15.0
-    investment_ratio: float = 0.60
-    max_open_positions: int = 4
+    investment_ratio: float = 0.85
+    max_open_positions: int = 6
     rebalance_threshold_positions: int = 5
     
     rebalance_interval_hours: float = field(default_factory=lambda: {
@@ -211,7 +211,7 @@ class GridConfig:
     
     trailing_stop_loss_enabled: bool = True
     trailing_stop_loss_percent: float = 5.0
-    trailing_stop_loss_trigger_percent: float = 3.0
+    trailing_stop_loss_trigger_percent: float = 5.0
     partial_close_ratio: float = 0.5
     enable_portfolio_protection: bool = True
     pause_after_stop_loss_hours: int = 24

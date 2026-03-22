@@ -816,6 +816,16 @@ class GridLiveTrader:
         )
         
         await self._place_grid_orders(symbol)
+
+    def _get_avg_entry_price(self, symbol: str) -> Optional[float]:
+        positions = self.positions.get(symbol, [])
+        if not positions:
+            return None
+        total_cost = sum(p.entry_price * p.amount for p in positions)
+        total_amount = sum(p.amount for p in positions)
+        if total_amount < 1e-8:
+            return None
+        return total_cost / total_amount
     
     async def _place_grid_orders(self, symbol: str):
         strategy = self.strategies[symbol]
@@ -826,6 +836,8 @@ class GridLiveTrader:
         base_available = balance_info.get(base, {}).get('free', 0)
 
         market = await self._get_market_info(symbol)
+
+        avg_entry = self._get_avg_entry_price(symbol)
 
         for level in active_levels:
             if level.order_id:
@@ -841,6 +853,9 @@ class GridLiveTrader:
                 level.amount = self._round_amount(level.amount, market['amount_precision'])
 
                 if side == 'sell':
+                    if avg_entry and level.price < avg_entry * 1.002:
+                        logger.debug(f"Skipping sell @ ${level.price:.4f} — below entry ${avg_entry:.4f}")
+                        continue
                     if base_available < level.amount:
                         if base_available > 0:
                             partial = self._round_amount(base_available * 0.99, market['amount_precision'])
@@ -1079,6 +1094,36 @@ class GridLiveTrader:
                     )
                     fill_price = order.get('average', order.get('price', current_price))
                     logger.info(f"🔄 Sold {sell_amount} {base} @ ${fill_price:.2f} before rebalance")
+
+                    rebalance_pnl = 0.0
+                    remaining = sell_amount
+                    matched_entries = []
+                    while remaining > 1e-8 and self.positions[symbol]:
+                        pos = self.positions[symbol][0]
+                        matched = min(remaining, pos.amount)
+                        pnl = (fill_price - pos.entry_price) * matched
+                        rebalance_pnl += pnl
+                        matched_entries.append((pos.entry_price, matched))
+                        pos.amount -= matched
+                        remaining -= matched
+                        if pos.amount < 1e-8:
+                            self.positions[symbol].pop(0)
+
+                    fee = sell_amount * fill_price * 0.001
+                    rebalance_pnl -= fee
+                    self.realized_pnl += rebalance_pnl
+                    self.trading_pnl += rebalance_pnl
+                    if rebalance_pnl > 0:
+                        self.winning_trades += 1
+                    elif matched_entries:
+                        self.losing_trades += 1
+                    if matched_entries:
+                        self.completed_cycles += 1
+                        avg_entry = sum(e * a for e, a in matched_entries) / sum(a for _, a in matched_entries)
+                        logger.info(f"🔄 Rebalance PnL: ${rebalance_pnl:+.2f} (entry ${avg_entry:.2f} → sell ${fill_price:.2f}, fee ${fee:.4f})")
+                    else:
+                        logger.info(f"🔄 Rebalance sell (no matched positions): {sell_amount} {base} @ ${fill_price:.2f}")
+
                     await asyncio.sleep(0.5)
             self.positions[symbol] = []
         except Exception as e:
@@ -1227,6 +1272,7 @@ class GridLiveTrader:
             balance = await self.exchange.fetch_balance()
             base_available = balance.get(base, {}).get('free', 0)
             market = await self._get_market_info(symbol)
+            avg_entry = self._get_avg_entry_price(symbol)
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
@@ -1237,6 +1283,9 @@ class GridLiveTrader:
                     level.price = self._round_price(level.price, market['price_precision'])
 
                     if level.side == 'sell':
+                        if avg_entry and level.price < avg_entry * 1.002:
+                            logger.debug(f"Skipping sell @ ${level.price:.4f} — below entry ${avg_entry:.4f}")
+                            continue
                         if base_available < level.amount:
                             if base_available > 0:
                                 partial = self._round_amount(base_available * 0.99, market['amount_precision'])
