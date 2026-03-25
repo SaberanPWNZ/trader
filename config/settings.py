@@ -198,20 +198,20 @@ class GridConfig:
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
     min_profit_threshold_percent: float = 0.0
-    rebalance_cooldown_minutes: int = 60
+    rebalance_cooldown_minutes: int = 120
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
     breakout_buffer_multiplier: float = 2.0
-    force_rebalance_after_hours: float = 36.0
+    force_rebalance_after_hours: float = 72.0
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0
     max_unrealized_loss_percent: float = 3.0
     partial_close_profit_percent: float = 10.0
     
-    trailing_stop_loss_enabled: bool = True
-    trailing_stop_loss_percent: float = 5.0
-    trailing_stop_loss_trigger_percent: float = 5.0
+    trailing_stop_loss_enabled: bool = False
+    trailing_stop_loss_percent: float = 15.0
+    trailing_stop_loss_trigger_percent: float = 15.0
     partial_close_ratio: float = 0.5
     enable_portfolio_protection: bool = True
     pause_after_stop_loss_hours: int = 24

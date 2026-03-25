@@ -874,7 +874,8 @@ class GridLiveTrader:
                     type='limit',
                     side=side,
                     amount=level.amount,
-                    price=level.price
+                    price=level.price,
+                    params={'postOnly': True}
                 )
                 level.order_id = order['id']
                 logger.info(f"Placed {side.upper()} order at ${level.price:.4f}, amount={level.amount:.2f} {base}, value=${level.amount * level.price:.2f}, id={order['id']}")
@@ -964,39 +965,13 @@ class GridLiveTrader:
         if datetime.utcnow() - init_time < cooldown:
             return False
 
-        buy_levels = [l for l in active_levels if l.side == "buy"]
-        sell_levels = [l for l in active_levels if l.side == "sell"]
-
-        nearest_buy = max((l.price for l in buy_levels), default=0)
-        nearest_sell = min((l.price for l in sell_levels), default=float('inf'))
-
-        if nearest_buy > 0 and nearest_sell < float('inf'):
-            gap_pct = (nearest_sell - nearest_buy) / current_price
-            if gap_pct > 0.04:
-                in_gap = nearest_buy < current_price < nearest_sell
-                if in_gap:
-                    hours_since_init = (datetime.utcnow() - init_time).total_seconds() / 3600
-                    force_hours = settings.grid.force_rebalance_after_hours
-                    if hours_since_init >= force_hours:
-                        logger.info(f"{symbol}: Force rebalance after {hours_since_init:.1f}h, gap={gap_pct:.1%}")
-                        return True
-
-                    config = self.strategies[symbol].config
-                    if config and config.num_grids > 0:
-                        full_range_pct = (config.upper_price - config.lower_price) / current_price
-                        gap_threshold = max(0.06, full_range_pct * 1.3)
-                    else:
-                        gap_threshold = 0.06
-
-                    if gap_pct > gap_threshold:
-                        logger.info(f"{symbol}: Wide gap rebalance, gap={gap_pct:.1%} > threshold={gap_threshold:.1%}")
-                        return True
-
         config = self.strategies[symbol].config
-        if config:
-            if current_price < config.lower_price or current_price > config.upper_price:
-                logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
-                return True
+        if not config:
+            return False
+
+        if current_price < config.lower_price or current_price > config.upper_price:
+            logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
+            return True
 
         return False
     
@@ -1082,34 +1057,9 @@ class GridLiveTrader:
         except Exception as e:
             logger.warning(f"Error cancelling old orders: {e}")
 
-        base = symbol.split('/')[0]
-        try:
-            balance_info = await self.exchange.fetch_balance()
-            base_free = balance_info.get(base, {}).get('free', 0)
-            if base_free > 0:
-                market = await self._get_market_info(symbol)
-                sell_amount = self._round_amount(base_free * 0.99, market['amount_precision'])
-                if sell_amount > 0 and sell_amount * current_price >= market['min_notional']:
-                    avg_entry = self._get_avg_entry_price(symbol)
-                    if avg_entry and avg_entry > current_price:
-                        sell_price = avg_entry * 1.003
-                        sell_price = self._round_price(sell_price, market['price_precision'])
-                        order = await self.exchange.create_order(
-                            symbol=symbol, type='limit', side='sell',
-                            amount=sell_amount, price=sell_price
-                        )
-                        logger.info(f"🔄 Placed LIMIT sell {sell_amount} {base} @ ${sell_price:.2f} (entry ${avg_entry:.2f}, +0.3%)")
-                    else:
-                        sell_price = current_price * 1.002
-                        sell_price = self._round_price(sell_price, market['price_precision'])
-                        order = await self.exchange.create_order(
-                            symbol=symbol, type='limit', side='sell',
-                            amount=sell_amount, price=sell_price
-                        )
-                        logger.info(f"🔄 Placed LIMIT sell {sell_amount} {base} @ ${sell_price:.2f} (above market)")
-                    await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"Error placing rebalance sell for {base}: {e}")
+        open_positions_count = len(self.positions.get(symbol, []))
+        avg_entry = self._get_avg_entry_price(symbol)
+        logger.info(f"🔄 Rebalance {symbol}: keeping {open_positions_count} positions (avg entry ${avg_entry:.2f if avg_entry else 0:.2f})")
 
         advice = await self._get_ml_advice(symbol)
         grid_range_pct = advice.grid_range_pct
@@ -1118,7 +1068,7 @@ class GridLiveTrader:
         lower_price = center * (1 - grid_range_pct)
 
         self._grid_init_prices[symbol] = current_price
-        
+
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
         num_symbols = max(1, len(self.symbols))
@@ -1126,7 +1076,7 @@ class GridLiveTrader:
         num_grids = advice.recommended_grids
         if investment / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment / settings.grid.min_order_value))
-        
+
         config = GridConfig(
             symbol=symbol,
             upper_price=upper_price,
@@ -1134,28 +1084,30 @@ class GridLiveTrader:
             num_grids=num_grids,
             total_investment=investment
         )
-        
+
         self.strategies[symbol].config = config
         self.strategies[symbol].center_price = current_price
         self.strategies[symbol].grid_levels = []
         self.strategies[symbol]._create_grid_levels(current_price)
         self.strategies[symbol].last_price = current_price
         self._grid_init_times[symbol] = datetime.utcnow()
-        
+
         ml_tag = f"🤖 {advice.reason}" if advice.confidence > 0 else ""
         logger.info(f"Grid reinitialized for {symbol}:")
         logger.info(f"  Price: ${current_price:.2f}")
         logger.info(f"  Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})")
+        logger.info(f"  Positions kept: {open_positions_count}")
         if ml_tag:
             logger.info(f"  {ml_tag}")
-        
+
         await telegram.send_message(
             f"🔄 Grid rebalanced: {symbol}\n"
             f"Price: ${current_price:.2f}\n"
-            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})"
+            f"Range: ${config.lower_price:.2f} - ${config.upper_price:.2f} ({grid_range_pct:.1%})\n"
+            f"Positions kept: {open_positions_count}"
             + (f"\n{ml_tag}" if ml_tag else "")
         )
-        
+
         await self._place_grid_orders(symbol)
     
     async def _rebalance_excess_positions(self, symbol: str, current_price: float):
@@ -1286,7 +1238,8 @@ class GridLiveTrader:
                             type='limit',
                             side=level.side,
                             amount=level.amount,
-                            price=level.price
+                            price=level.price,
+                            params={'postOnly': True}
                         )
                         level.order_id = order['id']
                         logger.debug(f"Placed new {level.side} order at ${level.price:.4f}")
