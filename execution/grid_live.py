@@ -1059,7 +1059,8 @@ class GridLiveTrader:
 
         open_positions_count = len(self.positions.get(symbol, []))
         avg_entry = self._get_avg_entry_price(symbol)
-        logger.info(f"🔄 Rebalance {symbol}: keeping {open_positions_count} positions (avg entry ${avg_entry:.2f if avg_entry else 0:.2f})")
+        entry_str = f"${avg_entry:.2f}" if avg_entry else "N/A"
+        logger.info(f"🔄 Rebalance {symbol}: keeping {open_positions_count} positions (avg entry {entry_str})")
 
         advice = await self._get_ml_advice(symbol)
         grid_range_pct = advice.grid_range_pct
