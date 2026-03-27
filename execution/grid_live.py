@@ -846,6 +846,10 @@ class GridLiveTrader:
 
             try:
                 side = level.side
+
+                if side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions - 1:
+                    continue
+
                 notional = level.amount * level.price
 
                 if notional < market['min_notional']:
@@ -931,20 +935,23 @@ class GridLiveTrader:
             return
         
         open_positions = len(self.positions[symbol])
-        if open_positions >= settings.grid.max_open_positions:
+        at_max_positions = open_positions >= settings.grid.max_open_positions
+        
+        if at_max_positions:
             await self._rebalance_excess_positions(symbol, current_price)
-            return
         
         active_levels = strategy.get_active_levels()
-        if len(active_levels) == 0:
-            logger.info(f"{symbol}: All grid levels filled, reinitializing grid...")
-            await self._reinitialize_grid(symbol, current_price)
-            return
         
-        if self._should_rebalance_grid(symbol, current_price, active_levels):
-            logger.info(f"{symbol}: Grid rebalance triggered — price drifted from active levels")
-            await self._reinitialize_grid(symbol, current_price)
-            return
+        if not at_max_positions:
+            if len(active_levels) == 0:
+                logger.info(f"{symbol}: All grid levels filled, reinitializing grid...")
+                await self._reinitialize_grid(symbol, current_price)
+                return
+            
+            if self._should_rebalance_grid(symbol, current_price, active_levels):
+                logger.info(f"{symbol}: Grid rebalance triggered — price drifted from active levels")
+                await self._reinitialize_grid(symbol, current_price)
+                return
         
         fills = strategy.check_grid_fills(current_price)
         
@@ -970,6 +977,15 @@ class GridLiveTrader:
             return False
 
         if current_price < config.lower_price or current_price > config.upper_price:
+            open_positions = len(self.positions.get(symbol, []))
+            if open_positions >= settings.grid.max_open_positions - 1:
+                avg_entry = self._get_avg_entry_price(symbol)
+                if avg_entry and current_price < avg_entry * 0.97:
+                    logger.info(
+                        f"{symbol}: Price ${current_price:.2f} outside range but "
+                        f"{open_positions} positions underwater (entry ${avg_entry:.2f}), skipping rebalance"
+                    )
+                    return False
             logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
             return True
 
@@ -1121,7 +1137,7 @@ class GridLiveTrader:
 
         last_rebalance = self._last_rebalance_times.get(symbol)
         if last_rebalance:
-            cooldown = timedelta(minutes=5)
+            cooldown = timedelta(minutes=30)
             if datetime.utcnow() - last_rebalance < cooldown:
                 return
 
@@ -1138,6 +1154,13 @@ class GridLiveTrader:
 
         avg_entry = sum(p.entry_price for _, p in worst_positions) / len(worst_positions)
         sell_price = max(avg_entry * 1.002, current_price * 1.001)
+
+        if sell_price > current_price * 1.05:
+            logger.info(
+                f"{symbol}: {open_positions} positions, sell ${sell_price:.2f} too far from market ${current_price:.2f}, holding"
+            )
+            self._last_rebalance_times[symbol] = datetime.utcnow()
+            return
 
         total_amount = sum(p.amount for _, p in worst_positions)
 
@@ -1212,6 +1235,9 @@ class GridLiveTrader:
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
+                    if level.side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions - 1:
+                        continue
+
                     notional = level.amount * level.price
                     if notional < market['min_notional']:
                         level.amount = (market['min_notional'] * 1.05) / level.price
