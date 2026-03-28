@@ -827,6 +827,12 @@ class GridLiveTrader:
         if total_amount < 1e-8:
             return None
         return total_cost / total_amount
+
+    def _get_min_entry_price(self, symbol: str) -> Optional[float]:
+        positions = self.positions.get(symbol, [])
+        if not positions:
+            return None
+        return min(p.entry_price for p in positions)
     
     async def _place_grid_orders(self, symbol: str):
         strategy = self.strategies[symbol]
@@ -838,7 +844,7 @@ class GridLiveTrader:
 
         market = await self._get_market_info(symbol)
 
-        avg_entry = self._get_avg_entry_price(symbol)
+        min_entry = self._get_min_entry_price(symbol)
 
         for level in active_levels:
             if level.order_id:
@@ -858,8 +864,8 @@ class GridLiveTrader:
                 level.amount = self._round_amount(level.amount, market['amount_precision'])
 
                 if side == 'sell':
-                    if avg_entry and level.price < avg_entry * 1.002:
-                        logger.debug(f"Skipping sell @ ${level.price:.4f} — below entry ${avg_entry:.4f}")
+                    if min_entry and level.price < min_entry * 1.002:
+                        logger.debug(f"Skipping sell @ ${level.price:.4f} — below min entry ${min_entry:.4f}")
                         continue
                     if base_available < level.amount:
                         if base_available > 0:
@@ -1130,9 +1136,8 @@ class GridLiveTrader:
     async def _rebalance_excess_positions(self, symbol: str, current_price: float):
         open_positions = len(self.positions[symbol])
         max_positions = settings.grid.max_open_positions
-        threshold = settings.grid.rebalance_threshold_positions
 
-        if open_positions < threshold:
+        if open_positions <= max_positions:
             return
 
         last_rebalance = self._last_rebalance_times.get(symbol)
@@ -1141,8 +1146,50 @@ class GridLiveTrader:
             if datetime.utcnow() - last_rebalance < cooldown:
                 return
 
-        positions_to_close = open_positions - (max_positions - 1)
-        if positions_to_close <= 0:
+        base = symbol.split('/')[0]
+        balance_info = await self.exchange.fetch_balance()
+        base_available = balance_info.get(base, {}).get('free', 0)
+        market = await self._get_market_info(symbol)
+
+        profitable = [
+            (i, p) for i, p in enumerate(self.positions[symbol])
+            if current_price >= p.entry_price * 1.002
+        ]
+
+        if profitable:
+            profitable.sort(key=lambda x: x[1].entry_price)
+            to_sell = profitable[:open_positions - max_positions + 1]
+            total_amount = sum(p.amount for _, p in to_sell)
+            if total_amount > base_available:
+                total_amount = base_available * 0.99
+
+            sell_price = self._round_price(current_price * 0.999, market.get('price_precision', 0.01))
+            amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
+
+            if amount > 0 and amount * sell_price >= market['min_notional']:
+                try:
+                    order = await self.exchange.create_order(
+                        symbol=symbol, type='limit', side='sell',
+                        amount=amount, price=sell_price, params={'postOnly': True}
+                    )
+                    avg_e = sum(p.entry_price for _, p in to_sell) / len(to_sell)
+                    logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ${sell_price:.2f} (avg entry ${avg_e:.2f})")
+                    self._last_rebalance_times[symbol] = datetime.utcnow()
+                    await telegram.send_message(
+                        f"📉 Selling profitable positions {symbol}\n"
+                        f"Amount: {amount} {base} @ ${sell_price:.2f}\n"
+                        f"Avg entry: ${avg_e:.2f}\n"
+                        f"Positions: {open_positions} → {open_positions - len(to_sell)}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed profitable rebalance sell: {e}")
+            return
+
+        if open_positions <= max_positions * 2:
+            logger.info(
+                f"{symbol}: {open_positions} underwater positions, holding (market ${current_price:.2f})"
+            )
+            self._last_rebalance_times[symbol] = datetime.utcnow()
             return
 
         sorted_positions = sorted(
@@ -1150,65 +1197,47 @@ class GridLiveTrader:
             key=lambda x: x[1].entry_price,
             reverse=True
         )
-        worst_positions = sorted_positions[:positions_to_close]
-
-        avg_entry = sum(p.entry_price for _, p in worst_positions) / len(worst_positions)
-        sell_price = max(avg_entry * 1.002, current_price * 1.001)
-
-        if sell_price > current_price * 1.05:
-            logger.info(
-                f"{symbol}: {open_positions} positions, sell ${sell_price:.2f} too far from market ${current_price:.2f}, holding"
-            )
-            self._last_rebalance_times[symbol] = datetime.utcnow()
-            return
-
-        total_amount = sum(p.amount for _, p in worst_positions)
-
-        base = symbol.split('/')[0]
-        balance_info = await self.exchange.fetch_balance()
-        base_available = balance_info.get(base, {}).get('free', 0)
+        to_cut = sorted_positions[:open_positions - max_positions]
+        total_amount = sum(p.amount for _, p in to_cut)
+        avg_entry = sum(p.entry_price for _, p in to_cut) / len(to_cut)
+        loss_per_unit = avg_entry - current_price
+        total_loss = loss_per_unit * total_amount
 
         if total_amount > base_available:
             total_amount = base_available * 0.99
-        
-        order_value = total_amount * sell_price
-        
-        if order_value < settings.grid.min_order_value:
-            logger.info(f"Rebalance: not enough {base} to sell (${order_value:.2f} < ${settings.grid.min_order_value}), clearing stuck positions")
-            self.positions[symbol] = [p for i, p in enumerate(self.positions[symbol]) 
-                                       if i not in [idx for idx, _ in worst_positions]]
+
+        amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
+
+        if amount <= 0 or amount * current_price < market['min_notional']:
+            logger.info(f"Rebalance: not enough {base} to sell, clearing phantom positions")
+            indices_to_remove = {idx for idx, _ in to_cut}
+            self.positions[symbol] = [p for i, p in enumerate(self.positions[symbol]) if i not in indices_to_remove]
             return
 
-        logger.warning(f"⚠️ {symbol}: {open_positions} positions, placing limit sell for {positions_to_close} worst @ ${sell_price:.2f} (avg entry ${avg_entry:.2f})")
+        logger.warning(
+            f"🔻 {symbol}: {open_positions} positions (3x+ max), cutting {len(to_cut)} worst @ market "
+            f"(avg entry ${avg_entry:.2f}, est loss ${total_loss:.2f})"
+        )
 
-        if total_amount > 0:
-            try:
-                market = await self._get_market_info(symbol)
-                amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
-                sell_price = self._round_price(sell_price, market.get('price_precision', 0.01))
+        try:
+            order = await self.exchange.create_order(
+                symbol=symbol, type='market', side='sell', amount=amount
+            )
+            logger.info(f"🔻 Market SELL executed: {amount} {base} (cut-loss)")
+            self._last_rebalance_times[symbol] = datetime.utcnow()
 
-                if amount > 0:
-                    order = await self.exchange.create_order(
-                        symbol=symbol,
-                        type='limit',
-                        side='sell',
-                        amount=amount,
-                        price=sell_price
-                    )
-                    logger.info(f"📉 Limit SELL placed: {amount} {base} @ ${sell_price:.2f} (break-even rebalance)")
-                    
-                    self._last_rebalance_times[symbol] = datetime.utcnow()
-                    
-                    await telegram.send_message(
-                        f"⚠️ REBALANCING {symbol}\n"
-                        f"Open positions: {open_positions}\n"
-                        f"Closed {positions_to_close} worst positions\n"
-                        f"Avg entry: ${avg_entry:.2f}\n"
-                        f"Limit sell: ${sell_price:.2f}\n"
-                        f"Amount: {amount} {base}"
-                    )
-            except Exception as e:
-                logger.error(f"Failed to execute rebalance sell: {e}")
+            indices_to_remove = {idx for idx, _ in to_cut}
+            self.positions[symbol] = [p for i, p in enumerate(self.positions[symbol]) if i not in indices_to_remove]
+
+            await telegram.send_message(
+                f"🔻 CUT LOSS {symbol}\n"
+                f"Sold {amount} {base} @ ~${current_price:.2f}\n"
+                f"Avg entry: ${avg_entry:.2f}\n"
+                f"Est loss: ${total_loss:.2f}\n"
+                f"Positions: {open_positions} → {len(self.positions[symbol])}"
+            )
+        except Exception as e:
+            logger.error(f"Failed cut-loss sell: {e}")
     
     async def _process_fill(self, symbol: str, fill: dict):
         logger.debug(f"Grid fill detected: {fill['side']} @ ${fill['price']:.2f} - will be synced from exchange")
@@ -1231,7 +1260,7 @@ class GridLiveTrader:
             balance = await self.exchange.fetch_balance()
             base_available = balance.get(base, {}).get('free', 0)
             market = await self._get_market_info(symbol)
-            avg_entry = self._get_avg_entry_price(symbol)
+            min_entry = self._get_min_entry_price(symbol)
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
@@ -1245,8 +1274,8 @@ class GridLiveTrader:
                     level.price = self._round_price(level.price, market['price_precision'])
 
                     if level.side == 'sell':
-                        if avg_entry and level.price < avg_entry * 1.002:
-                            logger.debug(f"Skipping sell @ ${level.price:.4f} — below entry ${avg_entry:.4f}")
+                        if min_entry and level.price < min_entry * 1.002:
+                            logger.debug(f"Skipping sell @ ${level.price:.4f} — below min entry ${min_entry:.4f}")
                             continue
                         if base_available < level.amount:
                             if base_available > 0:
