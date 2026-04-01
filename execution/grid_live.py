@@ -853,7 +853,7 @@ class GridLiveTrader:
             try:
                 side = level.side
 
-                if side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions - 1:
+                if side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions:
                     continue
 
                 notional = level.amount * level.price
@@ -941,23 +941,23 @@ class GridLiveTrader:
             return
         
         open_positions = len(self.positions[symbol])
-        at_max_positions = open_positions >= settings.grid.max_open_positions
+        over_max = open_positions > settings.grid.max_open_positions
         
-        if at_max_positions:
+        if over_max:
             await self._rebalance_excess_positions(symbol, current_price)
+            return
         
         active_levels = strategy.get_active_levels()
         
-        if not at_max_positions:
-            if len(active_levels) == 0:
-                logger.info(f"{symbol}: All grid levels filled, reinitializing grid...")
-                await self._reinitialize_grid(symbol, current_price)
-                return
-            
-            if self._should_rebalance_grid(symbol, current_price, active_levels):
-                logger.info(f"{symbol}: Grid rebalance triggered — price drifted from active levels")
-                await self._reinitialize_grid(symbol, current_price)
-                return
+        if len(active_levels) == 0:
+            logger.info(f"{symbol}: All grid levels filled, reinitializing grid...")
+            await self._reinitialize_grid(symbol, current_price)
+            return
+        
+        if self._should_rebalance_grid(symbol, current_price, active_levels):
+            logger.info(f"{symbol}: Grid rebalance triggered — price drifted from active levels")
+            await self._reinitialize_grid(symbol, current_price)
+            return
         
         fills = strategy.check_grid_fills(current_price)
         
@@ -1264,7 +1264,7 @@ class GridLiveTrader:
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
-                    if level.side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions - 1:
+                    if level.side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions:
                         continue
 
                     notional = level.amount * level.price

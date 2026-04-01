@@ -184,8 +184,8 @@ class GridConfig:
     min_grids: int = 5
     min_order_value: float = 12.0
     investment_ratio: float = 0.85
-    max_open_positions: int = 4
-    rebalance_threshold_positions: int = 4
+    max_open_positions: int = 6
+    rebalance_threshold_positions: int = 6
     
     rebalance_interval_hours: float = field(default_factory=lambda: {
         "BTC/USDT": 12.0,
