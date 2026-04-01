@@ -828,11 +828,11 @@ class GridLiveTrader:
             return None
         return total_cost / total_amount
 
-    def _get_min_entry_price(self, symbol: str) -> Optional[float]:
+    def _has_profitable_position(self, symbol: str, sell_price: float) -> bool:
         positions = self.positions.get(symbol, [])
         if not positions:
-            return None
-        return min(p.entry_price for p in positions)
+            return False
+        return any(sell_price > p.entry_price * 1.002 for p in positions)
     
     async def _place_grid_orders(self, symbol: str):
         strategy = self.strategies[symbol]
@@ -843,8 +843,6 @@ class GridLiveTrader:
         base_available = balance_info.get(base, {}).get('free', 0)
 
         market = await self._get_market_info(symbol)
-
-        min_entry = self._get_min_entry_price(symbol)
 
         for level in active_levels:
             if level.order_id:
@@ -864,8 +862,8 @@ class GridLiveTrader:
                 level.amount = self._round_amount(level.amount, market['amount_precision'])
 
                 if side == 'sell':
-                    if min_entry and level.price < min_entry * 1.002:
-                        logger.debug(f"Skipping sell @ ${level.price:.4f} — below min entry ${min_entry:.4f}")
+                    if not self._has_profitable_position(symbol, level.price):
+                        logger.debug(f"Skipping sell @ ${level.price:.4f} — no profitable position")
                         continue
                     if base_available < level.amount:
                         if base_available > 0:
@@ -1260,7 +1258,6 @@ class GridLiveTrader:
             balance = await self.exchange.fetch_balance()
             base_available = balance.get(base, {}).get('free', 0)
             market = await self._get_market_info(symbol)
-            min_entry = self._get_min_entry_price(symbol)
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
@@ -1274,8 +1271,8 @@ class GridLiveTrader:
                     level.price = self._round_price(level.price, market['price_precision'])
 
                     if level.side == 'sell':
-                        if min_entry and level.price < min_entry * 1.002:
-                            logger.debug(f"Skipping sell @ ${level.price:.4f} — below min entry ${min_entry:.4f}")
+                        if not self._has_profitable_position(symbol, level.price):
+                            logger.debug(f"Skipping sell @ ${level.price:.4f} — no profitable position")
                             continue
                         if base_available < level.amount:
                             if base_available > 0:
