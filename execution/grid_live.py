@@ -943,7 +943,6 @@ class GridLiveTrader:
         
         if over_max:
             await self._rebalance_excess_positions(symbol, current_price)
-            return
         
         active_levels = strategy.get_active_levels()
         
