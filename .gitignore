@@ -73,3 +73,8 @@ models/*.pkl
 
 *.csv.git-filter-repo/
 .git-backup/
+
+# Ignore archive folders and CSV data files
+archive_*/
+data/*.csv
+data/local/
