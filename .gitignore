@@ -71,4 +71,4 @@ models/*.pkl
 .ipynb_checkpoints/
 
 
-*.csv
+*.csv.git-filter-repo/
