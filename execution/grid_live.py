@@ -435,6 +435,7 @@ class GridLiveTrader:
 
                 logger.info(f"   Current positions: {len(self.positions[symbol])}")
                 if side == 'SELL' and self.positions[symbol]:
+                    self.positions[symbol].sort(key=lambda p: p.entry_price)
                     remaining = amount
                     total_gross_pnl = 0.0
                     total_matched = 0.0
@@ -1160,21 +1161,20 @@ class GridLiveTrader:
             if total_amount > base_available:
                 total_amount = base_available * 0.99
 
-            sell_price = self._round_price(current_price * 0.999, market.get('price_precision', 0.01))
             amount = self._round_amount(total_amount, market.get('amount_precision', 0.001))
 
-            if amount > 0 and amount * sell_price >= market['min_notional']:
+            if amount > 0 and amount * current_price >= market['min_notional']:
                 try:
                     order = await self.exchange.create_order(
-                        symbol=symbol, type='limit', side='sell',
-                        amount=amount, price=sell_price, params={'postOnly': True}
+                        symbol=symbol, type='market', side='sell',
+                        amount=amount
                     )
                     avg_e = sum(p.entry_price for _, p in to_sell) / len(to_sell)
-                    logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ${sell_price:.2f} (avg entry ${avg_e:.2f})")
+                    logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ~${current_price:.2f} (avg entry ${avg_e:.2f})")
                     self._last_rebalance_times[symbol] = datetime.utcnow()
                     await telegram.send_message(
                         f"📉 Selling profitable positions {symbol}\n"
-                        f"Amount: {amount} {base} @ ${sell_price:.2f}\n"
+                        f"Amount: {amount} {base} @ ~${current_price:.2f}\n"
                         f"Avg entry: ${avg_e:.2f}\n"
                         f"Positions: {open_positions} → {open_positions - len(to_sell)}"
                     )
