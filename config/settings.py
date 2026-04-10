@@ -179,10 +179,10 @@ class DatabaseConfig:
 @dataclass
 class GridConfig:
     """Grid trading configuration."""
-    grid_range_pct: float = 0.03
+    grid_range_pct: float = 0.02
     max_grids: int = 10
-    min_grids: int = 5
-    min_order_value: float = 12.0
+    min_grids: int = 8
+    min_order_value: float = 7.0
     investment_ratio: float = 0.85
     max_open_positions: int = 6
     rebalance_threshold_positions: int = 6
@@ -198,7 +198,7 @@ class GridConfig:
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
     min_profit_threshold_percent: float = 0.0
-    rebalance_cooldown_minutes: int = 120
+    rebalance_cooldown_minutes: int = 30
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
     breakout_buffer_multiplier: float = 2.0

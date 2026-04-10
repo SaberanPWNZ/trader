@@ -993,6 +993,15 @@ class GridLiveTrader:
             logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
             return True
 
+        unfilled = [l for l in active_levels if not l.filled]
+        if unfilled:
+            nearest_distance = min(abs(current_price - l.price) / current_price for l in unfilled)
+            if nearest_distance > 0.015:
+                logger.info(
+                    f"{symbol}: Price ${current_price:.2f} drifted {nearest_distance:.1%} from nearest level, re-centering grid"
+                )
+                return True
+
         return False
     
     def _check_trailing_stop_loss(self, symbol: str, current_price: float) -> bool:
