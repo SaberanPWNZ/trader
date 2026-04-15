@@ -833,7 +833,7 @@ class GridLiveTrader:
         positions = self.positions.get(symbol, [])
         if not positions:
             return False
-        return any(sell_price > p.entry_price * 1.002 for p in positions)
+        return any(sell_price > p.entry_price for p in positions)
     
     async def _place_grid_orders(self, symbol: str):
         strategy = self.strategies[symbol]
@@ -1160,7 +1160,7 @@ class GridLiveTrader:
 
         profitable = [
             (i, p) for i, p in enumerate(self.positions[symbol])
-            if current_price >= p.entry_price * 1.002
+            if current_price >= p.entry_price
         ]
 
         if profitable:
@@ -1181,19 +1181,22 @@ class GridLiveTrader:
                     avg_e = sum(p.entry_price for _, p in to_sell) / len(to_sell)
                     logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ~${current_price:.2f} (avg entry ${avg_e:.2f})")
                     self._last_rebalance_times[symbol] = datetime.utcnow()
+                    indices_to_remove = {idx for idx, _ in to_sell}
+                    self.positions[symbol] = [p for i, p in enumerate(self.positions[symbol]) if i not in indices_to_remove]
                     await telegram.send_message(
                         f"📉 Selling profitable positions {symbol}\n"
                         f"Amount: {amount} {base} @ ~${current_price:.2f}\n"
                         f"Avg entry: ${avg_e:.2f}\n"
-                        f"Positions: {open_positions} → {open_positions - len(to_sell)}"
+                        f"Positions: {open_positions} → {len(self.positions[symbol])}"
                     )
                 except Exception as e:
                     logger.error(f"Failed profitable rebalance sell: {e}")
             return
 
-        if open_positions <= max_positions * 2:
+        excess = open_positions - max_positions
+        if excess <= 2:
             logger.info(
-                f"{symbol}: {open_positions} underwater positions, holding (market ${current_price:.2f})"
+                f"{symbol}: {open_positions} underwater positions ({excess} over max), holding (market ${current_price:.2f})"
             )
             self._last_rebalance_times[symbol] = datetime.utcnow()
             return
