@@ -852,8 +852,15 @@ class GridLiveTrader:
             try:
                 side = level.side
 
-                if side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions:
-                    continue
+                if side == 'buy':
+                    positions = self.positions.get(symbol, [])
+                    max_pos = settings.grid.max_open_positions
+                    if len(positions) >= max_pos:
+                        avg_entry = self._get_avg_entry_price(symbol)
+                        if avg_entry and level.price < avg_entry * 0.97:
+                            max_pos += 2
+                    if len(positions) >= max_pos:
+                        continue
 
                 notional = level.amount * level.price
 
@@ -985,11 +992,20 @@ class GridLiveTrader:
             if open_positions >= settings.grid.max_open_positions - 1:
                 avg_entry = self._get_avg_entry_price(symbol)
                 if avg_entry and current_price < avg_entry * 0.97:
-                    logger.info(
-                        f"{symbol}: Price ${current_price:.2f} outside range but "
-                        f"{open_positions} positions underwater (entry ${avg_entry:.2f}), skipping rebalance"
-                    )
-                    return False
+                    hours_stuck = (datetime.utcnow() - init_time).total_seconds() / 3600
+                    if hours_stuck < 4:
+                        logger.info(
+                            f"{symbol}: Price ${current_price:.2f} outside range but "
+                            f"{open_positions} positions underwater (entry ${avg_entry:.2f}), "
+                            f"skipping rebalance ({hours_stuck:.1f}h)"
+                        )
+                        return False
+                    else:
+                        logger.warning(
+                            f"{symbol}: FORCE rebalance after {hours_stuck:.1f}h deadlock — "
+                            f"Price ${current_price:.2f}, {open_positions} positions underwater "
+                            f"(entry ${avg_entry:.2f})"
+                        )
             logger.info(f"{symbol}: Price ${current_price:.2f} outside grid range ${config.lower_price:.2f}-${config.upper_price:.2f}")
             return True
 
@@ -1272,8 +1288,15 @@ class GridLiveTrader:
 
             for level in active_levels:
                 if not level.order_id and not level.filled:
-                    if level.side == 'buy' and len(self.positions.get(symbol, [])) >= settings.grid.max_open_positions:
-                        continue
+                    if level.side == 'buy':
+                        positions = self.positions.get(symbol, [])
+                        max_pos = settings.grid.max_open_positions
+                        if len(positions) >= max_pos:
+                            avg_entry = self._get_avg_entry_price(symbol)
+                            if avg_entry and level.price < avg_entry * 0.97:
+                                max_pos += 2
+                        if len(positions) >= max_pos:
+                            continue
 
                     notional = level.amount * level.price
                     if notional < market['min_notional']:
