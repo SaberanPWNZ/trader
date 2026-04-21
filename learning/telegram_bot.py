@@ -568,6 +568,8 @@ class LearningTelegramBot:
     async def _cmd_stats(self, args: list) -> None:
         try:
             state_file = "data/grid_live_balance.json"
+            trades_file = "data/grid_live_trades.csv"
+
             if not os.path.exists(state_file):
                 await self._send_message("❌ No trading data yet")
                 return
@@ -577,61 +579,104 @@ class LearningTelegramBot:
 
             initial = state.get('initial_balance', 0)
             total_value = state.get('total_value', 0)
-            trading_pnl = state.get('trading_pnl', 0)
-            holding_pnl = state.get('holding_pnl', 0)
-            total_fees = state.get('total_fees_paid', 0)
-
-            cycles = state.get('completed_cycles', 0)
-            wins = state.get('winning_trades', 0)
-            losses = state.get('losing_trades', 0)
-            win_rate = state.get('win_rate', 0)
-            avg_profit = state.get('avg_profit_per_cycle', 0)
-
-            symbols = state.get('symbols', settings.trading.symbols)
-            initial_prices = state.get('initial_base_prices', {})
-
             total_pnl = total_value - initial
             total_pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
 
+            monthly = self._compute_monthly_stats(trades_file)
+
             lines = [
-                "📊 <b>Детальна статистика торгівлі (MAINNET 🔴)</b>",
-                "",
-                "<b>💵 ПРИБУТКИ:</b>",
-                f"├ Trading PnL: <b>${trading_pnl:+.2f}</b>",
-                f"├ Holding PnL: <b>${holding_pnl:+.2f}</b>",
-                f"├ Total PnL: <b>${total_pnl:+.2f}</b> ({total_pnl_pct:+.2f}%)",
-                f"└ Fees Paid: <code>-${total_fees:.2f}</code>",
-                "",
-                "<b>📈 ТОРГІВЛЯ:</b>",
-                f"├ Cycles: <b>{cycles}</b>",
-                f"├ Win Rate: <b>{win_rate:.1f}%</b> ({wins}W / {losses}L)",
-                f"└ Avg per cycle: <b>${avg_profit:+.2f}</b>",
+                "📊 <b>Статистика торгівлі по місяцях (MAINNET 🔴)</b>",
                 "",
                 "<b>💰 БАЛАНС:</b>",
                 f"├ Initial: ${initial:.2f}",
-                f"└ Current: <b>${total_value:.2f}</b>",
+                f"├ Current: <b>${total_value:.2f}</b>",
+                f"└ Total PnL: <b>${total_pnl:+.2f}</b> ({total_pnl_pct:+.2f}%)",
+                "",
             ]
 
-            for sym in symbols:
-                base = sym.split('/')[0]
-                ip = initial_prices.get(base, 0)
-                cp = state.get(f'{base.lower()}_price', ip)
-                if ip > 0:
-                    change = ((cp - ip) / ip * 100)
-                    lines.append(f"   {base}: ${ip:.2f} → ${cp:.2f} ({change:+.1f}%)")
+            if not monthly:
+                lines.append("<i>Немає завершених циклів</i>")
+            else:
+                lines.append("<b>📅 ПО МІСЯЦЯХ:</b>")
+                for month in sorted(monthly.keys()):
+                    m = monthly[month]
+                    wr = (m['wins'] / m['cycles'] * 100) if m['cycles'] > 0 else 0
+                    avg = (m['pnl'] / m['cycles']) if m['cycles'] > 0 else 0
+                    lines.append(f"<b>{month}</b>")
+                    lines.append(
+                        f"├ Cycles: <b>{m['cycles']}</b> "
+                        f"({m['wins']}W / {m['losses']}L, {wr:.0f}%)"
+                    )
+                    lines.append(f"├ PnL: <b>${m['pnl']:+.2f}</b> (avg ${avg:+.2f})")
+                    lines.append(f"└ Fees: <code>-${m['fees']:.2f}</code>")
 
-            if cycles > 0:
+                total_cycles = sum(m['cycles'] for m in monthly.values())
+                total_wins = sum(m['wins'] for m in monthly.values())
+                total_losses = sum(m['losses'] for m in monthly.values())
+                total_trading_pnl = sum(m['pnl'] for m in monthly.values())
+                total_fees = sum(m['fees'] for m in monthly.values())
+                overall_wr = (total_wins / total_cycles * 100) if total_cycles > 0 else 0
+
                 lines.append("")
-                lines.append("<b>📌 ПОЯСНЕННЯ:</b>")
-                lines.append("• <b>Trading PnL</b> = прибуток від циклів купівлі-продажу")
-                lines.append("• <b>Holding PnL</b> = зміна вартості через ціну")
-                lines.append("• <b>Win Rate</b> = % прибуткових циклів")
+                lines.append("<b>📈 ВСЬОГО:</b>")
+                lines.append(
+                    f"├ Cycles: <b>{total_cycles}</b> "
+                    f"({total_wins}W / {total_losses}L, {overall_wr:.1f}%)"
+                )
+                lines.append(f"├ Trading PnL: <b>${total_trading_pnl:+.2f}</b>")
+                lines.append(f"└ Fees: <code>-${total_fees:.2f}</code>")
 
             await self._send_message("\n".join(lines))
 
         except Exception as e:
             logger.error(f"Stats command error: {e}")
             await self._send_message(f"❌ Error: {e}")
+
+    def _compute_monthly_stats(self, trades_file: str) -> Dict[str, Dict[str, float]]:
+        monthly: Dict[str, Dict[str, float]] = {}
+        if not os.path.exists(trades_file):
+            return monthly
+
+        with open(trades_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts = row.get('timestamp', '')
+                if not ts:
+                    continue
+                try:
+                    month = datetime.fromisoformat(ts).strftime('%Y-%m')
+                except ValueError:
+                    continue
+
+                bucket = monthly.setdefault(month, {
+                    'cycles': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0, 'fees': 0.0
+                })
+
+                try:
+                    fee = float(row.get('fee') or 0)
+                except ValueError:
+                    fee = 0.0
+                bucket['fees'] += fee
+
+                if row.get('side') != 'sell':
+                    continue
+
+                try:
+                    pnl = float(row.get('trading_pnl') or 0)
+                except ValueError:
+                    pnl = 0.0
+
+                if pnl == 0:
+                    continue
+
+                bucket['cycles'] += 1
+                bucket['pnl'] += pnl
+                if pnl > 0:
+                    bucket['wins'] += 1
+                else:
+                    bucket['losses'] += 1
+
+        return monthly
 
     async def _cmd_daily(self, args: list) -> None:
         try:
