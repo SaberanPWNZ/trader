@@ -215,6 +215,15 @@ class GridConfig:
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0
+    # Trailing portfolio take-profit. When enabled, the trader tracks the
+    # peak total_value seen since startup. If total_value drops by
+    # ``trailing_portfolio_tp_drawdown_percent`` from that peak — and the
+    # peak is at least ``trailing_portfolio_tp_arm_percent`` above the
+    # initial balance — the trader takes profit. This locks in gains in
+    # trends instead of waiting for a fixed +50% from initial.
+    trailing_portfolio_tp_enabled: bool = False
+    trailing_portfolio_tp_arm_percent: float = 10.0
+    trailing_portfolio_tp_drawdown_percent: float = 3.0
     max_unrealized_loss_percent: float = 3.0
     partial_close_profit_percent: float = 10.0
     

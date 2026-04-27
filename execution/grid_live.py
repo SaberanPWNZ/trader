@@ -13,6 +13,10 @@ from strategies.ml_grid_advisor import MLGridAdvisor
 from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
+from execution.portfolio_protection import (
+    TrailingTPState,
+    check_trailing_take_profit,
+)
 
 
 @dataclass
@@ -66,6 +70,12 @@ class GridLiveTrader:
         self._grid_init_prices: Dict[str, float] = {}
         self._fee_ticker_cache: Dict[str, tuple] = {}
         self._fee_ticker_ttl_seconds: int = 60
+        # Peak portfolio value (since startup) used by the trailing
+        # portfolio take-profit. Stored separately from ``initial_balance``
+        # so the trail follows the high-water mark, not just the starting
+        # capital.
+        self._peak_portfolio_value: float = 0.0
+        self._trailing_tp_state = TrailingTPState()
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -734,7 +744,37 @@ class GridLiveTrader:
                     await telegram.send_message(emergency_msg)
                     self._emergency_stop = True
                     self._running = False
-                    
+
+            # Trailing portfolio take-profit. When enabled, locks in gains
+            # by stopping trading after a configurable drawdown from the
+            # high-water mark. Independent of the stop-loss path above.
+            if getattr(settings.grid, 'trailing_portfolio_tp_enabled', False):
+                triggered = check_trailing_take_profit(
+                    state=self._trailing_tp_state,
+                    current_value=current_value,
+                    initial_balance=self.initial_balance,
+                    arm_percent=settings.grid.trailing_portfolio_tp_arm_percent,
+                    drawdown_percent=settings.grid.trailing_portfolio_tp_drawdown_percent,
+                )
+                # Mirror peak into the public attribute for state files /
+                # observability.
+                self._peak_portfolio_value = self._trailing_tp_state.peak_value
+                if triggered:
+                    peak = self._trailing_tp_state.peak_value
+                    drop = peak - current_value
+                    drop_pct = (drop / peak * 100.0) if peak > 0 else 0.0
+                    tp_msg = (
+                        f"🟢 TRAILING TAKE-PROFIT\n"
+                        f"Peak: ${peak:.2f}\n"
+                        f"Current: ${current_value:.2f} (-{drop_pct:.2f}%)\n"
+                        f"Locked-in gain vs initial "
+                        f"${self.initial_balance:.2f}: "
+                        f"${current_value - self.initial_balance:+.2f}"
+                    )
+                    logger.warning(tp_msg)
+                    await telegram.send_message(tp_msg)
+                    self._running = False
+
         except Exception as e:
             logger.error(f"Error checking portfolio protection: {e}")
     

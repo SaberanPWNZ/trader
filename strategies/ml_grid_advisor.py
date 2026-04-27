@@ -15,6 +15,7 @@ class GridAdvice:
     __slots__ = (
         'grid_range_pct', 'trend_bias', 'confidence',
         'volatility_regime', 'recommended_grids', 'reason',
+        'pause_trading',
     )
 
     def __init__(
@@ -25,6 +26,7 @@ class GridAdvice:
         volatility_regime: str,
         recommended_grids: int,
         reason: str,
+        pause_trading: bool = False,
     ):
         self.grid_range_pct = grid_range_pct
         self.trend_bias = trend_bias
@@ -32,11 +34,18 @@ class GridAdvice:
         self.volatility_regime = volatility_regime
         self.recommended_grids = recommended_grids
         self.reason = reason
+        # When True, callers should refrain from placing new grid orders
+        # (e.g. during a volatility shock). The flag is informational —
+        # existing positions / SELL orders remain untouched so the strategy
+        # can still take profit if price reverts.
+        self.pause_trading = pause_trading
 
     def __repr__(self) -> str:
+        flag = " PAUSE" if self.pause_trading else ""
         return (
             f"GridAdvice(range={self.grid_range_pct:.1%}, bias={self.trend_bias:+.3f}, "
-            f"vol={self.volatility_regime}, conf={self.confidence:.2f}, grids={self.recommended_grids})"
+            f"vol={self.volatility_regime}, conf={self.confidence:.2f}, "
+            f"grids={self.recommended_grids}{flag})"
         )
 
 
@@ -289,6 +298,11 @@ class MLGridAdvisor:
             volatility_regime=volatility_regime,
             recommended_grids=int(recommended_grids),
             reason=reason,
+            # Pause new entries when the market is in an extreme volatility
+            # regime: grids tend to lose to trend / produce large drawdowns
+            # while spreads blow out. Existing orders are unaffected so we
+            # can still take profit on a mean-reverting bounce.
+            pause_trading=(volatility_regime == "extreme"),
         )
 
     def _default_advice(self, reason: str) -> GridAdvice:
@@ -299,4 +313,5 @@ class MLGridAdvisor:
             volatility_regime="unknown",
             recommended_grids=settings.grid.min_grids,
             reason=f"default: {reason}",
+            pause_trading=False,
         )
