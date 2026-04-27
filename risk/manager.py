@@ -17,6 +17,11 @@ class RiskState:
     daily_pnl: float = 0.0
     peak_balance: float = 0.0
     current_balance: float = 0.0
+    # Balance at the start of the current trading day. Used as the denominator
+    # for the daily-loss percentage so that intra-day gains do not artificially
+    # widen the daily-loss budget (which would happen if peak_balance were
+    # used instead).
+    day_start_balance: float = 0.0
     consecutive_losses: int = 0
     last_trade_time: Optional[datetime] = None
     cooldown_until: Optional[datetime] = None
@@ -49,7 +54,8 @@ class RiskManager:
         self.config = settings.risk
         self.state = RiskState(
             peak_balance=initial_balance,
-            current_balance=initial_balance
+            current_balance=initial_balance,
+            day_start_balance=initial_balance,
         )
         self._risk_events: List[Dict[str, Any]] = []
     
@@ -75,8 +81,11 @@ class RiskManager:
             else:
                 self.state.cooldown_until = None
         
-        # Check daily loss limit
-        daily_loss_pct = abs(self.state.daily_pnl) / self.state.peak_balance
+        # Check daily loss limit. The denominator is the balance at the start
+        # of the trading day (not peak_balance) so that gains earlier in the
+        # day cannot relax the daily-loss budget.
+        denom = self.state.day_start_balance or self.state.peak_balance
+        daily_loss_pct = abs(self.state.daily_pnl) / denom if denom > 0 else 0.0
         if self.state.daily_pnl < 0 and daily_loss_pct >= self.config.max_daily_loss:
             self._record_risk_event(RiskEventType.MAX_LOSS_REACHED, {
                 'daily_loss': self.state.daily_pnl,
@@ -111,9 +120,16 @@ class RiskManager:
         if not can_trade:
             return False, reason
         
-        # Check minimum confidence
-        if signal.confidence < self.config.min_confidence if hasattr(self.config, 'min_confidence') else 0.5:
-            return False, f"Signal confidence too low ({signal.confidence:.2f})"
+        # Check minimum confidence. Threshold is sourced from RiskConfig so
+        # it can be tuned via configuration; the previous implementation had
+        # an operator-precedence bug (the ternary covered the *fallback*, not
+        # the comparison) and silently used 0.5 if the field was absent.
+        min_confidence = getattr(self.config, 'min_confidence', 0.5)
+        if signal.confidence < min_confidence:
+            return False, (
+                f"Signal confidence too low ({signal.confidence:.2f} < "
+                f"{min_confidence:.2f})"
+            )
         
         # Validate stop-loss
         if signal.stop_loss is None:
@@ -257,6 +273,9 @@ class RiskManager:
     def reset_daily_stats(self) -> None:
         """Reset daily statistics (call at start of new trading day)."""
         self.state.daily_pnl = 0.0
+        # Snapshot the balance at day-start so daily-loss percentages are
+        # measured against a stable denominator for the rest of the day.
+        self.state.day_start_balance = self.state.current_balance
         logger.info("Daily risk stats reset")
     
     def get_risk_summary(self) -> dict:

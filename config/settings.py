@@ -44,6 +44,10 @@ class RiskConfig:
     max_consecutive_losses: int = 5
     cooldown_minutes: int = 30
     kill_switch_enabled: bool = True
+    # Minimum signal confidence required to allow a trade.
+    # Explicit field so the threshold is controllable via config (was previously
+    # accessed via hasattr() with a hard-coded fallback).
+    min_confidence: float = 0.5
 
 
 @dataclass
@@ -144,6 +148,11 @@ class BacktestConfig:
     initial_balance: float = 2000.0
     trading_fee: float = 0.001  # 0.1%
     slippage: float = 0.0005  # 0.05%
+    # Number of bars per year used to annualize Sharpe / Sortino. Should match
+    # the timeframe of the equity curve fed into PerformanceMetrics.
+    # Defaults to daily bars (crypto trades 365 days/year). For 1h bars use
+    # 365*24=8760, for 15m use 365*24*4=35040.
+    bars_per_year: int = 365
     
     # PyBroker-specific backtest settings
     pybroker_engine: bool = True

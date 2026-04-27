@@ -140,12 +140,14 @@ class PositionSizer:
         entry_price: float,
         atr: float,
         atr_multiplier: float = 2.0,
-        risk_percent: Optional[float] = None
+        risk_percent: Optional[float] = None,
+        side: str = "long",
     ) -> float:
         """
         Calculate position size adjusted for volatility (ATR).
         
-        Stop loss is placed at ATR × multiplier from entry.
+        Stop loss is placed at ATR × multiplier from entry, on the correct
+        side of the trade ("long" → below entry, "short" → above entry).
         
         Args:
             account_balance: Current account balance
@@ -153,6 +155,7 @@ class PositionSizer:
             atr: Average True Range
             atr_multiplier: ATR multiplier for stop loss
             risk_percent: Risk percentage
+            side: Trade direction, "long" or "short"
             
         Returns:
             Position size in base currency
@@ -160,7 +163,11 @@ class PositionSizer:
         risk_percent = risk_percent or self.config.max_risk_per_trade
         
         stop_distance = atr * atr_multiplier
-        stop_loss = entry_price - stop_distance
+        side_norm = (side or "long").lower()
+        if side_norm == "short":
+            stop_loss = entry_price + stop_distance
+        else:
+            stop_loss = entry_price - stop_distance
         
         return self.fixed_risk(
             account_balance,

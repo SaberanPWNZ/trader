@@ -56,7 +56,8 @@ class BacktestEngine:
         strategy: BaseStrategy,
         initial_balance: float = None,
         fee_rate: float = None,
-        slippage: float = None
+        slippage: float = None,
+        bars_per_year: Optional[int] = None,
     ):
         """
         Initialize backtest engine.
@@ -66,11 +67,17 @@ class BacktestEngine:
             initial_balance: Starting balance
             fee_rate: Trading fee rate
             slippage: Slippage rate
+            bars_per_year: Bars per year for Sharpe / Sortino annualization.
+                Should match the timeframe of the equity curve. Defaults to
+                ``settings.backtest.bars_per_year``.
         """
         self.strategy = strategy
-        self.initial_balance = initial_balance or settings.backtest.initial_balance
-        self.fee_rate = fee_rate or settings.backtest.trading_fee
-        self.slippage = slippage or settings.backtest.slippage
+        self.initial_balance = initial_balance if initial_balance is not None else settings.backtest.initial_balance
+        self.fee_rate = fee_rate if fee_rate is not None else settings.backtest.trading_fee
+        self.slippage = slippage if slippage is not None else settings.backtest.slippage
+        self.bars_per_year = bars_per_year if bars_per_year is not None else getattr(
+            settings.backtest, 'bars_per_year', 365
+        )
         self.risk_config = settings.risk
         
         # State
@@ -170,12 +177,20 @@ class BacktestEngine:
         if self._position:
             # Check stop-loss
             if self._check_stop_loss(bar):
-                self._close_position(bar, "Stop-loss")
+                self._close_position(
+                    bar,
+                    "Stop-loss",
+                    trigger_price=self._position.get('stop_loss'),
+                )
                 return
             
             # Check take-profit
             if self._check_take_profit(bar):
-                self._close_position(bar, "Take-profit")
+                self._close_position(
+                    bar,
+                    "Take-profit",
+                    trigger_price=self._position.get('take_profit'),
+                )
                 return
             
             # Check for exit signal
@@ -205,9 +220,14 @@ class BacktestEngine:
             if risk_per_unit > 0:
                 amount = risk_amount / risk_per_unit
             else:
-                amount = self._balance * 0.1 / entry_price
+                # Fall back to risk-based notional sizing (was 10% of equity,
+                # which silently bypassed max_risk_per_trade and inflated
+                # backtest returns relative to the live risk-manager).
+                amount = risk_amount / entry_price
         else:
-            amount = self._balance * 0.1 / entry_price
+            # No stop-loss provided: size the position so that a 100% adverse
+            # move would still respect max_risk_per_trade.
+            amount = risk_amount / entry_price
         
         # Apply max position size
         max_amount = (self._balance * self.risk_config.max_position_size) / entry_price
@@ -229,21 +249,57 @@ class BacktestEngine:
         
         self._balance -= fees
     
-    def _close_position(self, bar: pd.Series, reason: str) -> None:
-        """Close current position."""
+    def _close_position(
+        self,
+        bar: pd.Series,
+        reason: str,
+        trigger_price: Optional[float] = None,
+    ) -> None:
+        """Close current position.
+
+        Args:
+            bar: Current OHLCV bar.
+            reason: Human-readable exit reason.
+            trigger_price: When the close is triggered by a stop-loss or
+                take-profit, this is the level that triggered it. The fill
+                price is then modelled as the worst of (bar.open, trigger)
+                for stop-losses and the best of (bar.open, trigger) for
+                take-profits, capturing intra-bar gap behaviour. Without a
+                trigger the bar's close price is used (signal reversal /
+                end-of-backtest cases).
+        """
         if not self._position:
             return
-        
-        exit_price = bar['close']
-        
-        # Apply slippage
-        if self._position['side'] == 'long':
+
+        side = self._position['side']
+        bar_open = bar['open'] if 'open' in bar else bar['close']
+
+        if reason == "Stop-loss" and trigger_price is not None:
+            # Long: a gap-down through the SL fills at the (worse) open;
+            # otherwise we fill at the SL level itself.
+            # Short: symmetric — gap-up above SL fills at open.
+            if side == 'long':
+                exit_price = min(bar_open, trigger_price)
+            else:
+                exit_price = max(bar_open, trigger_price)
+        elif reason == "Take-profit" and trigger_price is not None:
+            # Long: gap-up through TP fills at the (better) open; otherwise
+            # at the TP level. Short: symmetric.
+            if side == 'long':
+                exit_price = max(bar_open, trigger_price)
+            else:
+                exit_price = min(bar_open, trigger_price)
+        else:
+            exit_price = bar['close']
+
+        # Apply slippage in the adverse direction relative to the trade side.
+        if side == 'long':
             exit_price *= (1 - self.slippage)
         else:
             exit_price *= (1 + self.slippage)
-        
+
         # Calculate PnL
-        if self._position['side'] == 'long':
+        if side == 'long':
             pnl = (exit_price - self._position['entry_price']) * self._position['amount']
         else:
             pnl = (self._position['entry_price'] - exit_price) * self._position['amount']
@@ -262,7 +318,7 @@ class BacktestEngine:
             entry_time=self._position['entry_time'],
             exit_time=bar.name,
             symbol=self._position['symbol'],
-            side=self._position['side'],
+            side=side,
             entry_price=self._position['entry_price'],
             exit_price=exit_price,
             amount=self._position['amount'],
@@ -321,7 +377,8 @@ class BacktestEngine:
         calculator = PerformanceMetrics(
             self._trades,
             pd.Series(self._equity_history),
-            self.initial_balance
+            self.initial_balance,
+            bars_per_year=self.bars_per_year,
         )
         return calculator.calculate_all()
     
