@@ -307,8 +307,12 @@ def compute_adaptive_num_grids(
         ``min_grids > max_grids`` is silently swapped — caller config
         bugs shouldn't blow up the live trader.
     """
-    lo = max(1, int(min(min_grids, max_grids)))
-    hi = max(lo, int(max(min_grids, max_grids)))
+    # Silently swap if the caller passed bounds in the wrong order
+    # (config-bug protection — the live trader shouldn't crash because
+    # someone wrote {min: 10, max: 8} in YAML).
+    actual_min = max(1, int(min(min_grids, max_grids)))
+    actual_max = max(actual_min, int(max(min_grids, max_grids)))
+
     table = dict(_DEFAULT_NUM_GRIDS_FACTORS)
     if factors:
         table.update(factors)
@@ -316,6 +320,6 @@ def compute_adaptive_num_grids(
     if multiplier <= 0:
         multiplier = 1.0
 
-    midpoint = (lo + hi) / 2.0
+    midpoint = (actual_min + actual_max) / 2.0
     scaled = int(round(midpoint * multiplier))
-    return max(lo, min(hi, scaled))
+    return max(actual_min, min(actual_max, scaled))

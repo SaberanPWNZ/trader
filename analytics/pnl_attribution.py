@@ -88,6 +88,11 @@ def _coerce_date(value: object) -> Optional[date]:
         return value
     if isinstance(value, str):
         try:
+            # ``Z`` suffix is the ISO-8601 shorthand for ``+00:00`` (UTC).
+            # ``data/grid_trades.csv`` and the ``recompute_trades`` output
+            # both write UTC timestamps, so this substitution is safe in
+            # the project's CSVs. Naive strings (no offset) are accepted
+            # as-is — only the date portion matters for daily grouping.
             return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
         except ValueError:
             # Try plain YYYY-MM-DD as a last resort.
