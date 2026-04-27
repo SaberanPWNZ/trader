@@ -54,6 +54,16 @@ class RiskConfig:
     # Explicit field so the threshold is controllable via config (was previously
     # accessed via hasattr() with a hard-coded fallback).
     min_confidence: float = 0.5
+    # Portfolio-level loss thresholds for the live grid trader (fractions, not
+    # percent points). When unrealized portfolio loss vs. ``initial_balance``
+    # crosses ``portfolio_stop_loss_pct`` the trader sends a Telegram warning;
+    # at ``portfolio_emergency_stop_pct`` it sets ``_emergency_stop`` and halts
+    # the trading loop. Previously hardcoded as ``0.10`` / ``0.15`` inside
+    # ``GridLiveTrader``; lifting them to config lets ops dial down without a
+    # redeploy. Distinct from ``GridConfig.portfolio_stop_loss_percent``
+    # (paper simulator, percent units).
+    portfolio_stop_loss_pct: float = 0.10
+    portfolio_emergency_stop_pct: float = 0.15
 
 
 @dataclass
@@ -212,7 +222,14 @@ class GridConfig:
     auto_rebalance_enabled: bool = True
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
-    min_profit_threshold_percent: float = 0.0
+    # Minimum unrealized profit (percent of total grid investment) required
+    # before the strategy will rebalance / take profit. Default 0.3% covers a
+    # full round-trip cost of ``2 * (trading_fee + slippage)`` at the
+    # backtest defaults — concretely ``2 * (0.001 + 0.0005) * 100 = 0.3%``,
+    # so the rebalance does not lock in a loss masquerading as a small
+    # gain. Tune higher per deployment if exchange fees are higher than
+    # Binance spot.
+    min_profit_threshold_percent: float = 0.3
     rebalance_cooldown_minutes: int = 30
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True

@@ -13,6 +13,7 @@ from strategies.ml_grid_advisor import GridAdvice, MLGridAdvisor
 from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
+from execution.exchange_guard import ExchangeApiGuard
 from execution.portfolio_protection import (
     InvestmentBudget,
     TrailingTPState,
@@ -21,6 +22,7 @@ from execution.portfolio_protection import (
     compute_inventory_hedge,
     compute_target_investment,
 )
+from risk.manager import RiskManager
 
 
 @dataclass
@@ -62,11 +64,21 @@ class GridLiveTrader:
         self.total_trades = 0
         self._running = False
         self._last_trade_sync: datetime = datetime.min
-        self._max_loss_pct = 0.15
-        self._stop_loss_pct = 0.10
+        # Portfolio loss thresholds are sourced from ``RiskConfig`` so ops
+        # can dial them without a redeploy. ``portfolio_stop_loss_pct``
+        # triggers a Telegram warning; ``portfolio_emergency_stop_pct``
+        # halts the trading loop.
+        self._stop_loss_pct = settings.risk.portfolio_stop_loss_pct
+        self._max_loss_pct = settings.risk.portfolio_emergency_stop_pct
         self._error_count = 0
         self._max_errors = 10
         self._emergency_stop = False
+        # RiskManager owns the API kill-switch counter. ``ExchangeApiGuard``
+        # below records every exchange call's success/failure against it,
+        # and on threshold-trip flips ``_emergency_stop`` via the callback
+        # below. Independent of the per-symbol ``_error_count`` (which
+        # tracks higher-level processing errors and triggers reconnect).
+        self._risk_manager = RiskManager()
         self._buy_positions: Dict[str, List[Dict]] = {s: [] for s in symbols}
         self._ml_advisor = MLGridAdvisor()
         self._grid_init_times: Dict[str, datetime] = {}
@@ -378,6 +390,16 @@ class GridLiveTrader:
         try:
             self.exchange = create_exchange(testnet=self.testnet)
             await self.exchange.connect()
+            # Funnel every subsequent ``self.exchange.<method>(...)`` call
+            # through the RiskManager kill-switch path. Done after
+            # ``connect()`` so a failed initial handshake (which we
+            # already report and abort on) does not pre-emptively trip
+            # the kill switch.
+            self.exchange = ExchangeApiGuard(
+                self.exchange,
+                risk_manager=self._risk_manager,
+                on_kill_switch=self._on_api_kill_switch,
+            )
         except Exception as e:
             logger.error(f"Failed to create exchange: {e}")
             await telegram.send_message(f"❌ Exchange connection failed: {e}")
@@ -825,6 +847,28 @@ class GridLiveTrader:
 
         except Exception as e:
             logger.error(f"Error checking portfolio protection: {e}")
+    
+    def _on_api_kill_switch(self) -> None:
+        """Callback invoked when ``ExchangeApiGuard`` activates the
+        RiskManager kill switch after consecutive API failures. We flip
+        the trader's emergency-stop flag so the trading loop exits on
+        the next iteration instead of continuing to retry into an
+        already-broken exchange. A best-effort Telegram notice is
+        scheduled if the event loop is still running."""
+        threshold = getattr(self._risk_manager.config, "max_consecutive_api_errors", 0)
+        msg = (
+            f"🚨 API KILL-SWITCH\n"
+            f"{self._risk_manager.state.consecutive_api_errors} consecutive "
+            f"exchange errors (threshold {threshold}). Halting trading loop."
+        )
+        logger.critical(msg)
+        self._emergency_stop = True
+        self._running = False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(telegram.send_message(msg))
     
     async def _trading_loop(self):
         try:
