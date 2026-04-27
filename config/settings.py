@@ -205,6 +205,13 @@ class DatabaseConfig:
 class GridConfig:
     """Grid trading configuration."""
     grid_range_pct: float = 0.02
+    # Per-symbol overrides for ``grid_range_pct``. Symbols absent from
+    # the dict fall back to ``grid_range_pct``. Use this to widen the
+    # grid on noisy symbols (e.g. DOGE) without forcing churn on quiet
+    # ones (e.g. BTC), since a single global value over-fits one regime.
+    # The ML advisor still scales this by the volatility regime, so the
+    # override sets the *base* range, not the final one.
+    grid_range_pct_overrides: dict = field(default_factory=dict)
     max_grids: int = 10
     min_grids: int = 8
     min_order_value: float = 7.0
@@ -289,6 +296,20 @@ class GridConfig:
         if isinstance(self.rebalance_interval_hours, dict):
             return self.rebalance_interval_hours.get(symbol, 12.0)
         return self.rebalance_interval_hours
+
+    def get_grid_range_pct(self, symbol: str) -> float:
+        """Return the base ``grid_range_pct`` for ``symbol``.
+
+        Falls back to the global ``grid_range_pct`` when no override is
+        registered. The MLGridAdvisor scales this by the current
+        volatility regime before the grid is built, so the override
+        controls the *baseline*, not the final spacing.
+        """
+        if isinstance(self.grid_range_pct_overrides, dict):
+            return float(self.grid_range_pct_overrides.get(
+                symbol, self.grid_range_pct
+            ))
+        return self.grid_range_pct
 
 
 @dataclass

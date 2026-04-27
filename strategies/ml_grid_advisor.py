@@ -180,14 +180,22 @@ class MLGridAdvisor:
                 return cached
 
         if ohlcv_df is None or len(ohlcv_df) < 50:
-            return self._default_advice("insufficient data")
+            return self._default_advice("insufficient data", symbol=symbol)
 
         try:
             vol = self._calculate_volatility_features(ohlcv_df)
             trend = self._calculate_trend_features(ohlcv_df)
             ml_confidence, ml_direction = self._get_ml_confidence(symbol, ohlcv_df)
 
-            advice = self._compute_grid_params(vol, trend, ml_confidence, ml_direction)
+            # Resolve the per-symbol baseline once, then thread it into
+            # ``_compute_grid_params``. Quiet symbols (BTC) and noisy
+            # ones (DOGE) typically need different anchors before the
+            # volatility-regime multiplier is applied.
+            base_range = settings.grid.get_grid_range_pct(symbol)
+
+            advice = self._compute_grid_params(
+                vol, trend, ml_confidence, ml_direction, base_range=base_range
+            )
 
             self._last_advice[symbol] = advice
             self._last_update[symbol] = now
@@ -201,7 +209,7 @@ class MLGridAdvisor:
 
         except Exception as e:
             logger.warning(f"ML advisor error for {symbol}: {e}")
-            return self._default_advice(f"error: {e}")
+            return self._default_advice(f"error: {e}", symbol=symbol)
 
     def _compute_grid_params(
         self,
@@ -209,8 +217,13 @@ class MLGridAdvisor:
         trend: Dict[str, float],
         ml_confidence: float,
         ml_direction: float,
+        *,
+        base_range: Optional[float] = None,
     ) -> GridAdvice:
-        base_range = self._default_range
+        # ``base_range`` is the per-symbol anchor (see
+        # ``GridConfig.get_grid_range_pct``). Falls back to the global
+        # default for legacy callers / tests that don't pass it.
+        base_range = self._default_range if base_range is None else base_range
         atr_pct = vol['atr_pct']
         bb_width = vol['bb_width']
         vol_ratio = vol['vol_ratio']
@@ -311,9 +324,17 @@ class MLGridAdvisor:
             pause_trading=(volatility_regime == "extreme"),
         )
 
-    def _default_advice(self, reason: str) -> GridAdvice:
+    def _default_advice(self, reason: str, *, symbol: Optional[str] = None) -> GridAdvice:
+        # When the advisor falls back (no data, exception, etc.) we still
+        # honour the per-symbol ``grid_range_pct_overrides`` so the
+        # fallback grid stays usable on that specific market. Symbol
+        # ``None`` keeps the legacy global behaviour.
+        if symbol is not None:
+            grid_range = settings.grid.get_grid_range_pct(symbol)
+        else:
+            grid_range = self._default_range
         return GridAdvice(
-            grid_range_pct=self._default_range,
+            grid_range_pct=grid_range,
             trend_bias=0.0,
             confidence=0.0,
             volatility_regime="unknown",

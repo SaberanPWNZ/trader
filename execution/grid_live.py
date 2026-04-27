@@ -108,6 +108,13 @@ class GridLiveTrader:
         # back to ``data/grid_live_trades.csv``. Bounded loosely by the
         # number of in-flight grid orders; pruned when orders complete.
         self._expected_prices: Dict[str, float] = {}
+        # Map order_id → cause tag (e.g. ``"stop_loss"``,
+        # ``"rebalance"``, ``"inventory_hedge"``) so the live trades CSV
+        # can record *why* an order was placed. Vanilla grid fills are
+        # left unannotated — ``analytics.attribute_pnl`` defaults blank
+        # rows to ``CAUSE_TRADE``. Same lifecycle as ``_expected_prices``:
+        # populated at order placement, popped on fill log.
+        self._order_causes: Dict[str, str] = {}
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -122,26 +129,30 @@ class GridLiveTrader:
                     'timestamp', 'symbol', 'side', 'price', 'amount', 'value',
                     'order_id', 'status', 'fee', 'trading_pnl', 'holding_pnl', 
                     'realized_pnl', 'balance', 'total_value', 'base_held',
-                    'expected_price'
+                    'expected_price', 'cause'
                 ])
         else:
-            # Migrate legacy CSVs that pre-date the ``expected_price``
-            # column: rewrite only the header line so spreadsheet/analysis
-            # tools see the right column names. Existing rows keep
-            # working — positional readers (``row[6]`` etc.) ignore the
-            # missing trailing field, and the slippage helper treats
-            # blank ``expected_price`` as "unknown" by design.
+            # Migrate legacy CSVs by appending any missing trailing
+            # columns (``expected_price``, ``cause``) to the header.
+            # Existing rows keep working — positional readers ignore
+            # missing trailing fields, and downstream helpers
+            # (slippage / attribution) treat blanks as "unknown".
             try:
                 with open(self._trades_file, 'r', newline='') as f:
                     reader = csv.reader(f)
                     header = next(reader, None)
                     rest = list(reader)
-                if header and 'expected_price' not in header:
-                    header.append('expected_price')
-                    with open(self._trades_file, 'w', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(header)
-                        writer.writerows(rest)
+                if header is not None:
+                    changed = False
+                    for col in ('expected_price', 'cause'):
+                        if col not in header:
+                            header.append(col)
+                            changed = True
+                    if changed:
+                        with open(self._trades_file, 'w', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(header)
+                            writer.writerows(rest)
             except Exception as e:
                 logger.warning(f"Could not migrate trades CSV header: {e}")
         
@@ -707,11 +718,14 @@ class GridLiveTrader:
                                   value: float, order_id: str, fee: float, trading_pnl: float,
                                   holding_pnl: float, balance: float, total_value: float, base_held: float):
         # Pop (don't peek) so the cache stays bounded — once a fill is
-        # logged we no longer need the expected price. Empty string when
-        # unknown (e.g. partial-startup state, manual orders, restarts
-        # before the order placement was tracked).
+        # logged we no longer need the expected price / cause. Empty
+        # string when unknown (e.g. partial-startup state, manual
+        # orders, restarts before the order placement was tracked).
+        # ``analytics.pnl_attribution`` treats blank ``cause`` as
+        # ``CAUSE_TRADE`` (vanilla grid fill).
         expected_price = self._expected_prices.pop(str(order_id), None)
         expected_str = f"{expected_price:.8f}" if expected_price is not None else ""
+        cause = self._order_causes.pop(str(order_id), "")
         with open(self._trades_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -719,7 +733,7 @@ class GridLiveTrader:
                 symbol, side, price, amount, value,
                 order_id, 'filled', fee, trading_pnl, holding_pnl,
                 self.realized_pnl, balance, total_value, base_held,
-                expected_str
+                expected_str, cause
             ])
     
     async def _update_balance_state(self):
@@ -1124,6 +1138,10 @@ class GridLiveTrader:
             amount=amount,
             price=None,
         )
+        # Tag this fill so post-trade attribution can separate the
+        # one-time inventory seed from real grid fills.
+        if order and order.get('id'):
+            self._order_causes[str(order['id'])] = "inventory_hedge"
         await telegram.send_message(
             f"🌱 Inventory seed: {symbol}\n"
             f"Bought {amount:.6f} {base} (≈${hedge_usdt:.2f})\n"
@@ -1404,6 +1422,8 @@ class GridLiveTrader:
                     side='sell',
                     amount=amount
                 )
+                if order and order.get('id'):
+                    self._order_causes[str(order['id'])] = "stop_loss"
                 logger.info(f"✅ Emergency sell executed: {amount} {base}")
                 
                 await telegram.send_message(
@@ -1543,6 +1563,8 @@ class GridLiveTrader:
                         symbol=symbol, type='market', side='sell',
                         amount=amount
                     )
+                    if order and order.get('id'):
+                        self._order_causes[str(order['id'])] = "rebalance"
                     avg_e = sum(p.entry_price for _, p in to_sell) / len(to_sell)
                     logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ~${current_price:.2f} (avg entry ${avg_e:.2f})")
                     self._last_rebalance_times[symbol] = datetime.utcnow()
@@ -1597,6 +1619,8 @@ class GridLiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, type='market', side='sell', amount=amount
             )
+            if order and order.get('id'):
+                self._order_causes[str(order['id'])] = "stop_loss"
             logger.info(f"🔻 Market SELL executed: {amount} {base} (cut-loss)")
             self._last_rebalance_times[symbol] = datetime.utcnow()
 

@@ -208,10 +208,11 @@ class TestExpectedPriceCsvColumn:
         )
 
         with open(trader._trades_file, 'r') as f:
-            rows = list(csv.reader(f))
-        # First row is header, second is our trade.
-        assert rows[1][6] == order_id
-        assert rows[1][-1] == "99.50000000"
+            rows = list(csv.DictReader(f))
+        # Use column-name lookups so this test is robust against trailing
+        # columns added in later steps (e.g. ``cause``).
+        assert rows[0]['order_id'] == order_id
+        assert rows[0]['expected_price'] == "99.50000000"
         # Cache popped on log.
         assert order_id not in trader._expected_prices
 
@@ -226,8 +227,8 @@ class TestExpectedPriceCsvColumn:
         )
 
         with open(trader._trades_file, 'r') as f:
-            rows = list(csv.reader(f))
-        assert rows[1][-1] == ""
+            rows = list(csv.DictReader(f))
+        assert rows[0]['expected_price'] == ""
 
     def test_legacy_header_is_migrated_in_place(self, tmp_path, monkeypatch):
         # Pre-create a legacy file with the old 15-column header and a
@@ -256,7 +257,10 @@ class TestExpectedPriceCsvColumn:
 
         with open(path, 'r') as f:
             rows = list(csv.reader(f))
-        assert rows[0][-1] == 'expected_price'
+        # Header was migrated to include ``expected_price``; later steps
+        # may append additional trailing columns (e.g. ``cause``), so
+        # check membership rather than the last position.
+        assert 'expected_price' in rows[0]
         # Data row preserved verbatim.
         assert rows[1] == legacy_row
 
