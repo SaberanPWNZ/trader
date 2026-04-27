@@ -317,8 +317,8 @@ class GridConfig:
     # can fill from tick one (otherwise they have to wait for BUYs to
     # round-trip first). Capped at ``inventory_hedge_max_fraction`` of
     # the per-symbol budget so the BUY legs still have USDT to deploy.
-    # OFF by default — enable explicitly per deployment.
-    inventory_hedge_enabled: bool = False
+    # Enabled by default to seed the SELL leg from tick one.
+    inventory_hedge_enabled: bool = True
     inventory_hedge_max_fraction: float = 0.5
     
     def get_interval_hours(self, symbol: str) -> float:
