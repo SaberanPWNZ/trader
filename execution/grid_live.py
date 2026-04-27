@@ -9,7 +9,7 @@ from loguru import logger
 import pandas as pd
 
 from strategies.grid import GridStrategy, GridLevel, GridConfig
-from strategies.ml_grid_advisor import MLGridAdvisor
+from strategies.ml_grid_advisor import GridAdvice, MLGridAdvisor
 from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
@@ -17,6 +17,8 @@ from execution.portfolio_protection import (
     InvestmentBudget,
     TrailingTPState,
     check_trailing_take_profit,
+    compute_adaptive_cooldown,
+    compute_inventory_hedge,
     compute_target_investment,
 )
 
@@ -78,6 +80,11 @@ class GridLiveTrader:
         # don't progressively shrink the grid as USDT gets locked into
         # BUY orders elsewhere in the portfolio.
         self._investment_budget = InvestmentBudget()
+        # Cache of the most recent ``GridAdvice`` per symbol, populated by
+        # ``_get_ml_advice``. Used by ``_should_rebalance_grid`` to scale
+        # the rebalance cooldown by the current volatility regime without
+        # paying for an extra OHLCV fetch on every tick.
+        self._latest_advice: Dict[str, GridAdvice] = {}
         # Peak portfolio value (since startup) used by the trailing
         # portfolio take-profit. Stored separately from ``initial_balance``
         # so the trail follows the high-water mark, not just the starting
@@ -838,18 +845,29 @@ class GridLiveTrader:
     
     async def _get_ml_advice(self, symbol: str):
         if not settings.grid.ml_advisor_enabled:
-            return self._ml_advisor._default_advice("ML advisor disabled in config")
+            advice = self._ml_advisor._default_advice("ML advisor disabled in config")
+            self._latest_advice[symbol] = advice
+            return advice
         try:
             ohlcv_raw = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
             if not ohlcv_raw or len(ohlcv_raw) < 50:
-                return self._ml_advisor._default_advice("not enough OHLCV data")
+                advice = self._ml_advisor._default_advice("not enough OHLCV data")
+                self._latest_advice[symbol] = advice
+                return advice
             df = pd.DataFrame(ohlcv_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            return self._ml_advisor.get_advice(symbol, df)
+            advice = self._ml_advisor.get_advice(symbol, df)
+            # Cache the latest advice so cooldown decisions in
+            # ``_should_rebalance_grid`` can read the regime without
+            # paying for another OHLCV fetch.
+            self._latest_advice[symbol] = advice
+            return advice
         except Exception as e:
             logger.warning(f"ML advice fetch failed for {symbol}: {e}")
-            return self._ml_advisor._default_advice(f"fetch error: {e}")
+            advice = self._ml_advisor._default_advice(f"fetch error: {e}")
+            self._latest_advice[symbol] = advice
+            return advice
 
     async def _initialize_grid(self, symbol: str):
         try:
@@ -946,7 +964,94 @@ class GridLiveTrader:
             await telegram.send_message(warning)
             return
 
+        # Optional one-time inventory hedge: market BUY enough base so the
+        # SELL legs of the freshly-built grid can fill without waiting for
+        # BUYs to round-trip first. Off by default; capped so the BUY legs
+        # still have USDT to deploy.
+        if settings.grid.inventory_hedge_enabled:
+            try:
+                await self._seed_inventory_hedge(
+                    symbol=symbol,
+                    investment_per_symbol=investment_per_symbol,
+                    current_price=current_price,
+                    base=base,
+                )
+            except Exception as e:
+                # A failed hedge must not block the BUY-side grid from going up.
+                logger.error(f"{symbol}: inventory hedge failed: {e}")
+
         await self._place_grid_orders(symbol)
+
+    async def _seed_inventory_hedge(
+        self,
+        *,
+        symbol: str,
+        investment_per_symbol: float,
+        current_price: float,
+        base: str,
+    ) -> None:
+        """One-time market BUY to seed base inventory for SELL legs.
+
+        Reads how many BUY/SELL legs the freshly-built grid has, asks
+        ``compute_inventory_hedge`` for the USDT amount to spend, and
+        submits a single market BUY for the equivalent base quantity.
+        Skips silently when the helper returns 0 (already stocked, no
+        SELL legs, or budget empty) or when the resulting order would
+        be below the exchange's minimum notional.
+        """
+        levels = self.strategies[symbol].grid_levels
+        num_buys = sum(1 for lvl in levels if lvl.side == 'buy')
+        num_sells = sum(1 for lvl in levels if lvl.side == 'sell')
+
+        balance_info = await self.exchange.fetch_balance()
+        base_free = balance_info.get(base, {}).get('free', 0) or 0.0
+        current_base_value_usdt = base_free * current_price
+
+        hedge_usdt = compute_inventory_hedge(
+            investment_per_symbol=investment_per_symbol,
+            num_buy_levels=num_buys,
+            num_sell_levels=num_sells,
+            current_base_value_usdt=current_base_value_usdt,
+            max_hedge_fraction=settings.grid.inventory_hedge_max_fraction,
+        )
+        if hedge_usdt <= 0:
+            logger.info(
+                f"{symbol}: inventory hedge skipped — already stocked "
+                f"(have ≈${current_base_value_usdt:.2f} {base}, "
+                f"need ≈${num_sells * (investment_per_symbol / max(num_buys, 1)):.2f})"
+            )
+            return
+
+        market = await self._get_market_info(symbol)
+        if hedge_usdt < market['min_notional']:
+            logger.info(
+                f"{symbol}: inventory hedge ${hedge_usdt:.2f} below min notional "
+                f"${market['min_notional']:.2f}; skipping seed BUY."
+            )
+            return
+
+        amount = hedge_usdt / current_price
+        amount = self._round_amount(amount, market['amount_precision'])
+        if amount <= 0:
+            logger.info(f"{symbol}: inventory hedge amount rounds to 0; skipping.")
+            return
+
+        logger.info(
+            f"🌱 {symbol}: seeding inventory — market BUY {amount:.6f} {base} "
+            f"(≈${hedge_usdt:.2f}) for SELL legs"
+        )
+        order = await self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='buy',
+            amount=amount,
+            price=None,
+        )
+        await telegram.send_message(
+            f"🌱 Inventory seed: {symbol}\n"
+            f"Bought {amount:.6f} {base} (≈${hedge_usdt:.2f})\n"
+            f"Order id: {order.get('id', 'n/a')}"
+        )
 
     def _get_avg_entry_price(self, symbol: str) -> Optional[float]:
         positions = self.positions.get(symbol, [])
@@ -1108,7 +1213,21 @@ class GridLiveTrader:
         if not init_time:
             return False
 
-        cooldown = timedelta(minutes=settings.grid.rebalance_cooldown_minutes)
+        cooldown_minutes = settings.grid.rebalance_cooldown_minutes
+        if settings.grid.adaptive_cooldown_enabled:
+            advice = self._latest_advice.get(symbol)
+            regime = advice.volatility_regime if advice else None
+            cooldown_minutes = compute_adaptive_cooldown(
+                base_minutes=settings.grid.rebalance_cooldown_minutes,
+                volatility_regime=regime,
+                factors={
+                    "extreme": settings.grid.cooldown_factor_extreme,
+                    "high": settings.grid.cooldown_factor_high,
+                    "low": settings.grid.cooldown_factor_low,
+                },
+                min_minutes=settings.grid.cooldown_min_minutes,
+            )
+        cooldown = timedelta(minutes=cooldown_minutes)
         if datetime.utcnow() - init_time < cooldown:
             return False
 

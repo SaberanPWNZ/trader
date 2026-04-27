@@ -241,6 +241,26 @@ class GridConfig:
     ml_min_range_pct: float = 0.025
     ml_max_range_pct: float = 0.10
     ml_update_interval_minutes: int = 15
+
+    # Adaptive cooldown: scale ``rebalance_cooldown_minutes`` by
+    # ``MLGridAdvisor.volatility_regime``. Extreme/high regimes shorten
+    # the cooldown so we react to breakouts faster; low regimes stretch
+    # it so noise doesn't trigger churn. Set ``adaptive_cooldown_enabled
+    # = False`` to use the static cooldown unconditionally.
+    adaptive_cooldown_enabled: bool = True
+    cooldown_factor_extreme: float = 0.25
+    cooldown_factor_high: float = 0.5
+    cooldown_factor_low: float = 1.5
+    cooldown_min_minutes: float = 1.0
+
+    # Inventory hedge seed: when enabled, ``_initialize_grid`` issues a
+    # one-time market BUY before placing limit orders so the SELL legs
+    # can fill from tick one (otherwise they have to wait for BUYs to
+    # round-trip first). Capped at ``inventory_hedge_max_fraction`` of
+    # the per-symbol budget so the BUY legs still have USDT to deploy.
+    # OFF by default — enable explicitly per deployment.
+    inventory_hedge_enabled: bool = False
+    inventory_hedge_max_fraction: float = 0.5
     
     def get_interval_hours(self, symbol: str) -> float:
         if isinstance(self.rebalance_interval_hours, dict):
