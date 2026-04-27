@@ -17,6 +17,8 @@ class GridLevel:
     order_id: Optional[str] = None
     filled: bool = False
     filled_at: Optional[datetime] = None
+    level_id: Optional[int] = None
+    pair_id: Optional[int] = None
 
 
 @dataclass
@@ -47,6 +49,12 @@ class GridStrategy(BaseStrategy):
         self.center_price = 0.0
         self.last_rebalance_time: Optional[datetime] = None
         self.positions_carried_over: int = 0
+        self._next_level_id: int = 0
+
+    def _new_level_id(self) -> int:
+        lid = self._next_level_id
+        self._next_level_id += 1
+        return lid
         
     def build_strategy(self, data_source=None, start_date=None, end_date=None, symbol=None):
         pass
@@ -112,7 +120,8 @@ class GridStrategy(BaseStrategy):
             self.grid_levels.append(GridLevel(
                 price=price,
                 side=side,
-                amount=self.config.amount_per_grid / price
+                amount=self.config.amount_per_grid / price,
+                level_id=self._new_level_id()
             ))
         
         self.grid_levels.sort(key=lambda x: x.price)
@@ -186,7 +195,9 @@ class GridStrategy(BaseStrategy):
                 self.grid_levels.append(GridLevel(
                     price=new_price,
                     side=opposite_side,
-                    amount=filled_level.amount
+                    amount=filled_level.amount,
+                    level_id=self._new_level_id(),
+                    pair_id=filled_level.level_id
                 ))
     
     def get_active_levels(self) -> List[GridLevel]:
@@ -196,21 +207,60 @@ class GridStrategy(BaseStrategy):
         return [l for l in self.grid_levels if l.filled]
     
     def calculate_unrealized_pnl(self, current_price: float) -> float:
+        """Unrealized PnL = MTM of filled BUYs whose paired SELL is NOT yet filled.
+
+        BUY is considered "open" only if no filled SELL references it as pair_id.
+        This avoids double-counting BUYs that have already been closed by a SELL.
+        """
+        levels_by_id = {l.level_id: l for l in self.grid_levels if l.level_id is not None}
+        closed_buy_ids = {
+            l.pair_id for l in self.grid_levels
+            if l.filled and l.side == "sell" and l.pair_id is not None and l.pair_id in levels_by_id
+        }
+
         pnl = 0.0
-        buy_fills = [l for l in self.grid_levels if l.filled and l.side == "buy"]
-        for level in buy_fills:
+        for level in self.grid_levels:
+            if not (level.filled and level.side == "buy"):
+                continue
+            if level.level_id is not None and level.level_id in closed_buy_ids:
+                continue
             pnl += (current_price - level.price) * level.amount
         return pnl
-    
+
     def calculate_realized_pnl(self) -> float:
-        buys = sorted([l for l in self.grid_levels if l.filled and l.side == "buy"], key=lambda x: x.filled_at or datetime.min)
-        sells = sorted([l for l in self.grid_levels if l.filled and l.side == "sell"], key=lambda x: x.filled_at or datetime.min)
-        
+        """Realized PnL = sum over filled SELLs paired (via pair_id) with a filled BUY.
+
+        Falls back to FIFO chronological matching for legacy levels that lack pair_id
+        (e.g. positions restored from older state files without level_id metadata).
+        """
+        levels_by_id = {l.level_id: l for l in self.grid_levels if l.level_id is not None}
+
         pnl = 0.0
-        for buy, sell in zip(buys, sells):
-            if buy.filled_at and sell.filled_at and buy.filled_at < sell.filled_at:
-                profit = (sell.price - buy.price) * min(buy.amount, sell.amount)
-                pnl += profit
+        legacy_sells = []
+        legacy_buy_ids = set()
+
+        for sell in self.grid_levels:
+            if not (sell.filled and sell.side == "sell"):
+                continue
+            if sell.pair_id is not None and sell.pair_id in levels_by_id:
+                buy = levels_by_id[sell.pair_id]
+                if buy.filled and buy.side == "buy":
+                    matched = min(buy.amount, sell.amount)
+                    pnl += (sell.price - buy.price) * matched
+                    legacy_buy_ids.add(buy.level_id)
+                    continue
+            legacy_sells.append(sell)
+
+        if legacy_sells:
+            legacy_buys = sorted(
+                [l for l in self.grid_levels
+                 if l.filled and l.side == "buy" and l.level_id not in legacy_buy_ids],
+                key=lambda x: x.filled_at or datetime.min
+            )
+            legacy_sells.sort(key=lambda x: x.filled_at or datetime.min)
+            for buy, sell in zip(legacy_buys, legacy_sells):
+                if buy.filled_at and sell.filled_at and buy.filled_at < sell.filled_at:
+                    pnl += (sell.price - buy.price) * min(buy.amount, sell.amount)
         return pnl
     
     def can_rebalance_positions_profitable(self, current_price: float) -> tuple[bool, str]:
