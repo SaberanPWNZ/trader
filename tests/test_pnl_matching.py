@@ -398,33 +398,45 @@ class TestGridPairMatching:
 
     def testRealizedPnlUsesPairId(self):
         s = self._make_strategy()
-        # Fill the BUY at 95 and let _create_opposite_order spawn its SELL at 100.
-        buy = next(l for l in s.grid_levels if l.side == 'buy' and abs(l.price - 95.0) < 1e-6)
+        from strategies.grid import GridLevel
+        # Pair a BUY with a manually-linked SELL via pair_id (bypass spawn logic
+        # which can collide with pre-existing same-price grid levels).
+        buys = [l for l in s.grid_levels if l.side == 'buy']
+        assert buys, "expected BUY levels below center"
+        buy = max(buys, key=lambda l: l.price)
         buy.filled = True
         buy.filled_at = datetime(2026, 1, 1, 12, 0, 0)
-        s._create_opposite_order(buy)
 
-        sell = next(l for l in s.grid_levels if l.pair_id == buy.level_id)
-        sell.filled = True
-        sell.filled_at = datetime(2026, 1, 1, 12, 30, 0)
+        sell = GridLevel(
+            price=buy.price + s.config.grid_spacing,
+            side='sell', amount=buy.amount,
+            filled=True, filled_at=datetime(2026, 1, 1, 12, 30, 0),
+            level_id=s._new_level_id(), pair_id=buy.level_id,
+        )
+        s.grid_levels.append(sell)
 
         expected = (sell.price - buy.price) * min(buy.amount, sell.amount)
         assert abs(s.calculate_realized_pnl() - expected) < 1e-8
 
     def testUnrealizedExcludesPairedClosedBuys(self):
         s = self._make_strategy()
-        # Two BUYs filled.
-        buy_low = next(l for l in s.grid_levels if l.side == 'buy' and abs(l.price - 90.0) < 1e-6)
-        buy_high = next(l for l in s.grid_levels if l.side == 'buy' and abs(l.price - 95.0) < 1e-6)
+        from strategies.grid import GridLevel
+        buys = sorted([l for l in s.grid_levels if l.side == 'buy'], key=lambda l: l.price)
+        assert len(buys) >= 2
+        buy_low = buys[0]
+        buy_high = buys[-1]
         for b in (buy_low, buy_high):
             b.filled = True
             b.filled_at = datetime(2026, 1, 1, 12, 0, 0)
-            s._create_opposite_order(b)
 
-        # Only buy_high's paired SELL fires.
-        sell_for_high = next(l for l in s.grid_levels if l.pair_id == buy_high.level_id)
-        sell_for_high.filled = True
-        sell_for_high.filled_at = datetime(2026, 1, 1, 12, 30, 0)
+        # Only buy_high's paired SELL fires; buy_low remains "open".
+        sell_for_high = GridLevel(
+            price=buy_high.price + s.config.grid_spacing,
+            side='sell', amount=buy_high.amount,
+            filled=True, filled_at=datetime(2026, 1, 1, 12, 30, 0),
+            level_id=s._new_level_id(), pair_id=buy_high.level_id,
+        )
+        s.grid_levels.append(sell_for_high)
 
         # Unrealized must include buy_low only.
         current = 105.0

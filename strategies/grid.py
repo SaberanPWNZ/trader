@@ -28,13 +28,20 @@ class GridConfig:
     lower_price: float
     num_grids: int = 10
     total_investment: float = 100.0
-    
+
     @property
     def grid_spacing(self) -> float:
-        return (self.upper_price - self.lower_price) / self.num_grids
+        # num_grids interior levels strictly between lower_price and upper_price
+        # → there are num_grids+1 equal-width gaps.
+        return (self.upper_price - self.lower_price) / (self.num_grids + 1)
     
     @property
     def amount_per_grid(self) -> float:
+        """Legacy: USDT allocated per level if split evenly across all `num_grids`.
+
+        For actual capital allocation see `GridStrategy._create_grid_levels`,
+        which divides `total_investment` only across BUY levels (SELL levels
+        don't tie up USDT — they require base inventory)."""
         return self.total_investment / self.num_grids
 
 
@@ -105,27 +112,49 @@ class GridStrategy(BaseStrategy):
         return self.config
     
     def _create_grid_levels(self, current_price: float):
+        """Place exactly `num_grids` levels strictly between lower_price and
+        upper_price. Capital (`total_investment`) is split evenly across BUY
+        levels only — SELL levels don't lock USDT, they need base inventory.
+        """
         self.grid_levels = []
-        
-        for i in range(self.config.num_grids + 1):
-            price = self.config.lower_price + (i * self.config.grid_spacing)
-            
+        spacing = self.config.grid_spacing
+        # Two-pass: first compute prices and sides so we know how many BUYs
+        # exist before allocating capital per BUY.
+        prices_sides = []
+        for i in range(1, self.config.num_grids + 1):
+            price = self.config.lower_price + i * spacing
             if price < current_price:
                 side = "buy"
             elif price > current_price:
                 side = "sell"
             else:
-                continue
-                
+                # Exact match with current price is treated as BUY (USDT-funded);
+                # this preserves total level count = num_grids.
+                side = "buy"
+            prices_sides.append((price, side))
+
+        num_buys = sum(1 for _, s in prices_sides if s == "buy")
+        usdt_per_buy = (self.config.total_investment / num_buys) if num_buys > 0 else 0.0
+
+        for price, side in prices_sides:
+            if side == "buy":
+                amount = usdt_per_buy / price if price > 0 else 0.0
+            else:
+                # SELL inventory size mirrors what a single BUY would have produced;
+                # actual base inventory comes from filled BUYs or seed positions.
+                amount = usdt_per_buy / price if price > 0 else 0.0
             self.grid_levels.append(GridLevel(
                 price=price,
                 side=side,
-                amount=self.config.amount_per_grid / price,
+                amount=amount,
                 level_id=self._new_level_id()
             ))
-        
+
         self.grid_levels.sort(key=lambda x: x.price)
-        logger.debug(f"Created {len(self.grid_levels)} grid levels")
+        logger.debug(
+            f"Created {len(self.grid_levels)} grid levels "
+            f"({num_buys} BUY, {len(self.grid_levels) - num_buys} SELL)"
+        )
     
     def check_grid_fills(self, current_price: float) -> List[Dict]:
         if not self.initialized:
@@ -154,18 +183,23 @@ class GridStrategy(BaseStrategy):
                 sell_prices = [l.price for l in sell_levels]
                 logger.debug(f"check_grid_fills: SELL levels at: ${min(sell_prices):.2f} - ${max(sell_prices):.2f}")
         
-        for level in self.grid_levels:
+        # Two-phase iteration: don't mutate self.grid_levels while iterating it.
+        # Phase 1 — detect crosses against a snapshot.
+        crossed_levels: List[GridLevel] = []
+        for level in list(self.grid_levels):
             if level.filled:
                 continue
-            
+
             crossed = False
             if level.side == "buy":
-                if previous_price > level.price >= current_price:
+                # Symmetric inclusive bounds: price moved from at-or-above to
+                # at-or-below the level (covers exact touches on either tick).
+                if previous_price >= level.price >= current_price:
                     crossed = True
             else:
-                if previous_price < level.price <= current_price:
+                if previous_price <= level.price <= current_price:
                     crossed = True
-            
+
             if crossed:
                 level.filled = True
                 level.filled_at = datetime.utcnow()
@@ -176,8 +210,12 @@ class GridStrategy(BaseStrategy):
                     "value": level.amount * level.price
                 })
                 logger.info(f"Grid level filled: {level.side.upper()} at ${level.price:.2f}")
-                self._create_opposite_order(level)
-        
+                crossed_levels.append(level)
+
+        # Phase 2 — spawn opposite orders after the iteration is done.
+        for level in crossed_levels:
+            self._create_opposite_order(level)
+
         return fills
     
     def _create_opposite_order(self, filled_level: GridLevel):

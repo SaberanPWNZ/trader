@@ -243,6 +243,32 @@ class MLGridAdvisor:
         else:
             recommended_grids = max(settings.grid.min_grids, settings.grid.max_grids - 2)
 
+        # Breakeven floor: each round-trip pays 2 * fee + slippage. Add a small
+        # `edge` so spacing comfortably clears costs. If the requested grid count
+        # would push spacing below this floor, cap it — trading sub-breakeven is
+        # strictly worse than running fewer grids.
+        fee = float(getattr(settings.backtest, 'trading_fee', 0.001) or 0.001)
+        slippage = float(getattr(settings.backtest, 'slippage', 0.0005) or 0.0005)
+        edge = 0.001
+        min_spacing_pct = 2.0 * fee + slippage + edge
+
+        # spacing_pct ≈ grid_range_pct / (recommended_grids + 1) since `num_grids`
+        # interior levels carve out (num_grids + 1) equal gaps across the range.
+        max_grids_for_floor = max(1, int(grid_range_pct / min_spacing_pct) - 1)
+        if recommended_grids > max_grids_for_floor:
+            logger.debug(
+                f"ML advisor: capping recommended_grids {recommended_grids}→"
+                f"{max_grids_for_floor} so spacing ≥ {min_spacing_pct:.4%} "
+                f"(range={grid_range_pct:.2%})"
+            )
+            recommended_grids = max_grids_for_floor
+        if recommended_grids < settings.grid.min_grids:
+            logger.warning(
+                f"ML advisor: breakeven floor forces grids={recommended_grids} "
+                f"below configured min_grids={settings.grid.min_grids}; consider "
+                f"widening grid_range_pct or lowering min_grids."
+            )
+
         confidence = ml_confidence
 
         grid_range_pct = float(np.clip(grid_range_pct, 0.015, 0.05))
