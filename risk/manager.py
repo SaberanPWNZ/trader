@@ -17,7 +17,23 @@ class RiskState:
     daily_pnl: float = 0.0
     peak_balance: float = 0.0
     current_balance: float = 0.0
+    # Balance at the start of the current trading day. Used as the denominator
+    # for the daily-loss percentage so that intra-day gains do not artificially
+    # widen the daily-loss budget (which would happen if peak_balance were
+    # used instead).
+    day_start_balance: float = 0.0
     consecutive_losses: int = 0
+    # Counts consecutive winning trades; reset to 0 on any loss. Used by
+    # ``RiskConfig.recovery_wins_to_lift_cooldown`` to lift a cooldown
+    # early after a recovery streak. Independent of consecutive_losses
+    # (which already resets to 0 on the first win).
+    consecutive_wins: int = 0
+    # Counts consecutive failed exchange API calls (5xx, rate-limit,
+    # network timeouts). Reset by ``record_api_success``. When the
+    # counter hits ``RiskConfig.max_consecutive_api_errors`` the kill
+    # switch is activated to prevent retry-storm losses during exchange
+    # outages.
+    consecutive_api_errors: int = 0
     last_trade_time: Optional[datetime] = None
     cooldown_until: Optional[datetime] = None
     kill_switch_active: bool = False
@@ -49,7 +65,8 @@ class RiskManager:
         self.config = settings.risk
         self.state = RiskState(
             peak_balance=initial_balance,
-            current_balance=initial_balance
+            current_balance=initial_balance,
+            day_start_balance=initial_balance,
         )
         self._risk_events: List[Dict[str, Any]] = []
     
@@ -75,8 +92,11 @@ class RiskManager:
             else:
                 self.state.cooldown_until = None
         
-        # Check daily loss limit
-        daily_loss_pct = abs(self.state.daily_pnl) / self.state.peak_balance
+        # Check daily loss limit. The denominator is the balance at the start
+        # of the trading day (not peak_balance) so that gains earlier in the
+        # day cannot relax the daily-loss budget.
+        denom = self.state.day_start_balance or self.state.peak_balance
+        daily_loss_pct = abs(self.state.daily_pnl) / denom if denom > 0 else 0.0
         if self.state.daily_pnl < 0 and daily_loss_pct >= self.config.max_daily_loss:
             self._record_risk_event(RiskEventType.MAX_LOSS_REACHED, {
                 'daily_loss': self.state.daily_pnl,
@@ -111,9 +131,16 @@ class RiskManager:
         if not can_trade:
             return False, reason
         
-        # Check minimum confidence
-        if signal.confidence < self.config.min_confidence if hasattr(self.config, 'min_confidence') else 0.5:
-            return False, f"Signal confidence too low ({signal.confidence:.2f})"
+        # Check minimum confidence. Threshold is sourced from RiskConfig so
+        # it can be tuned via configuration; the previous implementation had
+        # an operator-precedence bug (the ternary covered the *fallback*, not
+        # the comparison) and silently used 0.5 if the field was absent.
+        min_confidence = getattr(self.config, 'min_confidence', 0.5)
+        if signal.confidence < min_confidence:
+            return False, (
+                f"Signal confidence too low ({signal.confidence:.2f} < "
+                f"{min_confidence:.2f})"
+            )
         
         # Validate stop-loss
         if signal.stop_loss is None:
@@ -189,15 +216,21 @@ class RiskManager:
         if self.state.current_balance > self.state.peak_balance:
             self.state.peak_balance = self.state.current_balance
         
-        # Track consecutive losses
+        # Track consecutive losses & wins. ``consecutive_wins`` enables
+        # the optional ``recovery_wins_to_lift_cooldown`` early-exit
+        # below — the trader can resume sooner if the recovery streak
+        # is long enough.
         if realized_pnl < 0:
             self.state.consecutive_losses += 1
-            
+            self.state.consecutive_wins = 0
+
             if self.state.consecutive_losses >= self.config.max_consecutive_losses:
                 self._activate_cooldown()
         else:
             self.state.consecutive_losses = 0
-        
+            self.state.consecutive_wins += 1
+            self._maybe_lift_cooldown_early()
+
         logger.info(f"Closed position for {symbol}: PnL={realized_pnl:.2f}")
     
     def check_stop_loss(self, position: Position, current_price: float) -> bool:
@@ -243,6 +276,45 @@ class RiskManager:
             'cooldown_until': self.state.cooldown_until.isoformat()
         })
         logger.warning(f"Cooldown activated until {self.state.cooldown_until}")
+
+    def _maybe_lift_cooldown_early(self) -> None:
+        """Lift an active cooldown after a long enough win streak.
+
+        The cooldown is set by ``_activate_cooldown`` after
+        ``max_consecutive_losses`` losses. Once the trader recovers
+        (``consecutive_wins`` reaches
+        ``RiskConfig.recovery_wins_to_lift_cooldown``), the cooldown
+        is cleared so trading resumes without waiting for the full
+        ``cooldown_minutes`` timer.
+
+        Disabled when the threshold is ``<= 0`` (default) so existing
+        deployments keep the historical fixed-duration behaviour.
+        """
+        threshold = getattr(
+            self.config, "recovery_wins_to_lift_cooldown", 0
+        )
+        if threshold <= 0:
+            return
+        if self.state.cooldown_until is None:
+            return
+        if self.state.consecutive_wins < threshold:
+            return
+        # Only lift if the cooldown is still in the future — expired
+        # cooldowns are already harmless and clearing them needlessly
+        # would lose the historical timestamp.
+        if self.state.cooldown_until <= datetime.utcnow():
+            return
+        prev_until = self.state.cooldown_until
+        self.state.cooldown_until = None
+        self._record_risk_event(RiskEventType.COOLDOWN_ACTIVE, {
+            'lifted_early': True,
+            'consecutive_wins': self.state.consecutive_wins,
+            'previous_cooldown_until': prev_until.isoformat(),
+        })
+        logger.info(
+            f"Cooldown lifted early after {self.state.consecutive_wins} "
+            f"consecutive wins (was {prev_until})"
+        )
     
     def _record_risk_event(self, event_type: RiskEventType, data: dict) -> None:
         """Record a risk event."""
@@ -254,9 +326,49 @@ class RiskManager:
         self._risk_events.append(event)
         logger.warning(f"Risk event: {event_type.value} - {data}")
     
+    def record_api_error(self, reason: str = "") -> bool:
+        """Register a failed exchange API call.
+
+        Increments ``consecutive_api_errors`` and activates the kill
+        switch when the configured threshold is reached. Threshold
+        ``0`` (or any non-positive value) disables this path entirely
+        — callers can still bookkeep the counter via this method, but
+        the kill switch will not fire from API errors alone.
+
+        Args:
+            reason: Short description (e.g. ``"HTTP 503"``,
+                ``"binance rate-limit"``) recorded on the risk-event
+                log when the threshold trips.
+
+        Returns:
+            ``True`` if this call activated the kill switch, ``False``
+            otherwise.
+        """
+        self.state.consecutive_api_errors += 1
+        threshold = getattr(self.config, "max_consecutive_api_errors", 0)
+        if (
+            threshold
+            and threshold > 0
+            and self.state.consecutive_api_errors >= threshold
+            and not self.state.kill_switch_active
+        ):
+            self.activate_kill_switch(
+                f"API error threshold reached "
+                f"({self.state.consecutive_api_errors}/{threshold}): {reason}"
+            )
+            return True
+        return False
+
+    def record_api_success(self) -> None:
+        """Reset the consecutive API-error counter after a successful call."""
+        self.state.consecutive_api_errors = 0
+
     def reset_daily_stats(self) -> None:
         """Reset daily statistics (call at start of new trading day)."""
         self.state.daily_pnl = 0.0
+        # Snapshot the balance at day-start so daily-loss percentages are
+        # measured against a stable denominator for the rest of the day.
+        self.state.day_start_balance = self.state.current_balance
         logger.info("Daily risk stats reset")
     
     def get_risk_summary(self) -> dict:

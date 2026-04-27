@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from config.settings import settings
+from execution.portfolio_protection import compute_adaptive_num_grids
 from strategies.indicators import TechnicalIndicators
 
 
@@ -15,6 +16,7 @@ class GridAdvice:
     __slots__ = (
         'grid_range_pct', 'trend_bias', 'confidence',
         'volatility_regime', 'recommended_grids', 'reason',
+        'pause_trading',
     )
 
     def __init__(
@@ -25,6 +27,7 @@ class GridAdvice:
         volatility_regime: str,
         recommended_grids: int,
         reason: str,
+        pause_trading: bool = False,
     ):
         self.grid_range_pct = grid_range_pct
         self.trend_bias = trend_bias
@@ -32,11 +35,18 @@ class GridAdvice:
         self.volatility_regime = volatility_regime
         self.recommended_grids = recommended_grids
         self.reason = reason
+        # When True, callers should refrain from placing new grid orders
+        # (e.g. during a volatility shock). The flag is informational —
+        # existing positions / SELL orders remain untouched so the strategy
+        # can still take profit if price reverts.
+        self.pause_trading = pause_trading
 
     def __repr__(self) -> str:
+        flag = " PAUSE" if self.pause_trading else ""
         return (
             f"GridAdvice(range={self.grid_range_pct:.1%}, bias={self.trend_bias:+.3f}, "
-            f"vol={self.volatility_regime}, conf={self.confidence:.2f}, grids={self.recommended_grids})"
+            f"vol={self.volatility_regime}, conf={self.confidence:.2f}, "
+            f"grids={self.recommended_grids}{flag})"
         )
 
 
@@ -170,14 +180,22 @@ class MLGridAdvisor:
                 return cached
 
         if ohlcv_df is None or len(ohlcv_df) < 50:
-            return self._default_advice("insufficient data")
+            return self._default_advice("insufficient data", symbol=symbol)
 
         try:
             vol = self._calculate_volatility_features(ohlcv_df)
             trend = self._calculate_trend_features(ohlcv_df)
             ml_confidence, ml_direction = self._get_ml_confidence(symbol, ohlcv_df)
 
-            advice = self._compute_grid_params(vol, trend, ml_confidence, ml_direction)
+            # Resolve the per-symbol baseline once, then thread it into
+            # ``_compute_grid_params``. Quiet symbols (BTC) and noisy
+            # ones (DOGE) typically need different anchors before the
+            # volatility-regime multiplier is applied.
+            base_range = settings.grid.get_grid_range_pct(symbol)
+
+            advice = self._compute_grid_params(
+                vol, trend, ml_confidence, ml_direction, base_range=base_range
+            )
 
             self._last_advice[symbol] = advice
             self._last_update[symbol] = now
@@ -191,7 +209,7 @@ class MLGridAdvisor:
 
         except Exception as e:
             logger.warning(f"ML advisor error for {symbol}: {e}")
-            return self._default_advice(f"error: {e}")
+            return self._default_advice(f"error: {e}", symbol=symbol)
 
     def _compute_grid_params(
         self,
@@ -199,8 +217,13 @@ class MLGridAdvisor:
         trend: Dict[str, float],
         ml_confidence: float,
         ml_direction: float,
+        *,
+        base_range: Optional[float] = None,
     ) -> GridAdvice:
-        base_range = self._default_range
+        # ``base_range`` is the per-symbol anchor (see
+        # ``GridConfig.get_grid_range_pct``). Falls back to the global
+        # default for legacy callers / tests that don't pass it.
+        base_range = self._default_range if base_range is None else base_range
         atr_pct = vol['atr_pct']
         bb_width = vol['bb_width']
         vol_ratio = vol['vol_ratio']
@@ -234,14 +257,19 @@ class MLGridAdvisor:
         elif abs(trend_score) > 0.3:
             trend_bias = trend_score * grid_range_pct * 0.15
 
-        if volatility_regime == "extreme":
-            recommended_grids = max(settings.grid.min_grids, 6)
-        elif volatility_regime == "high":
-            recommended_grids = max(settings.grid.min_grids, 8)
-        elif volatility_regime == "low":
-            recommended_grids = settings.grid.max_grids
-        else:
-            recommended_grids = max(settings.grid.min_grids, settings.grid.max_grids - 2)
+        # Delegate the regime → line-count mapping to the canonical helper
+        # (``execution.portfolio_protection.compute_adaptive_num_grids``).
+        # The helper applies a regime multiplier to the midpoint of
+        # [min_grids, max_grids] and clamps back into bounds, matching the
+        # previous extreme/high/low cases (8, 8, max_grids respectively at
+        # min=8/max=10) while consistently lifting "normal" off the lower
+        # bound. Keeping a single source of truth here means any future
+        # tuning to the regime table propagates everywhere automatically.
+        recommended_grids = compute_adaptive_num_grids(
+            min_grids=settings.grid.min_grids,
+            max_grids=settings.grid.max_grids,
+            volatility_regime=volatility_regime,
+        )
 
         # Breakeven floor: each round-trip pays 2 * fee + slippage. Add a small
         # `edge` so spacing comfortably clears costs. If the requested grid count
@@ -289,14 +317,28 @@ class MLGridAdvisor:
             volatility_regime=volatility_regime,
             recommended_grids=int(recommended_grids),
             reason=reason,
+            # Pause new entries when the market is in an extreme volatility
+            # regime: grids tend to lose to trend / produce large drawdowns
+            # while spreads blow out. Existing orders are unaffected so we
+            # can still take profit on a mean-reverting bounce.
+            pause_trading=(volatility_regime == "extreme"),
         )
 
-    def _default_advice(self, reason: str) -> GridAdvice:
+    def _default_advice(self, reason: str, *, symbol: Optional[str] = None) -> GridAdvice:
+        # When the advisor falls back (no data, exception, etc.) we still
+        # honour the per-symbol ``grid_range_pct_overrides`` so the
+        # fallback grid stays usable on that specific market. Symbol
+        # ``None`` keeps the legacy global behaviour.
+        if symbol is not None:
+            grid_range = settings.grid.get_grid_range_pct(symbol)
+        else:
+            grid_range = self._default_range
         return GridAdvice(
-            grid_range_pct=self._default_range,
+            grid_range_pct=grid_range,
             trend_bias=0.0,
             confidence=0.0,
             volatility_regime="unknown",
             recommended_grids=settings.grid.min_grids,
             reason=f"default: {reason}",
+            pause_trading=False,
         )

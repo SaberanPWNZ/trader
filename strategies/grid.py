@@ -6,7 +6,9 @@ from loguru import logger
 
 from strategies.base import BaseStrategy
 from config.constants import SignalType
+from config.settings import settings
 from data.models import Signal
+from execution.portfolio_protection import compute_adaptive_num_grids
 
 
 @dataclass
@@ -67,41 +69,99 @@ class GridStrategy(BaseStrategy):
         pass
     
     def _calculate_dynamic_multiplier(self, data: pd.DataFrame) -> float:
+        """Pick an ATR multiplier from recent return volatility.
+
+        ``_get_ml_advice`` and the rest of the live pipeline feed 1-hour
+        candles into this method, so the standard-deviation thresholds are
+        calibrated for *hourly* returns. The previous defaults of 5% / 3%
+        were daily-return-sized and effectively unreachable on hourly data,
+        so the high-volatility branch never fired.
+        """
         if data is None or len(data) < 30:
             return 7.0
-        
+
         close_prices = data['close'].tail(30)
-        daily_returns = close_prices.pct_change().dropna()
-        volatility = daily_returns.std()
-        
-        if volatility > 0.05:
+        hourly_returns = close_prices.pct_change().dropna()
+        volatility = hourly_returns.std()
+
+        # Hourly-return std thresholds:
+        #   > 1.5%   ≈ shock / news event
+        #   > 0.8%   ≈ elevated regime
+        #   else     ≈ calm
+        if volatility > 0.015:
             multiplier = 10.0
-            logger.info(f"{self.symbol}: High volatility ({volatility:.3f}) → multiplier = {multiplier}")
-        elif volatility > 0.03:
+            logger.info(f"{self.symbol}: High hourly volatility ({volatility:.4f}) → multiplier = {multiplier}")
+        elif volatility > 0.008:
             multiplier = 7.0
-            logger.info(f"{self.symbol}: Medium volatility ({volatility:.3f}) → multiplier = {multiplier}")
+            logger.info(f"{self.symbol}: Medium hourly volatility ({volatility:.4f}) → multiplier = {multiplier}")
         else:
             multiplier = 5.0
-            logger.info(f"{self.symbol}: Low volatility ({volatility:.3f}) → multiplier = {multiplier}")
-        
+            logger.info(f"{self.symbol}: Low hourly volatility ({volatility:.4f}) → multiplier = {multiplier}")
+
         return multiplier
     
-    def initialize_grid(self, current_price: float, atr: float, total_investment: float, data: pd.DataFrame = None) -> GridConfig:
+    def _classify_volatility_regime(self, data: pd.DataFrame) -> str:
+        """Map recent hourly-return volatility to the regime strings used by
+        ``compute_adaptive_num_grids``.
+
+        Thresholds mirror ``_calculate_dynamic_multiplier`` so the same
+        bands drive both the ATR multiplier (range width) and the grid
+        line count (range density).
+        """
+        if data is None or len(data) < 30:
+            return "normal"
+        close_prices = data['close'].tail(30)
+        hourly_returns = close_prices.pct_change().dropna()
+        if hourly_returns.empty:
+            return "normal"
+        volatility = float(hourly_returns.std())
+        if volatility > 0.015:
+            return "high"
+        if volatility > 0.008:
+            return "normal"
+        return "low"
+
+    def initialize_grid(
+        self,
+        current_price: float,
+        atr: float,
+        total_investment: float,
+        data: pd.DataFrame = None,
+        _is_rebalance: bool = False,
+        volatility_regime: Optional[str] = None,
+    ) -> GridConfig:
         atr_multiplier = self._calculate_dynamic_multiplier(data)
         upper_price = current_price + (atr * atr_multiplier)
         lower_price = current_price - (atr * atr_multiplier)
-        
+
+        # Pick grid density adaptively from volatility — calm markets get a
+        # denser grid (more fills on small wiggles), choppy markets get a
+        # sparser grid (each leg captures real movement). Replaces the old
+        # hard-coded ``num_grids=5``.
+        regime = volatility_regime or self._classify_volatility_regime(data)
+        num_grids = compute_adaptive_num_grids(
+            min_grids=settings.grid.min_grids,
+            max_grids=settings.grid.max_grids,
+            volatility_regime=regime,
+        )
+
         self.config = GridConfig(
             symbol=self.symbol,
             upper_price=upper_price,
             lower_price=lower_price,
-            num_grids=5,
+            num_grids=num_grids,
             total_investment=total_investment
         )
         
         self.center_price = current_price
         self._create_grid_levels(current_price)
         self.initialized = True
+        # Stamp the rebalance clock on first init too — otherwise
+        # ``should_rebalance_hybrid`` sees ``last_rebalance_time = None`` and
+        # treats hours_since_rebalance as 0, *bypassing* the cooldown check
+        # and allowing an immediate rebalance right after initialization.
+        if not _is_rebalance and self.last_rebalance_time is None:
+            self.last_rebalance_time = datetime.utcnow()
         
         logger.info(f"Grid initialized for {self.symbol}:")
         logger.info(f"  Range: ${lower_price:.2f} - ${upper_price:.2f}")
@@ -227,7 +287,13 @@ class GridStrategy(BaseStrategy):
             new_price = filled_level.price - self.config.grid_spacing
         
         if self.config.lower_price <= new_price <= self.config.upper_price:
-            tolerance = self.config.grid_spacing * 0.1
+            # Use a generous tolerance (half of grid_spacing). The previous
+            # 0.1*spacing band let near-duplicate levels coexist when an
+            # opposite order was spawned at almost — but not exactly — the
+            # same price as an existing active level, which produced
+            # double-fills on the next cross. Half-spacing is the natural
+            # exclusion radius around a grid line.
+            tolerance = self.config.grid_spacing * 0.5
             existing = [l for l in self.grid_levels if abs(l.price - new_price) < tolerance and not l.filled]
             if not existing:
                 self.grid_levels.append(GridLevel(
@@ -320,7 +386,9 @@ class GridStrategy(BaseStrategy):
         
         min_profit = max(
             settings.grid.min_profit_threshold,
-            self.config.total_investment * (settings.grid.min_profit_threshold_percent / 100)
+            self.config.total_investment * (
+                settings.grid.get_min_profit_threshold_percent(self.symbol) / 100
+            )
         )
         
         if total_unrealized < min_profit:
@@ -396,8 +464,27 @@ class GridStrategy(BaseStrategy):
         
         old_config = self.config
         self.positions_carried_over += len(filled_buys)
-        
-        self.initialize_grid(current_price, atr, self.config.total_investment, data)
+
+        # Preserve historical filled levels (with their original prices,
+        # amounts, level_id and pair_id) so realized/unrealized PnL stays
+        # consistent across the rebalance. ``_create_grid_levels`` (called
+        # from ``initialize_grid``) clears ``self.grid_levels``, which
+        # previously dropped this history and silently zeroed past PnL.
+        history = [l for l in self.grid_levels if l.filled]
+
+        self.initialize_grid(
+            current_price, atr, self.config.total_investment, data,
+            _is_rebalance=True,
+        )
+
+        # Re-attach historical levels alongside the freshly-built grid.
+        # They are kept marked as filled so they are not treated as active
+        # orders, but they remain visible to the PnL calculations and to
+        # ``get_filled_levels``.
+        if history:
+            self.grid_levels.extend(history)
+            self.grid_levels.sort(key=lambda l: l.price)
+
         self.last_rebalance_time = datetime.utcnow()
         
         logger.info(f"   Old range: ${old_config.lower_price:.2f} - ${old_config.upper_price:.2f}")

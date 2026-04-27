@@ -42,8 +42,43 @@ class RiskConfig:
     stop_loss_atr_multiplier: float = 1.5
     take_profit_atr_multiplier: float = 3.0
     max_consecutive_losses: int = 5
+    # When > 0 and a trader is in cooldown after hitting
+    # ``max_consecutive_losses``, ``record_trade_result`` lifts the
+    # cooldown early after this many consecutive *winning* trades. 0
+    # disables the early-lift path — cooldown then runs to its full
+    # ``cooldown_minutes`` regardless of subsequent recovery wins.
+    recovery_wins_to_lift_cooldown: int = 0
+    # Activate the kill switch after this many consecutive failed exchange
+    # API calls (HTTP 5xx, rate-limit, network timeouts). Without this,
+    # an upstream Binance outage can let the strategy burn balance on a
+    # retry storm. Set to 0 to disable the API-error kill-switch path
+    # entirely (per-trade kill-switch on consecutive losses still works).
+    max_consecutive_api_errors: int = 10
     cooldown_minutes: int = 30
     kill_switch_enabled: bool = True
+    # Minimum signal confidence required to allow a trade.
+    # Explicit field so the threshold is controllable via config (was previously
+    # accessed via hasattr() with a hard-coded fallback).
+    min_confidence: float = 0.5
+    # Portfolio-level loss thresholds for the live grid trader (fractions, not
+    # percent points). When unrealized portfolio loss vs. ``initial_balance``
+    # crosses ``portfolio_stop_loss_pct`` the trader sends a Telegram warning;
+    # at ``portfolio_emergency_stop_pct`` it sets ``_emergency_stop`` and halts
+    # the trading loop. Previously hardcoded as ``0.10`` / ``0.15`` inside
+    # ``GridLiveTrader``; lifting them to config lets ops dial down without a
+    # redeploy. Distinct from ``GridConfig.portfolio_stop_loss_percent``
+    # (paper simulator, percent units).
+    portfolio_stop_loss_pct: float = 0.10
+    portfolio_emergency_stop_pct: float = 0.15
+
+    # Slippage-aware position sizing. When enabled, ``PositionSizer.
+    # slippage_adjusted`` scales the volatility-sized result down by a
+    # factor derived from the recent adverse-slippage EMA. The factor
+    # decays linearly from 1.0 at 0 bps to ``slippage_size_min_factor``
+    # at ``slippage_size_max_bps``.
+    slippage_size_adjust_enabled: bool = False
+    slippage_size_max_bps: float = 30.0
+    slippage_size_min_factor: float = 0.5
 
 
 @dataclass
@@ -144,6 +179,11 @@ class BacktestConfig:
     initial_balance: float = 2000.0
     trading_fee: float = 0.001  # 0.1%
     slippage: float = 0.0005  # 0.05%
+    # Number of bars per year used to annualize Sharpe / Sortino. Should match
+    # the timeframe of the equity curve fed into PerformanceMetrics.
+    # Defaults to daily bars (crypto trades 365 days/year). For 1h bars use
+    # 365*24=8760, for 15m use 365*24*4=35040.
+    bars_per_year: int = 365
     
     # PyBroker-specific backtest settings
     pybroker_engine: bool = True
@@ -180,6 +220,13 @@ class DatabaseConfig:
 class GridConfig:
     """Grid trading configuration."""
     grid_range_pct: float = 0.02
+    # Per-symbol overrides for ``grid_range_pct``. Symbols absent from
+    # the dict fall back to ``grid_range_pct``. Use this to widen the
+    # grid on noisy symbols (e.g. DOGE) without forcing churn on quiet
+    # ones (e.g. BTC), since a single global value over-fits one regime.
+    # The ML advisor still scales this by the volatility regime, so the
+    # override sets the *base* range, not the final one.
+    grid_range_pct_overrides: dict = field(default_factory=dict)
     max_grids: int = 10
     min_grids: int = 8
     min_order_value: float = 7.0
@@ -197,7 +244,21 @@ class GridConfig:
     auto_rebalance_enabled: bool = True
     wait_for_profit: bool = True
     min_profit_threshold: float = 0.0
-    min_profit_threshold_percent: float = 0.0
+    # Minimum unrealized profit (percent of total grid investment) required
+    # before the strategy will rebalance / take profit. Default 0.3% covers a
+    # full round-trip cost of ``2 * (trading_fee + slippage)`` at the
+    # backtest defaults — concretely ``2 * (0.001 + 0.0005) * 100 = 0.3%``,
+    # so the rebalance does not lock in a loss masquerading as a small
+    # gain. Tune higher per deployment if exchange fees are higher than
+    # Binance spot.
+    min_profit_threshold_percent: float = 0.3
+    # Per-symbol overrides for ``min_profit_threshold_percent``. Symbols
+    # absent from the dict fall back to the global default. Use this to
+    # demand a tighter or looser take-profit floor on specific markets
+    # (e.g. raise it on coins with higher trading fees, lower it on
+    # majors with tight spreads). Consumed by
+    # ``GridStrategy.can_rebalance_positions_profitable``.
+    min_profit_threshold_percent_overrides: dict = field(default_factory=dict)
     rebalance_cooldown_minutes: int = 30
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
@@ -206,6 +267,22 @@ class GridConfig:
     
     portfolio_stop_loss_percent: float = 5.0
     portfolio_take_profit_percent: float = 50.0
+    # Trailing portfolio take-profit. When enabled, the trader tracks the
+    # peak total_value seen since startup. If total_value drops by
+    # ``trailing_portfolio_tp_drawdown_percent`` from that peak — and the
+    # peak is at least ``trailing_portfolio_tp_arm_percent`` above the
+    # initial balance — the trader takes profit. This locks in gains in
+    # trends instead of waiting for a fixed +50% from initial.
+    trailing_portfolio_tp_enabled: bool = False
+    trailing_portfolio_tp_arm_percent: float = 10.0
+    trailing_portfolio_tp_drawdown_percent: float = 3.0
+    # Per-symbol overrides for the trailing portfolio take-profit. Schema:
+    # ``{"DOGE/USDT": {"arm_percent": 15.0, "drawdown_percent": 5.0}}``.
+    # Live trader runs multi-symbol but the trail is portfolio-wide, so
+    # the resolver picks the override matching the trader's primary
+    # symbol (first one with a registered override). Missing keys fall
+    # back to the global ``arm_percent``/``drawdown_percent``.
+    trailing_portfolio_tp_overrides: dict = field(default_factory=dict)
     max_unrealized_loss_percent: float = 3.0
     partial_close_profit_percent: float = 10.0
     
@@ -223,11 +300,77 @@ class GridConfig:
     ml_min_range_pct: float = 0.025
     ml_max_range_pct: float = 0.10
     ml_update_interval_minutes: int = 15
+
+    # Adaptive cooldown: scale ``rebalance_cooldown_minutes`` by
+    # ``MLGridAdvisor.volatility_regime``. Extreme/high regimes shorten
+    # the cooldown so we react to breakouts faster; low regimes stretch
+    # it so noise doesn't trigger churn. Set ``adaptive_cooldown_enabled
+    # = False`` to use the static cooldown unconditionally.
+    adaptive_cooldown_enabled: bool = True
+    cooldown_factor_extreme: float = 0.25
+    cooldown_factor_high: float = 0.5
+    cooldown_factor_low: float = 1.5
+    cooldown_min_minutes: float = 1.0
+
+    # Inventory hedge seed: when enabled, ``_initialize_grid`` issues a
+    # one-time market BUY before placing limit orders so the SELL legs
+    # can fill from tick one (otherwise they have to wait for BUYs to
+    # round-trip first). Capped at ``inventory_hedge_max_fraction`` of
+    # the per-symbol budget so the BUY legs still have USDT to deploy.
+    # OFF by default — enable explicitly per deployment.
+    inventory_hedge_enabled: bool = False
+    inventory_hedge_max_fraction: float = 0.5
     
     def get_interval_hours(self, symbol: str) -> float:
         if isinstance(self.rebalance_interval_hours, dict):
             return self.rebalance_interval_hours.get(symbol, 12.0)
         return self.rebalance_interval_hours
+
+    def get_grid_range_pct(self, symbol: str) -> float:
+        """Return the base ``grid_range_pct`` for ``symbol``.
+
+        Falls back to the global ``grid_range_pct`` when no override is
+        registered. The MLGridAdvisor scales this by the current
+        volatility regime before the grid is built, so the override
+        controls the *baseline*, not the final spacing.
+        """
+        if isinstance(self.grid_range_pct_overrides, dict):
+            return float(self.grid_range_pct_overrides.get(
+                symbol, self.grid_range_pct
+            ))
+        return self.grid_range_pct
+
+    def get_min_profit_threshold_percent(self, symbol: str) -> float:
+        """Return the take-profit floor (% of total_investment) for ``symbol``.
+
+        Used by ``GridStrategy.can_rebalance_positions_profitable`` to
+        decide whether unrealized PnL is large enough to justify a
+        rebalance. Raise this for high-fee or thin-spread symbols and
+        lower it for majors with tight spreads.
+        """
+        if isinstance(self.min_profit_threshold_percent_overrides, dict):
+            return float(self.min_profit_threshold_percent_overrides.get(
+                symbol, self.min_profit_threshold_percent
+            ))
+        return self.min_profit_threshold_percent
+
+    def get_trailing_tp_params(self, symbol: Optional[str]) -> tuple:
+        """Return ``(arm_percent, drawdown_percent)`` for the trailing portfolio TP.
+
+        ``symbol`` is the trader's primary symbol (or ``None`` for the
+        global default). Per-symbol overrides may set either or both
+        knobs; missing keys fall back to the global values. The trail
+        itself is still portfolio-wide — this only controls *when* it
+        arms and *how much* drawdown it tolerates.
+        """
+        arm = float(self.trailing_portfolio_tp_arm_percent)
+        drawdown = float(self.trailing_portfolio_tp_drawdown_percent)
+        if symbol and isinstance(self.trailing_portfolio_tp_overrides, dict):
+            override = self.trailing_portfolio_tp_overrides.get(symbol)
+            if isinstance(override, dict):
+                arm = float(override.get("arm_percent", arm))
+                drawdown = float(override.get("drawdown_percent", drawdown))
+        return arm, drawdown
 
 
 @dataclass

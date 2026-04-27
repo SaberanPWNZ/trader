@@ -9,10 +9,20 @@ from loguru import logger
 import pandas as pd
 
 from strategies.grid import GridStrategy, GridLevel, GridConfig
-from strategies.ml_grid_advisor import MLGridAdvisor
+from strategies.ml_grid_advisor import GridAdvice, MLGridAdvisor
 from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
+from execution.exchange_guard import ExchangeApiGuard
+from execution.portfolio_protection import (
+    InvestmentBudget,
+    TrailingTPState,
+    check_trailing_take_profit,
+    compute_adaptive_cooldown,
+    compute_inventory_hedge,
+    compute_target_investment,
+)
+from risk.manager import RiskManager
 
 
 @dataclass
@@ -54,11 +64,21 @@ class GridLiveTrader:
         self.total_trades = 0
         self._running = False
         self._last_trade_sync: datetime = datetime.min
-        self._max_loss_pct = 0.15
-        self._stop_loss_pct = 0.10
+        # Portfolio loss thresholds are sourced from ``RiskConfig`` so ops
+        # can dial them without a redeploy. ``portfolio_stop_loss_pct``
+        # triggers a Telegram warning; ``portfolio_emergency_stop_pct``
+        # halts the trading loop.
+        self._stop_loss_pct = settings.risk.portfolio_stop_loss_pct
+        self._max_loss_pct = settings.risk.portfolio_emergency_stop_pct
         self._error_count = 0
         self._max_errors = 10
         self._emergency_stop = False
+        # RiskManager owns the API kill-switch counter. ``ExchangeApiGuard``
+        # below records every exchange call's success/failure against it,
+        # and on threshold-trip flips ``_emergency_stop`` via the callback
+        # below. Independent of the per-symbol ``_error_count`` (which
+        # tracks higher-level processing errors and triggers reconnect).
+        self._risk_manager = RiskManager()
         self._buy_positions: Dict[str, List[Dict]] = {s: [] for s in symbols}
         self._ml_advisor = MLGridAdvisor()
         self._grid_init_times: Dict[str, datetime] = {}
@@ -66,6 +86,35 @@ class GridLiveTrader:
         self._grid_init_prices: Dict[str, float] = {}
         self._fee_ticker_cache: Dict[str, tuple] = {}
         self._fee_ticker_ttl_seconds: int = 60
+        # Snapshot of the per-symbol investment budget (USDT). Computed on
+        # the first ``_initialize_grid`` call from the *starting* free
+        # balance and reused on every subsequent reinit so rebalances
+        # don't progressively shrink the grid as USDT gets locked into
+        # BUY orders elsewhere in the portfolio.
+        self._investment_budget = InvestmentBudget()
+        # Cache of the most recent ``GridAdvice`` per symbol, populated by
+        # ``_get_ml_advice``. Used by ``_should_rebalance_grid`` to scale
+        # the rebalance cooldown by the current volatility regime without
+        # paying for an extra OHLCV fetch on every tick.
+        self._latest_advice: Dict[str, GridAdvice] = {}
+        # Peak portfolio value (since startup) used by the trailing
+        # portfolio take-profit. Stored separately from ``initial_balance``
+        # so the trail follows the high-water mark, not just the starting
+        # capital.
+        self._peak_portfolio_value: float = 0.0
+        self._trailing_tp_state = TrailingTPState()
+        # Map order_id → (expected_price, side) recorded at order placement
+        # time so we can compute realized slippage when the fill is logged
+        # back to ``data/grid_live_trades.csv``. Bounded loosely by the
+        # number of in-flight grid orders; pruned when orders complete.
+        self._expected_prices: Dict[str, float] = {}
+        # Map order_id → cause tag (e.g. ``"stop_loss"``,
+        # ``"rebalance"``, ``"inventory_hedge"``) so the live trades CSV
+        # can record *why* an order was placed. Vanilla grid fills are
+        # left unannotated — ``analytics.attribute_pnl`` defaults blank
+        # rows to ``CAUSE_TRADE``. Same lifecycle as ``_expected_prices``:
+        # populated at order placement, popped on fill log.
+        self._order_causes: Dict[str, str] = {}
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -79,8 +128,33 @@ class GridLiveTrader:
                 writer.writerow([
                     'timestamp', 'symbol', 'side', 'price', 'amount', 'value',
                     'order_id', 'status', 'fee', 'trading_pnl', 'holding_pnl', 
-                    'realized_pnl', 'balance', 'total_value', 'base_held'
+                    'realized_pnl', 'balance', 'total_value', 'base_held',
+                    'expected_price', 'cause'
                 ])
+        else:
+            # Migrate legacy CSVs by appending any missing trailing
+            # columns (``expected_price``, ``cause``) to the header.
+            # Existing rows keep working — positional readers ignore
+            # missing trailing fields, and downstream helpers
+            # (slippage / attribution) treat blanks as "unknown".
+            try:
+                with open(self._trades_file, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    rest = list(reader)
+                if header is not None:
+                    changed = False
+                    for col in ('expected_price', 'cause'):
+                        if col not in header:
+                            header.append(col)
+                            changed = True
+                    if changed:
+                        with open(self._trades_file, 'w', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(header)
+                            writer.writerows(rest)
+            except Exception as e:
+                logger.warning(f"Could not migrate trades CSV header: {e}")
         
         self._load_processed_trade_ids()
     
@@ -327,6 +401,16 @@ class GridLiveTrader:
         try:
             self.exchange = create_exchange(testnet=self.testnet)
             await self.exchange.connect()
+            # Funnel every subsequent ``self.exchange.<method>(...)`` call
+            # through the RiskManager kill-switch path. Done after
+            # ``connect()`` so a failed initial handshake (which we
+            # already report and abort on) does not pre-emptively trip
+            # the kill switch.
+            self.exchange = ExchangeApiGuard(
+                self.exchange,
+                risk_manager=self._risk_manager,
+                on_kill_switch=self._on_api_kill_switch,
+            )
         except Exception as e:
             logger.error(f"Failed to create exchange: {e}")
             await telegram.send_message(f"❌ Exchange connection failed: {e}")
@@ -633,13 +717,23 @@ class GridLiveTrader:
     def _log_trade_from_exchange(self, symbol: str, side: str, price: float, amount: float, 
                                   value: float, order_id: str, fee: float, trading_pnl: float,
                                   holding_pnl: float, balance: float, total_value: float, base_held: float):
+        # Pop (don't peek) so the cache stays bounded — once a fill is
+        # logged we no longer need the expected price / cause. Empty
+        # string when unknown (e.g. partial-startup state, manual
+        # orders, restarts before the order placement was tracked).
+        # ``analytics.pnl_attribution`` treats blank ``cause`` as
+        # ``CAUSE_TRADE`` (vanilla grid fill).
+        expected_price = self._expected_prices.pop(str(order_id), None)
+        expected_str = f"{expected_price:.8f}" if expected_price is not None else ""
+        cause = self._order_causes.pop(str(order_id), "")
         with open(self._trades_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 datetime.utcnow().isoformat(),
                 symbol, side, price, amount, value,
                 order_id, 'filled', fee, trading_pnl, holding_pnl,
-                self.realized_pnl, balance, total_value, base_held
+                self.realized_pnl, balance, total_value, base_held,
+                expected_str, cause
             ])
     
     async def _update_balance_state(self):
@@ -734,9 +828,70 @@ class GridLiveTrader:
                     await telegram.send_message(emergency_msg)
                     self._emergency_stop = True
                     self._running = False
-                    
+
+            # Trailing portfolio take-profit. When enabled, locks in gains
+            # by stopping trading after a configurable drawdown from the
+            # high-water mark. Independent of the stop-loss path above.
+            if getattr(settings.grid, 'trailing_portfolio_tp_enabled', False):
+                # Resolve per-symbol override using the trader's primary
+                # symbol (first in self.symbols). Multi-symbol traders
+                # share a single portfolio, so only one (arm, drawdown)
+                # pair can be in effect; the convention is "primary
+                # symbol picks the trail".
+                primary_symbol = self.symbols[0] if self.symbols else None
+                arm_pct, drawdown_pct = settings.grid.get_trailing_tp_params(
+                    primary_symbol
+                )
+                triggered = check_trailing_take_profit(
+                    state=self._trailing_tp_state,
+                    current_value=current_value,
+                    initial_balance=self.initial_balance,
+                    arm_percent=arm_pct,
+                    drawdown_percent=drawdown_pct,
+                )
+                # Mirror peak into the public attribute for state files /
+                # observability.
+                self._peak_portfolio_value = self._trailing_tp_state.peak_value
+                if triggered:
+                    peak = self._trailing_tp_state.peak_value
+                    drop = peak - current_value
+                    drop_pct = (drop / peak * 100.0) if peak > 0 else 0.0
+                    tp_msg = (
+                        f"🟢 TRAILING TAKE-PROFIT\n"
+                        f"Peak: ${peak:.2f}\n"
+                        f"Current: ${current_value:.2f} (-{drop_pct:.2f}%)\n"
+                        f"Locked-in gain vs initial "
+                        f"${self.initial_balance:.2f}: "
+                        f"${current_value - self.initial_balance:+.2f}"
+                    )
+                    logger.warning(tp_msg)
+                    await telegram.send_message(tp_msg)
+                    self._running = False
+
         except Exception as e:
             logger.error(f"Error checking portfolio protection: {e}")
+    
+    def _on_api_kill_switch(self) -> None:
+        """Callback invoked when ``ExchangeApiGuard`` activates the
+        RiskManager kill switch after consecutive API failures. We flip
+        the trader's emergency-stop flag so the trading loop exits on
+        the next iteration instead of continuing to retry into an
+        already-broken exchange. A best-effort Telegram notice is
+        scheduled if the event loop is still running."""
+        threshold = getattr(self._risk_manager.config, "max_consecutive_api_errors", 0)
+        msg = (
+            f"🚨 API KILL-SWITCH\n"
+            f"{self._risk_manager.state.consecutive_api_errors} consecutive "
+            f"exchange errors (threshold {threshold}). Halting trading loop."
+        )
+        logger.critical(msg)
+        self._emergency_stop = True
+        self._running = False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(telegram.send_message(msg))
     
     async def _trading_loop(self):
         try:
@@ -790,18 +945,29 @@ class GridLiveTrader:
     
     async def _get_ml_advice(self, symbol: str):
         if not settings.grid.ml_advisor_enabled:
-            return self._ml_advisor._default_advice("ML advisor disabled in config")
+            advice = self._ml_advisor._default_advice("ML advisor disabled in config")
+            self._latest_advice[symbol] = advice
+            return advice
         try:
             ohlcv_raw = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
             if not ohlcv_raw or len(ohlcv_raw) < 50:
-                return self._ml_advisor._default_advice("not enough OHLCV data")
+                advice = self._ml_advisor._default_advice("not enough OHLCV data")
+                self._latest_advice[symbol] = advice
+                return advice
             df = pd.DataFrame(ohlcv_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            return self._ml_advisor.get_advice(symbol, df)
+            advice = self._ml_advisor.get_advice(symbol, df)
+            # Cache the latest advice so cooldown decisions in
+            # ``_should_rebalance_grid`` can read the regime without
+            # paying for another OHLCV fetch.
+            self._latest_advice[symbol] = advice
+            return advice
         except Exception as e:
             logger.warning(f"ML advice fetch failed for {symbol}: {e}")
-            return self._ml_advisor._default_advice(f"fetch error: {e}")
+            advice = self._ml_advisor._default_advice(f"fetch error: {e}")
+            self._latest_advice[symbol] = advice
+            return advice
 
     async def _initialize_grid(self, symbol: str):
         try:
@@ -836,8 +1002,17 @@ class GridLiveTrader:
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        num_symbols = max(1, len(self.symbols))
-        investment_per_symbol = (usdt_free * settings.grid.investment_ratio) / num_symbols
+        # Snapshot the per-symbol budget on first init; all later reinits
+        # reuse the same value so we don't progressively shrink the grid as
+        # USDT gets locked in other symbols' BUY orders. See
+        # ``compute_target_investment`` for the rationale.
+        investment_per_symbol = compute_target_investment(
+            budget=self._investment_budget,
+            symbol=symbol,
+            usdt_free=usdt_free,
+            investment_ratio=settings.grid.investment_ratio,
+            num_symbols=max(1, len(self.symbols)),
+        )
 
         num_grids = advice.recommended_grids
         if investment_per_symbol / max(num_grids, 1) < settings.grid.min_order_value:
@@ -874,8 +1049,113 @@ class GridLiveTrader:
             f"Spacing: ${config.grid_spacing:.2f}\n"
             f"Order size: ${config.amount_per_grid:.2f}"
         )
-        
+
+        # Honour the C6 ``pause_trading`` flag emitted by ``MLGridAdvisor``
+        # for extreme-volatility regimes: keep the freshly-built grid
+        # levels in memory but skip placing orders. The next ``_process_symbol``
+        # tick will re-evaluate (the advisor caches advice for ``ml_update_interval_minutes``,
+        # so we'll naturally retry once the regime calms down).
+        if advice.pause_trading:
+            warning = (
+                f"⏸️ {symbol}: pause_trading=True (regime={advice.volatility_regime}); "
+                f"grid built but order placement skipped."
+            )
+            logger.warning(warning)
+            await telegram.send_message(warning)
+            return
+
+        # Optional one-time inventory hedge: market BUY enough base so the
+        # SELL legs of the freshly-built grid can fill without waiting for
+        # BUYs to round-trip first. Off by default; capped so the BUY legs
+        # still have USDT to deploy.
+        if settings.grid.inventory_hedge_enabled:
+            try:
+                await self._seed_inventory_hedge(
+                    symbol=symbol,
+                    investment_per_symbol=investment_per_symbol,
+                    current_price=current_price,
+                    base=base,
+                )
+            except Exception as e:
+                # A failed hedge must not block the BUY-side grid from going up.
+                logger.error(f"{symbol}: inventory hedge failed: {e}")
+
         await self._place_grid_orders(symbol)
+
+    async def _seed_inventory_hedge(
+        self,
+        *,
+        symbol: str,
+        investment_per_symbol: float,
+        current_price: float,
+        base: str,
+    ) -> None:
+        """One-time market BUY to seed base inventory for SELL legs.
+
+        Reads how many BUY/SELL legs the freshly-built grid has, asks
+        ``compute_inventory_hedge`` for the USDT amount to spend, and
+        submits a single market BUY for the equivalent base quantity.
+        Skips silently when the helper returns 0 (already stocked, no
+        SELL legs, or budget empty) or when the resulting order would
+        be below the exchange's minimum notional.
+        """
+        levels = self.strategies[symbol].grid_levels
+        num_buys = sum(1 for lvl in levels if lvl.side == 'buy')
+        num_sells = sum(1 for lvl in levels if lvl.side == 'sell')
+
+        balance_info = await self.exchange.fetch_balance()
+        base_free = balance_info.get(base, {}).get('free', 0) or 0.0
+        current_base_value_usdt = base_free * current_price
+
+        hedge_usdt = compute_inventory_hedge(
+            investment_per_symbol=investment_per_symbol,
+            num_buy_levels=num_buys,
+            num_sell_levels=num_sells,
+            current_base_value_usdt=current_base_value_usdt,
+            max_hedge_fraction=settings.grid.inventory_hedge_max_fraction,
+        )
+        if hedge_usdt <= 0:
+            logger.info(
+                f"{symbol}: inventory hedge skipped — already stocked "
+                f"(have ≈${current_base_value_usdt:.2f} {base}, "
+                f"need ≈${num_sells * (investment_per_symbol / max(num_buys, 1)):.2f})"
+            )
+            return
+
+        market = await self._get_market_info(symbol)
+        if hedge_usdt < market['min_notional']:
+            logger.info(
+                f"{symbol}: inventory hedge ${hedge_usdt:.2f} below min notional "
+                f"${market['min_notional']:.2f}; skipping seed BUY."
+            )
+            return
+
+        amount = hedge_usdt / current_price
+        amount = self._round_amount(amount, market['amount_precision'])
+        if amount <= 0:
+            logger.info(f"{symbol}: inventory hedge amount rounds to 0; skipping.")
+            return
+
+        logger.info(
+            f"🌱 {symbol}: seeding inventory — market BUY {amount:.6f} {base} "
+            f"(≈${hedge_usdt:.2f}) for SELL legs"
+        )
+        order = await self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='buy',
+            amount=amount,
+            price=None,
+        )
+        # Tag this fill so post-trade attribution can separate the
+        # one-time inventory seed from real grid fills.
+        if order and order.get('id'):
+            self._order_causes[str(order['id'])] = "inventory_hedge"
+        await telegram.send_message(
+            f"🌱 Inventory seed: {symbol}\n"
+            f"Bought {amount:.6f} {base} (≈${hedge_usdt:.2f})\n"
+            f"Order id: {order.get('id', 'n/a')}"
+        )
 
     def _get_avg_entry_price(self, symbol: str) -> Optional[float]:
         positions = self.positions.get(symbol, [])
@@ -952,6 +1232,11 @@ class GridLiveTrader:
                     params={'postOnly': True}
                 )
                 level.order_id = order['id']
+                # Stash the originally-requested limit price so we can
+                # compute slippage when the fill comes back through
+                # ``_log_trade_from_exchange``. Bounded by the number of
+                # active grid orders; entries are popped on fill.
+                self._expected_prices[str(order['id'])] = float(level.price)
                 logger.info(f"Placed {side.upper()} order at ${level.price:.4f}, amount={level.amount:.2f} {base}, value=${level.amount * level.price:.2f}, id={order['id']}")
 
                 if side == 'sell':
@@ -1037,7 +1322,21 @@ class GridLiveTrader:
         if not init_time:
             return False
 
-        cooldown = timedelta(minutes=settings.grid.rebalance_cooldown_minutes)
+        cooldown_minutes = settings.grid.rebalance_cooldown_minutes
+        if settings.grid.adaptive_cooldown_enabled:
+            advice = self._latest_advice.get(symbol)
+            regime = advice.volatility_regime if advice else None
+            cooldown_minutes = compute_adaptive_cooldown(
+                base_minutes=settings.grid.rebalance_cooldown_minutes,
+                volatility_regime=regime,
+                factors={
+                    "extreme": settings.grid.cooldown_factor_extreme,
+                    "high": settings.grid.cooldown_factor_high,
+                    "low": settings.grid.cooldown_factor_low,
+                },
+                min_minutes=settings.grid.cooldown_min_minutes,
+            )
+        cooldown = timedelta(minutes=cooldown_minutes)
         if datetime.utcnow() - init_time < cooldown:
             return False
 
@@ -1132,6 +1431,8 @@ class GridLiveTrader:
                     side='sell',
                     amount=amount
                 )
+                if order and order.get('id'):
+                    self._order_causes[str(order['id'])] = "stop_loss"
                 logger.info(f"✅ Emergency sell executed: {amount} {base}")
                 
                 await telegram.send_message(
@@ -1175,8 +1476,16 @@ class GridLiveTrader:
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        num_symbols = max(1, len(self.symbols))
-        investment = (usdt_free * settings.grid.investment_ratio) / num_symbols
+        # Reuse the snapshot established at first init so the grid budget
+        # stays stable across reinits even when other symbols are holding
+        # USDT in open BUYs.
+        investment = compute_target_investment(
+            budget=self._investment_budget,
+            symbol=symbol,
+            usdt_free=usdt_free,
+            investment_ratio=settings.grid.investment_ratio,
+            num_symbols=max(1, len(self.symbols)),
+        )
         num_grids = advice.recommended_grids
         if investment / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment / settings.grid.min_order_value))
@@ -1211,6 +1520,17 @@ class GridLiveTrader:
             f"Positions kept: {open_positions_count}"
             + (f"\n{ml_tag}" if ml_tag else "")
         )
+
+        # Same pause guard as ``_initialize_grid``: extreme regime →
+        # keep the rebuilt grid but don't lay new orders.
+        if advice.pause_trading:
+            warning = (
+                f"⏸️ {symbol}: pause_trading=True after reinit "
+                f"(regime={advice.volatility_regime}); orders not placed."
+            )
+            logger.warning(warning)
+            await telegram.send_message(warning)
+            return
 
         await self._place_grid_orders(symbol)
     
@@ -1252,6 +1572,8 @@ class GridLiveTrader:
                         symbol=symbol, type='market', side='sell',
                         amount=amount
                     )
+                    if order and order.get('id'):
+                        self._order_causes[str(order['id'])] = "rebalance"
                     avg_e = sum(p.entry_price for _, p in to_sell) / len(to_sell)
                     logger.info(f"📉 Selling {len(to_sell)} profitable positions: {amount} {base} @ ~${current_price:.2f} (avg entry ${avg_e:.2f})")
                     self._last_rebalance_times[symbol] = datetime.utcnow()
@@ -1306,6 +1628,8 @@ class GridLiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, type='market', side='sell', amount=amount
             )
+            if order and order.get('id'):
+                self._order_causes[str(order['id'])] = "stop_loss"
             logger.info(f"🔻 Market SELL executed: {amount} {base} (cut-loss)")
             self._last_rebalance_times[symbol] = datetime.utcnow()
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Перерахунок останнього запису в CSV з реальними поточними цінами
+Перерахунок останнього запису в CSV з реальними поточними цінами.
+
+Math (FIFO replay + unrealized-from-positions) lives in
+:mod:`analytics.pnl_recompute`; this script only handles the live-price
+fetch and the CSV write-back.
 """
 import csv
 import yfinance as yf
-from datetime import datetime
+
+from analytics.pnl_recompute import recompute_trades, unrealized_from_positions
 
 trades_file = "data/grid_trades.csv"
 
@@ -13,21 +18,9 @@ with open(trades_file, 'r') as f:
     reader = csv.DictReader(f)
     trades = list(reader)
 
-# Знаходимо відкриті позиції
-open_positions = {}
-for trade in trades:
-    symbol = trade['symbol']
-    if symbol not in open_positions:
-        open_positions[symbol] = []
-    
-    if trade['side'] == 'BUY':
-        open_positions[symbol].append({
-            'price': float(trade['price']),
-            'amount': float(trade['amount']),
-            'value': float(trade['value'])
-        })
-    elif trade['side'] == 'SELL' and open_positions[symbol]:
-        open_positions[symbol].pop(0)
+# Replay FIFO to get the residual position book.
+result = recompute_trades(trades, initial_balance=1000.0)
+open_positions = result.positions
 
 # Отримуємо поточні ціни
 symbols_map = {
@@ -49,29 +42,26 @@ for symbol, yf_symbol in symbols_map.items():
     except Exception as e:
         print(f"  ❌ {symbol}: {e}")
 
-# Рахуємо unrealized PnL з поточними цінами
-total_unrealized = 0.0
-total_cost_basis = 0.0
+# Mark the residual positions to live quotes via the shared helper.
+total_unrealized, total_cost_basis = unrealized_from_positions(
+    open_positions, current_prices
+)
 
 print("\n💼 Open positions:")
-for symbol, positions in open_positions.items():
-    if not positions:
+for symbol, lots in open_positions.items():
+    if not lots:
         continue
-    
-    current_price = current_prices.get(symbol, 0)
-    symbol_unrealized = 0.0
-    symbol_cost = 0.0
-    
-    for pos in positions:
-        symbol_cost += pos['value']
-        if current_price > 0:
-            pnl = (current_price - pos['price']) * pos['amount']
-            symbol_unrealized += pnl
-    
-    total_cost_basis += symbol_cost
-    total_unrealized += symbol_unrealized
-    
-    print(f"  {symbol}: {len(positions)} positions, Cost: ${symbol_cost:.2f}, PnL: ${symbol_unrealized:+.2f}")
+    current_price = current_prices.get(symbol, 0) or 0
+    symbol_cost = sum(lot.price * lot.amount for lot in lots)
+    symbol_unrealized = (
+        sum((current_price - lot.price) * lot.amount for lot in lots)
+        if current_price > 0
+        else 0.0
+    )
+    print(
+        f"  {symbol}: {len(lots)} positions, Cost: ${symbol_cost:.2f}, "
+        f"PnL: ${symbol_unrealized:+.2f}"
+    )
 
 # Оновлюємо останній запис
 last_trade = trades[-1]

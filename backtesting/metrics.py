@@ -26,7 +26,8 @@ class PerformanceMetrics:
         self,
         trades: List,
         equity_curve: pd.Series,
-        initial_balance: float
+        initial_balance: float,
+        bars_per_year: int = 365,
     ):
         """
         Initialize metrics calculator.
@@ -35,10 +36,16 @@ class PerformanceMetrics:
             trades: List of BacktestTrade objects
             equity_curve: Equity curve series
             initial_balance: Starting balance
+            bars_per_year: Number of bars per year used to annualize Sharpe
+                and Sortino ratios. Must match the equity curve's timeframe
+                (e.g. 365 for daily, 365*24=8760 for hourly, 365*24*4=35040
+                for 15-minute bars). Using a wrong value silently mis-scales
+                the ratios by sqrt(true_freq / configured_freq).
         """
         self.trades = trades
         self.equity_curve = equity_curve
         self.initial_balance = initial_balance
+        self.bars_per_year = bars_per_year
     
     def calculate_all(self) -> Dict[str, Any]:
         """Calculate all performance metrics."""
@@ -202,32 +209,36 @@ class PerformanceMetrics:
     def _sharpe_ratio(self, returns: pd.Series, risk_free_rate: float = 0.0) -> float:
         """
         Calculate Sharpe ratio.
-        
-        Assumes daily returns, annualizes to 365 days (crypto markets).
+
+        Annualized using ``self.bars_per_year`` so the calculation is correct
+        for any equity-curve timeframe (daily, hourly, intraday).
         """
         if len(returns) == 0 or returns.std() == 0:
             return 0.0
-        
-        excess_returns = returns - (risk_free_rate / 365)
-        return (excess_returns.mean() / returns.std()) * np.sqrt(365)
-    
+
+        bpy = self.bars_per_year
+        excess_returns = returns - (risk_free_rate / bpy)
+        return (excess_returns.mean() / returns.std()) * np.sqrt(bpy)
+
     def _sortino_ratio(self, returns: pd.Series, risk_free_rate: float = 0.0) -> float:
         """
         Calculate Sortino ratio.
-        
-        Uses downside deviation instead of standard deviation.
+
+        Uses downside deviation instead of standard deviation. Annualized
+        using ``self.bars_per_year``.
         """
         if len(returns) == 0:
             return 0.0
-        
-        excess_returns = returns - (risk_free_rate / 365)
+
+        bpy = self.bars_per_year
+        excess_returns = returns - (risk_free_rate / bpy)
         downside_returns = returns[returns < 0]
-        
+
         if len(downside_returns) == 0 or downside_returns.std() == 0:
             return float('inf') if excess_returns.mean() > 0 else 0.0
-        
+
         downside_std = downside_returns.std()
-        return (excess_returns.mean() / downside_std) * np.sqrt(365)
+        return (excess_returns.mean() / downside_std) * np.sqrt(bpy)
     
     def _calmar_ratio(self) -> float:
         """Calculate Calmar ratio (annual return / max drawdown)."""
