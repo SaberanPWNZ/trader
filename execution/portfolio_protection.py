@@ -254,3 +254,68 @@ def compute_inventory_hedge(
 
     cap = max(0.0, max_hedge_fraction) * investment_per_symbol
     return min(deficit, cap)
+
+
+# Mapping from MLGridAdvisor's ``volatility_regime`` strings to default
+# multipliers for the *number of grid lines*. Rationale (mirror image of
+# the cooldown table — the cooldown shortens in fast markets, but the
+# grid density also has to fall there):
+#   - "extreme" / "high" volatility: a wider band is already drawn by
+#     ``_calculate_dynamic_multiplier``; packing more lines in means
+#     each leg is tiny and the round-trip is eaten by fees. Shrink the
+#     line count toward ``min_grids`` so each leg captures real movement.
+#   - "normal": no change.
+#   - "low": a calm market generates many tiny wiggles. A *denser* grid
+#     captures more of them as fills, increasing per-day turnover.
+# Multipliers can be overridden per-deployment via the ``factors`` arg.
+_DEFAULT_NUM_GRIDS_FACTORS: Dict[str, float] = {
+    "extreme": 0.6,
+    "high": 0.8,
+    "normal": 1.0,
+    "low": 1.25,
+}
+
+
+def compute_adaptive_num_grids(
+    *,
+    min_grids: int,
+    max_grids: int,
+    volatility_regime: Optional[str],
+    factors: Optional[Dict[str, float]] = None,
+) -> int:
+    """Pick a grid-line count for the current volatility regime.
+
+    Starts from the midpoint of ``[min_grids, max_grids]`` and scales it
+    by the regime multiplier, then clamps back into the configured
+    bounds. Returns an integer (rounded to nearest).
+
+    Args:
+        min_grids: Lower bound on the number of interior grid lines
+            (``settings.grid.min_grids``).
+        max_grids: Upper bound on the number of interior grid lines
+            (``settings.grid.max_grids``).
+        volatility_regime: One of ``"extreme"``, ``"high"``, ``"normal"``,
+            ``"low"`` (or ``None``/unknown — falls back to multiplier 1.0).
+        factors: Optional override for the regime → multiplier mapping.
+            Missing regimes fall through to the default table.
+
+    Returns:
+        Integer grid-line count, clamped to ``[min_grids, max_grids]``.
+        Always at least 1 even if both bounds are degenerate.
+
+    Notes:
+        ``min_grids > max_grids`` is silently swapped — caller config
+        bugs shouldn't blow up the live trader.
+    """
+    lo = max(1, int(min(min_grids, max_grids)))
+    hi = max(lo, int(max(min_grids, max_grids)))
+    table = dict(_DEFAULT_NUM_GRIDS_FACTORS)
+    if factors:
+        table.update(factors)
+    multiplier = table.get(volatility_regime or "", 1.0)
+    if multiplier <= 0:
+        multiplier = 1.0
+
+    midpoint = (lo + hi) / 2.0
+    scaled = int(round(midpoint * multiplier))
+    return max(lo, min(hi, scaled))

@@ -23,6 +23,12 @@ class RiskState:
     # used instead).
     day_start_balance: float = 0.0
     consecutive_losses: int = 0
+    # Counts consecutive failed exchange API calls (5xx, rate-limit,
+    # network timeouts). Reset by ``record_api_success``. When the
+    # counter hits ``RiskConfig.max_consecutive_api_errors`` the kill
+    # switch is activated to prevent retry-storm losses during exchange
+    # outages.
+    consecutive_api_errors: int = 0
     last_trade_time: Optional[datetime] = None
     cooldown_until: Optional[datetime] = None
     kill_switch_active: bool = False
@@ -270,6 +276,43 @@ class RiskManager:
         self._risk_events.append(event)
         logger.warning(f"Risk event: {event_type.value} - {data}")
     
+    def record_api_error(self, reason: str = "") -> bool:
+        """Register a failed exchange API call.
+
+        Increments ``consecutive_api_errors`` and activates the kill
+        switch when the configured threshold is reached. Threshold
+        ``0`` (or any non-positive value) disables this path entirely
+        — callers can still bookkeep the counter via this method, but
+        the kill switch will not fire from API errors alone.
+
+        Args:
+            reason: Short description (e.g. ``"HTTP 503"``,
+                ``"binance rate-limit"``) recorded on the risk-event
+                log when the threshold trips.
+
+        Returns:
+            ``True`` if this call activated the kill switch, ``False``
+            otherwise.
+        """
+        self.state.consecutive_api_errors += 1
+        threshold = getattr(self.config, "max_consecutive_api_errors", 0)
+        if (
+            threshold
+            and threshold > 0
+            and self.state.consecutive_api_errors >= threshold
+            and not self.state.kill_switch_active
+        ):
+            self.activate_kill_switch(
+                f"API error threshold reached "
+                f"({self.state.consecutive_api_errors}/{threshold}): {reason}"
+            )
+            return True
+        return False
+
+    def record_api_success(self) -> None:
+        """Reset the consecutive API-error counter after a successful call."""
+        self.state.consecutive_api_errors = 0
+
     def reset_daily_stats(self) -> None:
         """Reset daily statistics (call at start of new trading day)."""
         self.state.daily_pnl = 0.0

@@ -42,6 +42,12 @@ class RiskConfig:
     stop_loss_atr_multiplier: float = 1.5
     take_profit_atr_multiplier: float = 3.0
     max_consecutive_losses: int = 5
+    # Activate the kill switch after this many consecutive failed exchange
+    # API calls (HTTP 5xx, rate-limit, network timeouts). Without this,
+    # an upstream Binance outage can let the strategy burn balance on a
+    # retry storm. Set to 0 to disable the API-error kill-switch path
+    # entirely (per-trade kill-switch on consecutive losses still works).
+    max_consecutive_api_errors: int = 10
     cooldown_minutes: int = 30
     kill_switch_enabled: bool = True
     # Minimum signal confidence required to allow a trade.
