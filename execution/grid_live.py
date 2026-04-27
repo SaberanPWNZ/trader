@@ -833,12 +833,21 @@ class GridLiveTrader:
             # by stopping trading after a configurable drawdown from the
             # high-water mark. Independent of the stop-loss path above.
             if getattr(settings.grid, 'trailing_portfolio_tp_enabled', False):
+                # Resolve per-symbol override using the trader's primary
+                # symbol (first in self.symbols). Multi-symbol traders
+                # share a single portfolio, so only one (arm, drawdown)
+                # pair can be in effect; the convention is "primary
+                # symbol picks the trail".
+                primary_symbol = self.symbols[0] if self.symbols else None
+                arm_pct, drawdown_pct = settings.grid.get_trailing_tp_params(
+                    primary_symbol
+                )
                 triggered = check_trailing_take_profit(
                     state=self._trailing_tp_state,
                     current_value=current_value,
                     initial_balance=self.initial_balance,
-                    arm_percent=settings.grid.trailing_portfolio_tp_arm_percent,
-                    drawdown_percent=settings.grid.trailing_portfolio_tp_drawdown_percent,
+                    arm_percent=arm_pct,
+                    drawdown_percent=drawdown_pct,
                 )
                 # Mirror peak into the public attribute for state files /
                 # observability.

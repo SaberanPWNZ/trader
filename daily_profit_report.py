@@ -5,6 +5,48 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
+from analytics.pnl_attribution import attribute_pnl
+
+
+LIVE_TRADES_FILE = Path('data/grid_live_trades.csv')
+
+
+def printCauseAttributionSection():
+    """Print a per-cause breakdown of realized PnL from live trades.
+
+    Reads ``data/grid_live_trades.csv`` (the live grid trader's log,
+    which carries the ``cause`` column populated by ``GridLiveTrader``)
+    and pipes it through :func:`analytics.pnl_attribution.attribute_pnl`.
+    Silently skipped when the file is missing — paper-trading-only
+    deployments shouldn't see a stale section.
+    """
+    if not LIVE_TRADES_FILE.exists():
+        return
+    with open(LIVE_TRADES_FILE, 'r', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+
+    result = attribute_pnl(rows)
+    by_cause = result.by_cause()
+    if not by_cause:
+        return
+
+    print("\n" + "=" * 80)
+    print("📌 РЕАЛІЗОВАНИЙ PnL ЗА ПРИЧИНОЮ (live trades)")
+    print("=" * 80)
+    total = sum(by_cause.values())
+    # Stable ordering: largest absolute contribution first so the
+    # operator sees the dominant driver immediately.
+    for cause, pnl in sorted(by_cause.items(), key=lambda kv: -abs(kv[1])):
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        share = (pnl / total * 100.0) if total else 0.0
+        print(f"   {emoji} {cause:<14s} ${pnl:>+10.2f}  ({share:+6.1f}%)")
+    print("-" * 80)
+    print(f"   Сума: ${total:+.2f} (за {len(rows)} live-фільтрами)")
+    print("=" * 80)
+
+
 def generateDailyProfitReport():
     tradesFile = Path('data/grid_trades.csv')
     
@@ -114,6 +156,8 @@ def generateDailyProfitReport():
     winRate = (profitableDays / len(dailyStats)) * 100
     print(f"   Прибуткових днів: {profitableDays}/{len(dailyStats)} ({winRate:.1f}%)")
     print()
+
+    printCauseAttributionSection()
 
 if __name__ == "__main__":
     generateDailyProfitReport()

@@ -23,6 +23,11 @@ class RiskState:
     # used instead).
     day_start_balance: float = 0.0
     consecutive_losses: int = 0
+    # Counts consecutive winning trades; reset to 0 on any loss. Used by
+    # ``RiskConfig.recovery_wins_to_lift_cooldown`` to lift a cooldown
+    # early after a recovery streak. Independent of consecutive_losses
+    # (which already resets to 0 on the first win).
+    consecutive_wins: int = 0
     # Counts consecutive failed exchange API calls (5xx, rate-limit,
     # network timeouts). Reset by ``record_api_success``. When the
     # counter hits ``RiskConfig.max_consecutive_api_errors`` the kill
@@ -211,15 +216,21 @@ class RiskManager:
         if self.state.current_balance > self.state.peak_balance:
             self.state.peak_balance = self.state.current_balance
         
-        # Track consecutive losses
+        # Track consecutive losses & wins. ``consecutive_wins`` enables
+        # the optional ``recovery_wins_to_lift_cooldown`` early-exit
+        # below — the trader can resume sooner if the recovery streak
+        # is long enough.
         if realized_pnl < 0:
             self.state.consecutive_losses += 1
-            
+            self.state.consecutive_wins = 0
+
             if self.state.consecutive_losses >= self.config.max_consecutive_losses:
                 self._activate_cooldown()
         else:
             self.state.consecutive_losses = 0
-        
+            self.state.consecutive_wins += 1
+            self._maybe_lift_cooldown_early()
+
         logger.info(f"Closed position for {symbol}: PnL={realized_pnl:.2f}")
     
     def check_stop_loss(self, position: Position, current_price: float) -> bool:
@@ -265,6 +276,45 @@ class RiskManager:
             'cooldown_until': self.state.cooldown_until.isoformat()
         })
         logger.warning(f"Cooldown activated until {self.state.cooldown_until}")
+
+    def _maybe_lift_cooldown_early(self) -> None:
+        """Lift an active cooldown after a long enough win streak.
+
+        The cooldown is set by ``_activate_cooldown`` after
+        ``max_consecutive_losses`` losses. Once the trader recovers
+        (``consecutive_wins`` reaches
+        ``RiskConfig.recovery_wins_to_lift_cooldown``), the cooldown
+        is cleared so trading resumes without waiting for the full
+        ``cooldown_minutes`` timer.
+
+        Disabled when the threshold is ``<= 0`` (default) so existing
+        deployments keep the historical fixed-duration behaviour.
+        """
+        threshold = getattr(
+            self.config, "recovery_wins_to_lift_cooldown", 0
+        )
+        if threshold <= 0:
+            return
+        if self.state.cooldown_until is None:
+            return
+        if self.state.consecutive_wins < threshold:
+            return
+        # Only lift if the cooldown is still in the future — expired
+        # cooldowns are already harmless and clearing them needlessly
+        # would lose the historical timestamp.
+        if self.state.cooldown_until <= datetime.utcnow():
+            return
+        prev_until = self.state.cooldown_until
+        self.state.cooldown_until = None
+        self._record_risk_event(RiskEventType.COOLDOWN_ACTIVE, {
+            'lifted_early': True,
+            'consecutive_wins': self.state.consecutive_wins,
+            'previous_cooldown_until': prev_until.isoformat(),
+        })
+        logger.info(
+            f"Cooldown lifted early after {self.state.consecutive_wins} "
+            f"consecutive wins (was {prev_until})"
+        )
     
     def _record_risk_event(self, event_type: RiskEventType, data: dict) -> None:
         """Record a risk event."""

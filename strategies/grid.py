@@ -386,7 +386,9 @@ class GridStrategy(BaseStrategy):
         
         min_profit = max(
             settings.grid.min_profit_threshold,
-            self.config.total_investment * (settings.grid.min_profit_threshold_percent / 100)
+            self.config.total_investment * (
+                settings.grid.get_min_profit_threshold_percent(self.symbol) / 100
+            )
         )
         
         if total_unrealized < min_profit:

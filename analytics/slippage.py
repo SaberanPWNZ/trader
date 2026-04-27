@@ -79,3 +79,38 @@ def summarize_slippage(values_bps: Iterable[float]) -> SlippageStats:
         max_adverse_bps=max(0.0, max(finite)),
         max_favourable_bps=max(0.0, -min(finite)),
     )
+
+
+def compute_slippage_size_factor(
+    slippage_ema_bps: Optional[float],
+    *,
+    max_bps: float = 30.0,
+    min_factor: float = 0.5,
+) -> float:
+    """Return a multiplicative position-size factor in ``[min_factor, 1.0]``.
+
+    When recent fills have shown adverse slippage, the trader is
+    paying more on each round-trip and should size down. The factor
+    decays linearly from ``1.0`` at zero adverse slippage to
+    ``min_factor`` at ``max_bps``. Favourable (negative) or unknown
+    slippage returns ``1.0``.
+
+    Args:
+        slippage_ema_bps: Recent adverse slippage exponential moving
+            average in bps (positive = adverse). ``None`` or negative
+            values return ``1.0``.
+        max_bps: Adverse-slippage level at which the factor saturates
+            to ``min_factor`` (e.g. ``30.0`` = 0.30%).
+        min_factor: Floor for the factor (e.g. ``0.5`` halves position
+            size in the worst case).
+
+    Returns:
+        A multiplier in ``[min_factor, 1.0]``.
+    """
+    if slippage_ema_bps is None or slippage_ema_bps <= 0:
+        return 1.0
+    if max_bps <= 0:
+        return 1.0
+    min_factor = max(0.0, min(min_factor, 1.0))
+    ratio = min(1.0, slippage_ema_bps / max_bps)
+    return 1.0 - ratio * (1.0 - min_factor)

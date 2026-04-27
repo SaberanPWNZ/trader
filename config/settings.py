@@ -42,6 +42,12 @@ class RiskConfig:
     stop_loss_atr_multiplier: float = 1.5
     take_profit_atr_multiplier: float = 3.0
     max_consecutive_losses: int = 5
+    # When > 0 and a trader is in cooldown after hitting
+    # ``max_consecutive_losses``, ``record_trade_result`` lifts the
+    # cooldown early after this many consecutive *winning* trades. 0
+    # disables the early-lift path — cooldown then runs to its full
+    # ``cooldown_minutes`` regardless of subsequent recovery wins.
+    recovery_wins_to_lift_cooldown: int = 0
     # Activate the kill switch after this many consecutive failed exchange
     # API calls (HTTP 5xx, rate-limit, network timeouts). Without this,
     # an upstream Binance outage can let the strategy burn balance on a
@@ -64,6 +70,15 @@ class RiskConfig:
     # (paper simulator, percent units).
     portfolio_stop_loss_pct: float = 0.10
     portfolio_emergency_stop_pct: float = 0.15
+
+    # Slippage-aware position sizing. When enabled, ``PositionSizer.
+    # slippage_adjusted`` scales the volatility-sized result down by a
+    # factor derived from the recent adverse-slippage EMA. The factor
+    # decays linearly from 1.0 at 0 bps to ``slippage_size_min_factor``
+    # at ``slippage_size_max_bps``.
+    slippage_size_adjust_enabled: bool = False
+    slippage_size_max_bps: float = 30.0
+    slippage_size_min_factor: float = 0.5
 
 
 @dataclass
@@ -237,6 +252,13 @@ class GridConfig:
     # gain. Tune higher per deployment if exchange fees are higher than
     # Binance spot.
     min_profit_threshold_percent: float = 0.3
+    # Per-symbol overrides for ``min_profit_threshold_percent``. Symbols
+    # absent from the dict fall back to the global default. Use this to
+    # demand a tighter or looser take-profit floor on specific markets
+    # (e.g. raise it on coins with higher trading fees, lower it on
+    # majors with tight spreads). Consumed by
+    # ``GridStrategy.can_rebalance_positions_profitable``.
+    min_profit_threshold_percent_overrides: dict = field(default_factory=dict)
     rebalance_cooldown_minutes: int = 30
     min_price_movement_percent: float = 1.0
     emergency_rebalance_on_breakout: bool = True
@@ -254,6 +276,13 @@ class GridConfig:
     trailing_portfolio_tp_enabled: bool = False
     trailing_portfolio_tp_arm_percent: float = 10.0
     trailing_portfolio_tp_drawdown_percent: float = 3.0
+    # Per-symbol overrides for the trailing portfolio take-profit. Schema:
+    # ``{"DOGE/USDT": {"arm_percent": 15.0, "drawdown_percent": 5.0}}``.
+    # Live trader runs multi-symbol but the trail is portfolio-wide, so
+    # the resolver picks the override matching the trader's primary
+    # symbol (first one with a registered override). Missing keys fall
+    # back to the global ``arm_percent``/``drawdown_percent``.
+    trailing_portfolio_tp_overrides: dict = field(default_factory=dict)
     max_unrealized_loss_percent: float = 3.0
     partial_close_profit_percent: float = 10.0
     
@@ -310,6 +339,38 @@ class GridConfig:
                 symbol, self.grid_range_pct
             ))
         return self.grid_range_pct
+
+    def get_min_profit_threshold_percent(self, symbol: str) -> float:
+        """Return the take-profit floor (% of total_investment) for ``symbol``.
+
+        Used by ``GridStrategy.can_rebalance_positions_profitable`` to
+        decide whether unrealized PnL is large enough to justify a
+        rebalance. Raise this for high-fee or thin-spread symbols and
+        lower it for majors with tight spreads.
+        """
+        if isinstance(self.min_profit_threshold_percent_overrides, dict):
+            return float(self.min_profit_threshold_percent_overrides.get(
+                symbol, self.min_profit_threshold_percent
+            ))
+        return self.min_profit_threshold_percent
+
+    def get_trailing_tp_params(self, symbol: Optional[str]) -> tuple:
+        """Return ``(arm_percent, drawdown_percent)`` for the trailing portfolio TP.
+
+        ``symbol`` is the trader's primary symbol (or ``None`` for the
+        global default). Per-symbol overrides may set either or both
+        knobs; missing keys fall back to the global values. The trail
+        itself is still portfolio-wide — this only controls *when* it
+        arms and *how much* drawdown it tolerates.
+        """
+        arm = float(self.trailing_portfolio_tp_arm_percent)
+        drawdown = float(self.trailing_portfolio_tp_drawdown_percent)
+        if symbol and isinstance(self.trailing_portfolio_tp_overrides, dict):
+            override = self.trailing_portfolio_tp_overrides.get(symbol)
+            if isinstance(override, dict):
+                arm = float(override.get("arm_percent", arm))
+                drawdown = float(override.get("drawdown_percent", drawdown))
+        return arm, drawdown
 
 
 @dataclass
