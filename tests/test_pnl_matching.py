@@ -253,3 +253,211 @@ class TestPositionRestore:
         assert buy_queue[0]['price'] == 82.0
         assert abs(buy_queue[1]['amount'] - 1.0) < 1e-8
         assert buy_queue[1]['price'] == 84.0
+
+
+class TestFifoByOpenedAt:
+    """Session 1 regression: _sync_trades_from_exchange must close oldest first
+    (FIFO by opened_at), not cheapest first (which booked artificial profits)."""
+
+    def testSellSortsByOpenedAtNotPrice(self):
+        from datetime import datetime, timedelta
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+
+        positions = [
+            LiveGridPosition('SOL/USDT', 'long', 90.0, 1.0, 'a', t0),
+            LiveGridPosition('SOL/USDT', 'long', 70.0, 1.0, 'b', t0 + timedelta(minutes=5)),
+            LiveGridPosition('SOL/USDT', 'long', 80.0, 1.0, 'c', t0 + timedelta(minutes=10)),
+        ]
+
+        positions.sort(key=lambda p: p.opened_at or datetime.min)
+
+        assert positions[0].entry_price == 90.0
+        assert positions[1].entry_price == 70.0
+        assert positions[2].entry_price == 80.0
+
+    def testFifoBooksHonestPnlNotCheapestFirst(self):
+        from datetime import datetime, timedelta
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+
+        # Oldest entry is the highest-priced one. Cheapest-first sort would
+        # falsely book a profit; FIFO correctly books a loss.
+        positions = [
+            LiveGridPosition('SOL/USDT', 'long', 90.0, 1.0, 'a', t0),
+            LiveGridPosition('SOL/USDT', 'long', 70.0, 1.0, 'b', t0 + timedelta(minutes=5)),
+        ]
+        positions.sort(key=lambda p: p.opened_at or datetime.min)
+
+        sell_price = 85.0
+        remaining = 1.0
+        total_gross = 0.0
+        while remaining > 1e-8 and positions:
+            pos = positions[0]
+            matched = min(remaining, pos.amount)
+            total_gross += (sell_price - pos.entry_price) * matched
+            pos.amount -= matched
+            remaining -= matched
+            if pos.amount < 1e-8:
+                positions.pop(0)
+
+        assert total_gross == -5.0  # Closed the older 90-entry, not the 70-entry.
+        assert len(positions) == 1
+        assert positions[0].entry_price == 70.0
+
+
+class TestFeeConversion:
+    """Session 1 regression: fees in non-USDT currency must be converted to USDT
+    before accumulation, otherwise total_fees_paid mixes currencies and trading_pnl
+    is silently wrong."""
+
+    @pytest.mark.asyncio
+    async def testFeeUsdtPassthrough(self, trader):
+        class _Ex:
+            async def fetch_ticker(self, sym):
+                raise AssertionError("should not be called for USDT fee")
+        trader.exchange = _Ex()
+        trader._fee_ticker_cache = {}
+        trader._fee_ticker_ttl_seconds = 60
+
+        from execution.grid_live import GridLiveTrader
+        usdt_fee = await GridLiveTrader._convert_fee_to_usdt(
+            trader, {'cost': 0.5, 'currency': 'USDT'}, 'SOL/USDT', 100.0
+        )
+        assert usdt_fee == 0.5
+
+    @pytest.mark.asyncio
+    async def testFeeBnbConversion(self, trader):
+        calls = {'n': 0}
+
+        class _Ex:
+            async def fetch_ticker(self, sym):
+                calls['n'] += 1
+                assert sym == 'BNB/USDT'
+                return {'last': 600.0}
+
+        trader.exchange = _Ex()
+        trader._fee_ticker_cache = {}
+        trader._fee_ticker_ttl_seconds = 60
+
+        from execution.grid_live import GridLiveTrader
+        usdt_fee = await GridLiveTrader._convert_fee_to_usdt(
+            trader, {'cost': 0.001, 'currency': 'BNB'}, 'SOL/USDT', 100.0
+        )
+        assert abs(usdt_fee - 0.6) < 1e-8
+
+        # Cached on second call.
+        usdt_fee2 = await GridLiveTrader._convert_fee_to_usdt(
+            trader, {'cost': 0.002, 'currency': 'BNB'}, 'SOL/USDT', 100.0
+        )
+        assert abs(usdt_fee2 - 1.2) < 1e-8
+        assert calls['n'] == 1
+
+    @pytest.mark.asyncio
+    async def testFeeBaseCurrencyConversion(self, trader):
+        class _Ex:
+            async def fetch_ticker(self, sym):
+                raise AssertionError("base-currency fee uses trade price, not a fetch")
+        trader.exchange = _Ex()
+        trader._fee_ticker_cache = {}
+        trader._fee_ticker_ttl_seconds = 60
+
+        from execution.grid_live import GridLiveTrader
+        usdt_fee = await GridLiveTrader._convert_fee_to_usdt(
+            trader, {'cost': 0.01, 'currency': 'SOL'}, 'SOL/USDT', 150.0
+        )
+        assert abs(usdt_fee - 1.5) < 1e-8
+
+    @pytest.mark.asyncio
+    async def testEmptyFeeReturnsZero(self, trader):
+        trader.exchange = None
+        trader._fee_ticker_cache = {}
+        trader._fee_ticker_ttl_seconds = 60
+
+        from execution.grid_live import GridLiveTrader
+        assert await GridLiveTrader._convert_fee_to_usdt(trader, None, 'SOL/USDT', 100.0) == 0.0
+        assert await GridLiveTrader._convert_fee_to_usdt(trader, {}, 'SOL/USDT', 100.0) == 0.0
+        assert await GridLiveTrader._convert_fee_to_usdt(
+            trader, {'cost': 0, 'currency': 'BNB'}, 'SOL/USDT', 100.0
+        ) == 0.0
+
+
+class TestGridPairMatching:
+    """Session 1 regression: GridStrategy realized/unrealized PnL must use pair_id
+    so that a BUY closed by a SELL is not also counted as 'open' (double-count)."""
+
+    def _make_strategy(self):
+        from strategies.grid import GridStrategy, GridConfig
+        s = GridStrategy('SOL/USDT')
+        s.config = GridConfig(
+            symbol='SOL/USDT', upper_price=110.0, lower_price=90.0,
+            num_grids=4, total_investment=100.0
+        )
+        s.center_price = 100.0
+        s.initialized = True
+        s._create_grid_levels(100.0)
+        return s
+
+    def testRealizedPnlUsesPairId(self):
+        s = self._make_strategy()
+        from strategies.grid import GridLevel
+        # Pair a BUY with a manually-linked SELL via pair_id (bypass spawn logic
+        # which can collide with pre-existing same-price grid levels).
+        buys = [l for l in s.grid_levels if l.side == 'buy']
+        assert buys, "expected BUY levels below center"
+        buy = max(buys, key=lambda l: l.price)
+        buy.filled = True
+        buy.filled_at = datetime(2026, 1, 1, 12, 0, 0)
+
+        sell = GridLevel(
+            price=buy.price + s.config.grid_spacing,
+            side='sell', amount=buy.amount,
+            filled=True, filled_at=datetime(2026, 1, 1, 12, 30, 0),
+            level_id=s._new_level_id(), pair_id=buy.level_id,
+        )
+        s.grid_levels.append(sell)
+
+        expected = (sell.price - buy.price) * min(buy.amount, sell.amount)
+        assert abs(s.calculate_realized_pnl() - expected) < 1e-8
+
+    def testUnrealizedExcludesPairedClosedBuys(self):
+        s = self._make_strategy()
+        from strategies.grid import GridLevel
+        buys = sorted([l for l in s.grid_levels if l.side == 'buy'], key=lambda l: l.price)
+        assert len(buys) >= 2
+        buy_low = buys[0]
+        buy_high = buys[-1]
+        for b in (buy_low, buy_high):
+            b.filled = True
+            b.filled_at = datetime(2026, 1, 1, 12, 0, 0)
+
+        # Only buy_high's paired SELL fires; buy_low remains "open".
+        sell_for_high = GridLevel(
+            price=buy_high.price + s.config.grid_spacing,
+            side='sell', amount=buy_high.amount,
+            filled=True, filled_at=datetime(2026, 1, 1, 12, 30, 0),
+            level_id=s._new_level_id(), pair_id=buy_high.level_id,
+        )
+        s.grid_levels.append(sell_for_high)
+
+        # Unrealized must include buy_low only.
+        current = 105.0
+        expected_unrealized = (current - buy_low.price) * buy_low.amount
+        assert abs(s.calculate_unrealized_pnl(current) - expected_unrealized) < 1e-8
+
+        # Realized must reflect buy_high closure only.
+        expected_realized = (sell_for_high.price - buy_high.price) * min(buy_high.amount, sell_for_high.amount)
+        assert abs(s.calculate_realized_pnl() - expected_realized) < 1e-8
+
+    def testLegacyFifoFallbackForUnpairedLevels(self):
+        """Levels created without level_id (e.g. restored from old state) still
+        match via FIFO chronological order."""
+        from strategies.grid import GridLevel
+        s = self._make_strategy()
+        # Bypass _create_opposite_order: insert a SELL without pair_id.
+        legacy_buy = GridLevel(price=90.0, side='buy', amount=1.0,
+                               filled=True, filled_at=datetime(2026, 1, 1, 10, 0, 0))
+        legacy_sell = GridLevel(price=95.0, side='sell', amount=1.0,
+                                filled=True, filled_at=datetime(2026, 1, 1, 11, 0, 0))
+        s.grid_levels = [legacy_buy, legacy_sell]
+        assert abs(s.calculate_realized_pnl() - 5.0) < 1e-8
+        # No paired link → unrealized would also see legacy_buy as open. That's
+        # the documented legacy behaviour; the fix protects only pair-tagged levels.

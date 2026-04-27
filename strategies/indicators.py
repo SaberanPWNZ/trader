@@ -43,28 +43,36 @@ class TechnicalIndicators:
         return series.rolling(window=period).mean()
     
     @staticmethod
-    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    def rsi(series: pd.Series, period: int = 14, smoothing: str = "wilder") -> pd.Series:
         """
         Calculate Relative Strength Index.
-        
+
         Args:
             series: Price series
             period: RSI period
-            
+            smoothing: "wilder" (alpha=1/period, classical Wilder's smoothing) or
+                "ema" (alpha=2/(period+1), legacy behaviour). Defaults to "wilder".
+
         Returns:
             RSI series (0-100)
         """
         delta = series.diff()
-        
+
         gain = delta.where(delta > 0, 0)
         loss = (-delta).where(delta < 0, 0)
-        
-        avg_gain = gain.ewm(span=period, adjust=False).mean()
-        avg_loss = loss.ewm(span=period, adjust=False).mean()
-        
+
+        if smoothing == "wilder":
+            avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+        elif smoothing == "ema":
+            avg_gain = gain.ewm(span=period, adjust=False).mean()
+            avg_loss = loss.ewm(span=period, adjust=False).mean()
+        else:
+            raise ValueError(f"Unknown smoothing: {smoothing!r}; expected 'wilder' or 'ema'")
+
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
-        
+
         return rsi
     
     @staticmethod
@@ -100,27 +108,36 @@ class TechnicalIndicators:
         high: pd.Series,
         low: pd.Series,
         close: pd.Series,
-        period: int = 14
+        period: int = 14,
+        smoothing: str = "wilder"
     ) -> pd.Series:
         """
         Calculate Average True Range.
-        
+
         Args:
             high: High price series
             low: Low price series
             close: Close price series
             period: ATR period
-            
+            smoothing: "wilder" (alpha=1/period, classical Wilder's smoothing,
+                Wilder 1978) or "ema" (alpha=2/(period+1), legacy behaviour).
+                Defaults to "wilder".
+
         Returns:
             ATR series
         """
         tr1 = high - low
         tr2 = abs(high - close.shift(1))
         tr3 = abs(low - close.shift(1))
-        
+
         true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = true_range.ewm(span=period, adjust=False).mean()
-        
+        if smoothing == "wilder":
+            atr = true_range.ewm(alpha=1.0 / period, adjust=False).mean()
+        elif smoothing == "ema":
+            atr = true_range.ewm(span=period, adjust=False).mean()
+        else:
+            raise ValueError(f"Unknown smoothing: {smoothing!r}; expected 'wilder' or 'ema'")
+
         return atr
     
     @staticmethod
@@ -205,8 +222,10 @@ class TechnicalIndicators:
         df['ema_ratio_fast_slow'] = df['ema_fast'] / df['ema_slow']
         df['ema_ratio_medium_slow'] = df['ema_medium'] / df['ema_slow']
         
-        # RSI
+        # RSI (Wilder by default; expose legacy EMA variant for ML models trained
+        # on the pre-Wilder smoothing).
         df['rsi'] = TechnicalIndicators.rsi(df['close'], config.rsi_period)
+        df['rsi_ema'] = TechnicalIndicators.rsi(df['close'], config.rsi_period, smoothing='ema')
         
         # MACD
         macd_line, signal_line, histogram = TechnicalIndicators.macd(
@@ -219,9 +238,12 @@ class TechnicalIndicators:
         df['macd_signal'] = signal_line
         df['macd_histogram'] = histogram
         
-        # ATR
+        # ATR (Wilder by default; legacy EMA variant kept for ML feature compat).
         df['atr'] = TechnicalIndicators.atr(
             df['high'], df['low'], df['close'], config.atr_period
+        )
+        df['atr_ema'] = TechnicalIndicators.atr(
+            df['high'], df['low'], df['close'], config.atr_period, smoothing='ema'
         )
         df['atr_normalized'] = df['atr'] / df['close']
         

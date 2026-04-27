@@ -64,6 +64,8 @@ class GridLiveTrader:
         self._grid_init_times: Dict[str, datetime] = {}
         self._last_rebalance_times: Dict[str, datetime] = {}
         self._grid_init_prices: Dict[str, float] = {}
+        self._fee_ticker_cache: Dict[str, tuple] = {}
+        self._fee_ticker_ttl_seconds: int = 60
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -227,6 +229,58 @@ class GridLiveTrader:
                         self.positions[symbol].pop()
         except Exception as e:
             logger.warning(f"Error reconciling positions: {e}")
+
+    async def _convert_fee_to_usdt(self, fee_dict: Optional[dict], symbol: str, trade_price: float) -> float:
+        """Convert exchange fee (which may be denominated in BNB, base, or quote) to USDT.
+
+        Returns 0 for missing/zero fees. For unknown currencies, returns the raw cost
+        unchanged (best-effort fallback so we never silently lose accounting).
+        """
+        if not fee_dict:
+            return 0.0
+        cost = fee_dict.get('cost') or 0.0
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            return 0.0
+        if cost == 0.0:
+            return 0.0
+
+        currency = (fee_dict.get('currency') or '').upper()
+        if not currency:
+            return cost
+
+        if currency in ('USDT', 'BUSD', 'USDC', 'FDUSD'):
+            return cost
+
+        try:
+            base, quote = symbol.split('/')
+        except ValueError:
+            base, quote = '', ''
+        if currency == base.upper() and trade_price:
+            return cost * trade_price
+        if currency == quote.upper():
+            return cost
+
+        # Quote-foreign currency (e.g. BNB) - convert via cached ticker.
+        pair = f"{currency}/USDT"
+        now = datetime.utcnow()
+        cached = self._fee_ticker_cache.get(pair)
+        if cached and (now - cached[0]).total_seconds() < self._fee_ticker_ttl_seconds:
+            price = cached[1]
+        else:
+            price = None
+            try:
+                ticker = await self.exchange.fetch_ticker(pair)
+                price = ticker.get('last') if isinstance(ticker, dict) else None
+                if price:
+                    self._fee_ticker_cache[pair] = (now, float(price))
+            except Exception as e:
+                logger.warning(f"Fee conversion: could not fetch {pair}: {e}")
+        if price:
+            return cost * float(price)
+        # Last-resort fallback: keep raw cost so totals don't silently drift.
+        return cost
 
     async def _ensure_bnb_for_fees(self):
         try:
@@ -427,15 +481,21 @@ class GridLiveTrader:
                 if age_minutes > 60:
                     logger.info(f"   ℹ️ Processing old trade (age: {age_minutes/60:.1f}h)")
 
-                fee = trade.get('fee', {}).get('cost', 0)
+                fee_raw = trade.get('fee', {}).get('cost', 0)
+                fee_currency = (trade.get('fee', {}) or {}).get('currency', '')
+                fee = await self._convert_fee_to_usdt(trade.get('fee'), symbol, price)
                 self.total_fees_paid += fee
 
                 trading_pnl = 0.0
+                # holding_pnl at the per-trade level is intentionally 0: portfolio-level
+                # inventory mark-to-market is computed in _update_balance_state. The CSV
+                # column is kept for backwards compatibility.
                 holding_pnl = 0.0
 
                 logger.info(f"   Current positions: {len(self.positions[symbol])}")
                 if side == 'SELL' and self.positions[symbol]:
-                    self.positions[symbol].sort(key=lambda p: p.entry_price)
+                    # FIFO: oldest position closed first.
+                    self.positions[symbol].sort(key=lambda p: p.opened_at or datetime.min)
                     remaining = amount
                     total_gross_pnl = 0.0
                     total_matched = 0.0
@@ -454,10 +514,8 @@ class GridLiveTrader:
                             self.positions[symbol].pop(0)
 
                     trading_pnl = total_gross_pnl - fee
-                    holding_pnl = 0.0
                     if matched_entries:
                         avg_entry = sum(e * a for e, a in matched_entries) / total_matched
-                        holding_pnl = (self.current_prices.get(symbol, price) - avg_entry) * total_matched if avg_entry != price else 0
                         pnl_pct = (total_gross_pnl / (avg_entry * total_matched)) * 100 if (avg_entry * total_matched) > 0 else 0
                     else:
                         avg_entry = price

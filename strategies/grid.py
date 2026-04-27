@@ -17,6 +17,8 @@ class GridLevel:
     order_id: Optional[str] = None
     filled: bool = False
     filled_at: Optional[datetime] = None
+    level_id: Optional[int] = None
+    pair_id: Optional[int] = None
 
 
 @dataclass
@@ -26,13 +28,20 @@ class GridConfig:
     lower_price: float
     num_grids: int = 10
     total_investment: float = 100.0
-    
+
     @property
     def grid_spacing(self) -> float:
-        return (self.upper_price - self.lower_price) / self.num_grids
+        # num_grids interior levels strictly between lower_price and upper_price
+        # → there are num_grids+1 equal-width gaps.
+        return (self.upper_price - self.lower_price) / (self.num_grids + 1)
     
     @property
     def amount_per_grid(self) -> float:
+        """Legacy: USDT allocated per level if split evenly across all `num_grids`.
+
+        For actual capital allocation see `GridStrategy._create_grid_levels`,
+        which divides `total_investment` only across BUY levels (SELL levels
+        don't tie up USDT — they require base inventory)."""
         return self.total_investment / self.num_grids
 
 
@@ -47,6 +56,12 @@ class GridStrategy(BaseStrategy):
         self.center_price = 0.0
         self.last_rebalance_time: Optional[datetime] = None
         self.positions_carried_over: int = 0
+        self._next_level_id: int = 0
+
+    def _new_level_id(self) -> int:
+        lid = self._next_level_id
+        self._next_level_id += 1
+        return lid
         
     def build_strategy(self, data_source=None, start_date=None, end_date=None, symbol=None):
         pass
@@ -97,26 +112,49 @@ class GridStrategy(BaseStrategy):
         return self.config
     
     def _create_grid_levels(self, current_price: float):
+        """Place exactly `num_grids` levels strictly between lower_price and
+        upper_price. Capital (`total_investment`) is split evenly across BUY
+        levels only — SELL levels don't lock USDT, they need base inventory.
+        """
         self.grid_levels = []
-        
-        for i in range(self.config.num_grids + 1):
-            price = self.config.lower_price + (i * self.config.grid_spacing)
-            
+        spacing = self.config.grid_spacing
+        # Two-pass: first compute prices and sides so we know how many BUYs
+        # exist before allocating capital per BUY.
+        prices_sides = []
+        for i in range(1, self.config.num_grids + 1):
+            price = self.config.lower_price + i * spacing
             if price < current_price:
                 side = "buy"
             elif price > current_price:
                 side = "sell"
             else:
-                continue
-                
+                # Exact match with current price is treated as BUY (USDT-funded);
+                # this preserves total level count = num_grids.
+                side = "buy"
+            prices_sides.append((price, side))
+
+        num_buys = sum(1 for _, s in prices_sides if s == "buy")
+        usdt_per_buy = (self.config.total_investment / num_buys) if num_buys > 0 else 0.0
+
+        for price, side in prices_sides:
+            if side == "buy":
+                amount = usdt_per_buy / price if price > 0 else 0.0
+            else:
+                # SELL inventory size mirrors what a single BUY would have produced;
+                # actual base inventory comes from filled BUYs or seed positions.
+                amount = usdt_per_buy / price if price > 0 else 0.0
             self.grid_levels.append(GridLevel(
                 price=price,
                 side=side,
-                amount=self.config.amount_per_grid / price
+                amount=amount,
+                level_id=self._new_level_id()
             ))
-        
+
         self.grid_levels.sort(key=lambda x: x.price)
-        logger.debug(f"Created {len(self.grid_levels)} grid levels")
+        logger.debug(
+            f"Created {len(self.grid_levels)} grid levels "
+            f"({num_buys} BUY, {len(self.grid_levels) - num_buys} SELL)"
+        )
     
     def check_grid_fills(self, current_price: float) -> List[Dict]:
         if not self.initialized:
@@ -145,18 +183,23 @@ class GridStrategy(BaseStrategy):
                 sell_prices = [l.price for l in sell_levels]
                 logger.debug(f"check_grid_fills: SELL levels at: ${min(sell_prices):.2f} - ${max(sell_prices):.2f}")
         
-        for level in self.grid_levels:
+        # Two-phase iteration: don't mutate self.grid_levels while iterating it.
+        # Phase 1 — detect crosses against a snapshot.
+        crossed_levels: List[GridLevel] = []
+        for level in list(self.grid_levels):
             if level.filled:
                 continue
-            
+
             crossed = False
             if level.side == "buy":
-                if previous_price > level.price >= current_price:
+                # Symmetric inclusive bounds: price moved from at-or-above to
+                # at-or-below the level (covers exact touches on either tick).
+                if previous_price >= level.price >= current_price:
                     crossed = True
             else:
-                if previous_price < level.price <= current_price:
+                if previous_price <= level.price <= current_price:
                     crossed = True
-            
+
             if crossed:
                 level.filled = True
                 level.filled_at = datetime.utcnow()
@@ -167,8 +210,12 @@ class GridStrategy(BaseStrategy):
                     "value": level.amount * level.price
                 })
                 logger.info(f"Grid level filled: {level.side.upper()} at ${level.price:.2f}")
-                self._create_opposite_order(level)
-        
+                crossed_levels.append(level)
+
+        # Phase 2 — spawn opposite orders after the iteration is done.
+        for level in crossed_levels:
+            self._create_opposite_order(level)
+
         return fills
     
     def _create_opposite_order(self, filled_level: GridLevel):
@@ -186,7 +233,9 @@ class GridStrategy(BaseStrategy):
                 self.grid_levels.append(GridLevel(
                     price=new_price,
                     side=opposite_side,
-                    amount=filled_level.amount
+                    amount=filled_level.amount,
+                    level_id=self._new_level_id(),
+                    pair_id=filled_level.level_id
                 ))
     
     def get_active_levels(self) -> List[GridLevel]:
@@ -196,21 +245,60 @@ class GridStrategy(BaseStrategy):
         return [l for l in self.grid_levels if l.filled]
     
     def calculate_unrealized_pnl(self, current_price: float) -> float:
+        """Unrealized PnL = MTM of filled BUYs whose paired SELL is NOT yet filled.
+
+        BUY is considered "open" only if no filled SELL references it as pair_id.
+        This avoids double-counting BUYs that have already been closed by a SELL.
+        """
+        levels_by_id = {l.level_id: l for l in self.grid_levels if l.level_id is not None}
+        closed_buy_ids = {
+            l.pair_id for l in self.grid_levels
+            if l.filled and l.side == "sell" and l.pair_id is not None and l.pair_id in levels_by_id
+        }
+
         pnl = 0.0
-        buy_fills = [l for l in self.grid_levels if l.filled and l.side == "buy"]
-        for level in buy_fills:
+        for level in self.grid_levels:
+            if not (level.filled and level.side == "buy"):
+                continue
+            if level.level_id is not None and level.level_id in closed_buy_ids:
+                continue
             pnl += (current_price - level.price) * level.amount
         return pnl
-    
+
     def calculate_realized_pnl(self) -> float:
-        buys = sorted([l for l in self.grid_levels if l.filled and l.side == "buy"], key=lambda x: x.filled_at or datetime.min)
-        sells = sorted([l for l in self.grid_levels if l.filled and l.side == "sell"], key=lambda x: x.filled_at or datetime.min)
-        
+        """Realized PnL = sum over filled SELLs paired (via pair_id) with a filled BUY.
+
+        Falls back to FIFO chronological matching for legacy levels that lack pair_id
+        (e.g. positions restored from older state files without level_id metadata).
+        """
+        levels_by_id = {l.level_id: l for l in self.grid_levels if l.level_id is not None}
+
         pnl = 0.0
-        for buy, sell in zip(buys, sells):
-            if buy.filled_at and sell.filled_at and buy.filled_at < sell.filled_at:
-                profit = (sell.price - buy.price) * min(buy.amount, sell.amount)
-                pnl += profit
+        legacy_sells = []
+        legacy_buy_ids = set()
+
+        for sell in self.grid_levels:
+            if not (sell.filled and sell.side == "sell"):
+                continue
+            if sell.pair_id is not None and sell.pair_id in levels_by_id:
+                buy = levels_by_id[sell.pair_id]
+                if buy.filled and buy.side == "buy":
+                    matched = min(buy.amount, sell.amount)
+                    pnl += (sell.price - buy.price) * matched
+                    legacy_buy_ids.add(buy.level_id)
+                    continue
+            legacy_sells.append(sell)
+
+        if legacy_sells:
+            legacy_buys = sorted(
+                [l for l in self.grid_levels
+                 if l.filled and l.side == "buy" and l.level_id not in legacy_buy_ids],
+                key=lambda x: x.filled_at or datetime.min
+            )
+            legacy_sells.sort(key=lambda x: x.filled_at or datetime.min)
+            for buy, sell in zip(legacy_buys, legacy_sells):
+                if buy.filled_at and sell.filled_at and buy.filled_at < sell.filled_at:
+                    pnl += (sell.price - buy.price) * min(buy.amount, sell.amount)
         return pnl
     
     def can_rebalance_positions_profitable(self, current_price: float) -> tuple[bool, str]:
