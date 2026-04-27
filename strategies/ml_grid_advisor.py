@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from config.settings import settings
+from execution.portfolio_protection import compute_adaptive_num_grids
 from strategies.indicators import TechnicalIndicators
 
 
@@ -243,14 +244,19 @@ class MLGridAdvisor:
         elif abs(trend_score) > 0.3:
             trend_bias = trend_score * grid_range_pct * 0.15
 
-        if volatility_regime == "extreme":
-            recommended_grids = max(settings.grid.min_grids, 6)
-        elif volatility_regime == "high":
-            recommended_grids = max(settings.grid.min_grids, 8)
-        elif volatility_regime == "low":
-            recommended_grids = settings.grid.max_grids
-        else:
-            recommended_grids = max(settings.grid.min_grids, settings.grid.max_grids - 2)
+        # Delegate the regime → line-count mapping to the canonical helper
+        # (``execution.portfolio_protection.compute_adaptive_num_grids``).
+        # The helper applies a regime multiplier to the midpoint of
+        # [min_grids, max_grids] and clamps back into bounds, matching the
+        # previous extreme/high/low cases (8, 8, max_grids respectively at
+        # min=8/max=10) while consistently lifting "normal" off the lower
+        # bound. Keeping a single source of truth here means any future
+        # tuning to the regime table propagates everywhere automatically.
+        recommended_grids = compute_adaptive_num_grids(
+            min_grids=settings.grid.min_grids,
+            max_grids=settings.grid.max_grids,
+            volatility_regime=volatility_regime,
+        )
 
         # Breakeven floor: each round-trip pays 2 * fee + slippage. Add a small
         # `edge` so spacing comfortably clears costs. If the requested grid count

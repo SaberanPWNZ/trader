@@ -91,6 +91,11 @@ class GridLiveTrader:
         # capital.
         self._peak_portfolio_value: float = 0.0
         self._trailing_tp_state = TrailingTPState()
+        # Map order_id → (expected_price, side) recorded at order placement
+        # time so we can compute realized slippage when the fill is logged
+        # back to ``data/grid_live_trades.csv``. Bounded loosely by the
+        # number of in-flight grid orders; pruned when orders complete.
+        self._expected_prices: Dict[str, float] = {}
         
         for symbol in symbols:
             self.strategies[symbol] = GridStrategy(symbol)
@@ -104,8 +109,29 @@ class GridLiveTrader:
                 writer.writerow([
                     'timestamp', 'symbol', 'side', 'price', 'amount', 'value',
                     'order_id', 'status', 'fee', 'trading_pnl', 'holding_pnl', 
-                    'realized_pnl', 'balance', 'total_value', 'base_held'
+                    'realized_pnl', 'balance', 'total_value', 'base_held',
+                    'expected_price'
                 ])
+        else:
+            # Migrate legacy CSVs that pre-date the ``expected_price``
+            # column: rewrite only the header line so spreadsheet/analysis
+            # tools see the right column names. Existing rows keep
+            # working — positional readers (``row[6]`` etc.) ignore the
+            # missing trailing field, and the slippage helper treats
+            # blank ``expected_price`` as "unknown" by design.
+            try:
+                with open(self._trades_file, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    rest = list(reader)
+                if header and 'expected_price' not in header:
+                    header.append('expected_price')
+                    with open(self._trades_file, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(header)
+                        writer.writerows(rest)
+            except Exception as e:
+                logger.warning(f"Could not migrate trades CSV header: {e}")
         
         self._load_processed_trade_ids()
     
@@ -658,13 +684,20 @@ class GridLiveTrader:
     def _log_trade_from_exchange(self, symbol: str, side: str, price: float, amount: float, 
                                   value: float, order_id: str, fee: float, trading_pnl: float,
                                   holding_pnl: float, balance: float, total_value: float, base_held: float):
+        # Pop (don't peek) so the cache stays bounded — once a fill is
+        # logged we no longer need the expected price. Empty string when
+        # unknown (e.g. partial-startup state, manual orders, restarts
+        # before the order placement was tracked).
+        expected_price = self._expected_prices.pop(str(order_id), None)
+        expected_str = f"{expected_price:.8f}" if expected_price is not None else ""
         with open(self._trades_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 datetime.utcnow().isoformat(),
                 symbol, side, price, amount, value,
                 order_id, 'filled', fee, trading_pnl, holding_pnl,
-                self.realized_pnl, balance, total_value, base_held
+                self.realized_pnl, balance, total_value, base_held,
+                expected_str
             ])
     
     async def _update_balance_state(self):
@@ -1128,6 +1161,11 @@ class GridLiveTrader:
                     params={'postOnly': True}
                 )
                 level.order_id = order['id']
+                # Stash the originally-requested limit price so we can
+                # compute slippage when the fill comes back through
+                # ``_log_trade_from_exchange``. Bounded by the number of
+                # active grid orders; entries are popped on fill.
+                self._expected_prices[str(order['id'])] = float(level.price)
                 logger.info(f"Placed {side.upper()} order at ${level.price:.4f}, amount={level.amount:.2f} {base}, value=${level.amount * level.price:.2f}, id={order['id']}")
 
                 if side == 'sell':

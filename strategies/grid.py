@@ -6,7 +6,9 @@ from loguru import logger
 
 from strategies.base import BaseStrategy
 from config.constants import SignalType
+from config.settings import settings
 from data.models import Signal
+from execution.portfolio_protection import compute_adaptive_num_grids
 
 
 @dataclass
@@ -98,6 +100,27 @@ class GridStrategy(BaseStrategy):
 
         return multiplier
     
+    def _classify_volatility_regime(self, data: pd.DataFrame) -> str:
+        """Map recent hourly-return volatility to the regime strings used by
+        ``compute_adaptive_num_grids``.
+
+        Thresholds mirror ``_calculate_dynamic_multiplier`` so the same
+        bands drive both the ATR multiplier (range width) and the grid
+        line count (range density).
+        """
+        if data is None or len(data) < 30:
+            return "normal"
+        close_prices = data['close'].tail(30)
+        hourly_returns = close_prices.pct_change().dropna()
+        if hourly_returns.empty:
+            return "normal"
+        volatility = float(hourly_returns.std())
+        if volatility > 0.015:
+            return "high"
+        if volatility > 0.008:
+            return "normal"
+        return "low"
+
     def initialize_grid(
         self,
         current_price: float,
@@ -105,16 +128,28 @@ class GridStrategy(BaseStrategy):
         total_investment: float,
         data: pd.DataFrame = None,
         _is_rebalance: bool = False,
+        volatility_regime: Optional[str] = None,
     ) -> GridConfig:
         atr_multiplier = self._calculate_dynamic_multiplier(data)
         upper_price = current_price + (atr * atr_multiplier)
         lower_price = current_price - (atr * atr_multiplier)
-        
+
+        # Pick grid density adaptively from volatility — calm markets get a
+        # denser grid (more fills on small wiggles), choppy markets get a
+        # sparser grid (each leg captures real movement). Replaces the old
+        # hard-coded ``num_grids=5``.
+        regime = volatility_regime or self._classify_volatility_regime(data)
+        num_grids = compute_adaptive_num_grids(
+            min_grids=settings.grid.min_grids,
+            max_grids=settings.grid.max_grids,
+            volatility_regime=regime,
+        )
+
         self.config = GridConfig(
             symbol=self.symbol,
             upper_price=upper_price,
             lower_price=lower_price,
-            num_grids=5,
+            num_grids=num_grids,
             total_investment=total_investment
         )
         
