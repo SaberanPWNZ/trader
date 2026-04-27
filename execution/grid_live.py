@@ -14,8 +14,10 @@ from monitoring.alerts import telegram
 from config.settings import settings
 from exchange.factory import create_exchange
 from execution.portfolio_protection import (
+    InvestmentBudget,
     TrailingTPState,
     check_trailing_take_profit,
+    compute_target_investment,
 )
 
 
@@ -70,6 +72,12 @@ class GridLiveTrader:
         self._grid_init_prices: Dict[str, float] = {}
         self._fee_ticker_cache: Dict[str, tuple] = {}
         self._fee_ticker_ttl_seconds: int = 60
+        # Snapshot of the per-symbol investment budget (USDT). Computed on
+        # the first ``_initialize_grid`` call from the *starting* free
+        # balance and reused on every subsequent reinit so rebalances
+        # don't progressively shrink the grid as USDT gets locked into
+        # BUY orders elsewhere in the portfolio.
+        self._investment_budget = InvestmentBudget()
         # Peak portfolio value (since startup) used by the trailing
         # portfolio take-profit. Stored separately from ``initial_balance``
         # so the trail follows the high-water mark, not just the starting
@@ -876,8 +884,17 @@ class GridLiveTrader:
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        num_symbols = max(1, len(self.symbols))
-        investment_per_symbol = (usdt_free * settings.grid.investment_ratio) / num_symbols
+        # Snapshot the per-symbol budget on first init; all later reinits
+        # reuse the same value so we don't progressively shrink the grid as
+        # USDT gets locked in other symbols' BUY orders. See
+        # ``compute_target_investment`` for the rationale.
+        investment_per_symbol = compute_target_investment(
+            budget=self._investment_budget,
+            symbol=symbol,
+            usdt_free=usdt_free,
+            investment_ratio=settings.grid.investment_ratio,
+            num_symbols=max(1, len(self.symbols)),
+        )
 
         num_grids = advice.recommended_grids
         if investment_per_symbol / max(num_grids, 1) < settings.grid.min_order_value:
@@ -914,7 +931,21 @@ class GridLiveTrader:
             f"Spacing: ${config.grid_spacing:.2f}\n"
             f"Order size: ${config.amount_per_grid:.2f}"
         )
-        
+
+        # Honour the C6 ``pause_trading`` flag emitted by ``MLGridAdvisor``
+        # for extreme-volatility regimes: keep the freshly-built grid
+        # levels in memory but skip placing orders. The next ``_process_symbol``
+        # tick will re-evaluate (the advisor caches advice for ``ml_update_interval_minutes``,
+        # so we'll naturally retry once the regime calms down).
+        if advice.pause_trading:
+            warning = (
+                f"⏸️ {symbol}: pause_trading=True (regime={advice.volatility_regime}); "
+                f"grid built but order placement skipped."
+            )
+            logger.warning(warning)
+            await telegram.send_message(warning)
+            return
+
         await self._place_grid_orders(symbol)
 
     def _get_avg_entry_price(self, symbol: str) -> Optional[float]:
@@ -1215,8 +1246,16 @@ class GridLiveTrader:
 
         balance_info = await self.exchange.fetch_balance()
         usdt_free = balance_info.get('USDT', {}).get('free', 0)
-        num_symbols = max(1, len(self.symbols))
-        investment = (usdt_free * settings.grid.investment_ratio) / num_symbols
+        # Reuse the snapshot established at first init so the grid budget
+        # stays stable across reinits even when other symbols are holding
+        # USDT in open BUYs.
+        investment = compute_target_investment(
+            budget=self._investment_budget,
+            symbol=symbol,
+            usdt_free=usdt_free,
+            investment_ratio=settings.grid.investment_ratio,
+            num_symbols=max(1, len(self.symbols)),
+        )
         num_grids = advice.recommended_grids
         if investment / max(num_grids, 1) < settings.grid.min_order_value:
             num_grids = max(1, int(investment / settings.grid.min_order_value))
@@ -1251,6 +1290,17 @@ class GridLiveTrader:
             f"Positions kept: {open_positions_count}"
             + (f"\n{ml_tag}" if ml_tag else "")
         )
+
+        # Same pause guard as ``_initialize_grid``: extreme regime →
+        # keep the rebuilt grid but don't lay new orders.
+        if advice.pause_trading:
+            warning = (
+                f"⏸️ {symbol}: pause_trading=True after reinit "
+                f"(regime={advice.volatility_regime}); orders not placed."
+            )
+            logger.warning(warning)
+            await telegram.send_message(warning)
+            return
 
         await self._place_grid_orders(symbol)
     
