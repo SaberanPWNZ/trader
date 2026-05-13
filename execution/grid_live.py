@@ -1369,7 +1369,7 @@ class GridLiveTrader:
         unfilled = [l for l in active_levels if not l.filled]
         if unfilled:
             nearest_distance = min(abs(current_price - l.price) / current_price for l in unfilled)
-            if nearest_distance > 0.015:
+            if nearest_distance > 0.03:
                 logger.info(
                     f"{symbol}: Price ${current_price:.2f} drifted {nearest_distance:.1%} from nearest level, re-centering grid"
                 )

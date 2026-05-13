@@ -310,6 +310,8 @@ class MLGridAdvisor:
         parts.append(f"ATR={atr_pct:.1%}")
         reason = ", ".join(parts)
 
+        has_uptrend = trend_bias > 0 and abs(trend_bias) > 0.005
+        pause = volatility_regime == "extreme" and not has_uptrend
         return GridAdvice(
             grid_range_pct=float(grid_range_pct),
             trend_bias=float(trend_bias),
@@ -317,11 +319,7 @@ class MLGridAdvisor:
             volatility_regime=volatility_regime,
             recommended_grids=int(recommended_grids),
             reason=reason,
-            # Pause new entries when the market is in an extreme volatility
-            # regime: grids tend to lose to trend / produce large drawdowns
-            # while spreads blow out. Existing orders are unaffected so we
-            # can still take profit on a mean-reverting bounce.
-            pause_trading=(volatility_regime == "extreme"),
+            pause_trading=pause,
         )
 
     def _default_advice(self, reason: str, *, symbol: Optional[str] = None) -> GridAdvice:

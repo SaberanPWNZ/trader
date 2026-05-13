@@ -235,14 +235,14 @@ class GridConfig:
     rebalance_threshold_positions: int = 6
     
     rebalance_interval_hours: float = field(default_factory=lambda: {
-        "BTC/USDT": 12.0,
-        "ETH/USDT": 12.0,
-        "SOL/USDT": 8.0,
-        "DOGE/USDT": 6.0,
-        "XRP/USDT": 8.0
+        "BTC/USDT": 24.0,
+        "ETH/USDT": 24.0,
+        "SOL/USDT": 12.0,
+        "DOGE/USDT": 12.0,
+        "XRP/USDT": 12.0
     })
     auto_rebalance_enabled: bool = True
-    wait_for_profit: bool = True
+    wait_for_profit: bool = False
     min_profit_threshold: float = 0.0
     # Minimum unrealized profit (percent of total grid investment) required
     # before the strategy will rebalance / take profit. Default 0.3% covers a
