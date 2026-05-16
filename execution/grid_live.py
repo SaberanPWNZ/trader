@@ -1167,12 +1167,6 @@ class GridLiveTrader:
             return None
         return total_cost / total_amount
 
-    def _has_profitable_position(self, symbol: str, sell_price: float) -> bool:
-        positions = self.positions.get(symbol, [])
-        if not positions:
-            return False
-        return any(sell_price > p.entry_price for p in positions)
-    
     async def _place_grid_orders(self, symbol: str):
         strategy = self.strategies[symbol]
         active_levels = strategy.get_active_levels()
@@ -1208,9 +1202,6 @@ class GridLiveTrader:
                 level.amount = self._round_amount(level.amount, market['amount_precision'])
 
                 if side == 'sell':
-                    if not self._has_profitable_position(symbol, level.price):
-                        logger.debug(f"Skipping sell @ ${level.price:.4f} — no profitable position")
-                        continue
                     if base_available < level.amount:
                         if base_available > 0:
                             partial = self._round_amount(base_available * 0.99, market['amount_precision'])
@@ -1533,6 +1524,66 @@ class GridLiveTrader:
             return
 
         await self._place_grid_orders(symbol)
+        
+        await self._place_emergency_sells(symbol)
+    
+    async def _place_emergency_sells(self, symbol: str):
+        """Place SELL orders for open positions that lack one (fallback for orphaned positions).
+        
+        Happens when a position survives a rebalance but no SELL order was placed
+        (e.g. underwater positions that don't meet profitability check).
+        Places a single SELL order at market price if needed.
+        """
+        positions = self.positions.get(symbol, [])
+        if not positions:
+            return
+        
+        total_amount = sum(p.amount for p in positions)
+        if total_amount < 0.001:
+            return
+        
+        existing_orders = await self.exchange.fetch_open_orders(symbol)
+        sell_amounts = sum(
+            o['amount'] for o in existing_orders 
+            if o.get('side', '').lower() == 'sell'
+        )
+        
+        if sell_amounts >= total_amount * 0.95:
+            return
+        
+        uncovered = max(0, total_amount - sell_amounts)
+        if uncovered < 0.001:
+            return
+        
+        logger.warning(f"⚠️ {symbol}: {uncovered:.6f} open positions lack SELL orders, placing emergency sell")
+        
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            base = symbol.split('/')[0]
+            market = await self._get_market_info(symbol)
+            
+            amount = self._round_amount(uncovered * 0.99, market['amount_precision'])
+            if amount < market.get('min_notional', 5) / current_price:
+                return
+            
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side='sell',
+                amount=amount
+            )
+            
+            if order and order.get('id'):
+                self._order_causes[str(order['id'])] = "orphan_recovery"
+                logger.info(f"✅ Emergency SELL placed: {amount:.6f} {base} @ market")
+                await telegram.send_message(
+                    f"⚠️ Emergency SELL: {symbol}\n"
+                    f"Closed orphaned {amount:.6f} {base} @ market\n"
+                    f"Reason: Position lacked SELL order after rebalance"
+                )
+        except Exception as e:
+            logger.error(f"Failed to place emergency sell for {symbol}: {e}")
     
     async def _rebalance_excess_positions(self, symbol: str, current_price: float):
         open_positions = len(self.positions[symbol])
@@ -1687,9 +1738,6 @@ class GridLiveTrader:
                     level.price = self._round_price(level.price, market['price_precision'])
 
                     if level.side == 'sell':
-                        if not self._has_profitable_position(symbol, level.price):
-                            logger.debug(f"Skipping sell @ ${level.price:.4f} — no profitable position")
-                            continue
                         if base_available < level.amount:
                             if base_available > 0:
                                 partial = self._round_amount(base_available * 0.99, market['amount_precision'])
